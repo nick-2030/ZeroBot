@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -61,6 +62,7 @@ pub fn run(server: String, api_key: String) -> anyhow::Result<()> {
     let mut entries = load_initial_entries(&rt, &client, &session_id);
     let mut current_assistant: Option<usize> = None;
     let mut input = String::new();
+    let mut tool_entries: HashMap<String, usize> = HashMap::new();
 
     let (event_tx, event_rx) = mpsc::channel();
     let (send_tx, send_rx) = mpsc::channel();
@@ -69,7 +71,7 @@ pub fn run(server: String, api_key: String) -> anyhow::Result<()> {
     spawn_sse_thread(server.clone(), api_key.clone(), session_id.clone(), event_tx.clone());
 
     loop {
-        drain_events(&mut entries, &mut current_assistant, &event_rx);
+        drain_events(&mut entries, &mut current_assistant, &mut tool_entries, &event_rx);
 
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -227,7 +229,12 @@ fn spawn_sse_thread(server: String, api_key: String, session_id: String, tx: Sen
     });
 }
 
-fn drain_events(entries: &mut Vec<Entry>, current_assistant: &mut Option<usize>, rx: &Receiver<UiEvent>) {
+fn drain_events(
+    entries: &mut Vec<Entry>,
+    current_assistant: &mut Option<usize>,
+    tool_entries: &mut HashMap<String, usize>,
+    rx: &Receiver<UiEvent>,
+) {
     while let Ok(event) = rx.try_recv() {
         match event {
             UiEvent::SendError(err) => {
@@ -267,17 +274,41 @@ fn drain_events(entries: &mut Vec<Entry>, current_assistant: &mut Option<usize>,
                         *current_assistant = Some(entries.len() - 1);
                     }
                 }
+                "tool_call" => {
+                    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                    let args = data.get("arguments").cloned().unwrap_or(Value::Null);
+                    let call_id = data.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let entry = Entry {
+                        prefix: "● ".to_string(),
+                        content: format!("[tool:{}] {}", name, args),
+                        kind: EntryKind::Tool,
+                        status: EntryStatus::Pending,
+                        placeholder: false,
+                    };
+                    entries.push(entry);
+                    if !call_id.is_empty() {
+                        tool_entries.insert(call_id.to_string(), entries.len() - 1);
+                    }
+                }
                 "tool_result" => {
                     let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
                     let output = data.get("output").cloned().unwrap_or(Value::Null);
                     let is_error = data.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                    entries.push(Entry {
-                        prefix: "● ".to_string(),
-                        content: format!("[tool:{}] {}", name, output),
-                        kind: EntryKind::Tool,
-                        status: if is_error { EntryStatus::Error } else { EntryStatus::Success },
-                        placeholder: false,
-                    });
+                    let call_id = data.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(idx) = tool_entries.remove(call_id) {
+                        if let Some(entry) = entries.get_mut(idx) {
+                            entry.content = format!("[tool:{}] {}", name, output);
+                            entry.status = if is_error { EntryStatus::Error } else { EntryStatus::Success };
+                        }
+                    } else {
+                        entries.push(Entry {
+                            prefix: "● ".to_string(),
+                            content: format!("[tool:{}] {}", name, output),
+                            kind: EntryKind::Tool,
+                            status: if is_error { EntryStatus::Error } else { EntryStatus::Success },
+                            placeholder: false,
+                        });
+                    }
                 }
                 "agent_status" => {
                     let state = data.get("state").and_then(|v| v.as_str()).unwrap_or("");

@@ -15,3 +15,5 @@
 
 # Logs
 *.log
+
+/tmp/

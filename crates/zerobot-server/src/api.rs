@@ -130,6 +130,17 @@ async fn send_message(
         .add_message(&session_id, Role::User, payload.content.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let mut registered = state.tools.list().to_vec();
+    registered.extend(state.mcp.list());
+    for plugin in state.plugins.list() {
+        for tool in plugin.tools {
+            registered.push(ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            });
+        }
+    }
     let supervisor = Supervisor::new(state.tools.clone());
     let history = state
         .store
@@ -147,6 +158,7 @@ async fn send_message(
         .await;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tool_tx, mut tool_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let events = state.events.clone();
     let session_for_events = session_id.clone();
     let publish_task = tokio::spawn(async move {
@@ -162,14 +174,41 @@ async fn send_message(
                 .await;
         }
     });
+    let tool_events = state.events.clone();
+    let tool_session = session_id.clone();
+    let publish_tool_task = tokio::spawn(async move {
+        while let Some(payload) = tool_rx.recv().await {
+            tool_events
+                .publish(
+                    &tool_session,
+                    ServerEvent {
+                        event_type: "tool_call".to_string(),
+                        data: payload,
+                    },
+                )
+                .await;
+        }
+    });
 
-    let outputs = match supervisor
-        .handle_user_message_stream(&state.settings.active, &history, &payload.content, |chunk| {
-            let _ = tx.send(chunk.to_string());
-        })
+    let outcome = match supervisor
+        .handle_user_message_with_tools(
+            &state.settings.active,
+            &history,
+            &registered,
+            |chunk| {
+                let _ = tx.send(chunk.to_string());
+            },
+            |call| {
+                let _ = tool_tx.send(serde_json::json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "call_id": call.id,
+                }));
+            },
+        )
         .await
     {
-        Ok(outputs) => outputs,
+        Ok(outcome) => outcome,
         Err(err) => {
             state
                 .events
@@ -185,34 +224,34 @@ async fn send_message(
         }
     };
     drop(tx);
+    drop(tool_tx);
     let _ = publish_task.await;
+    let _ = publish_tool_task.await;
 
-    for output in outputs {
-        match output {
-            crate::agent::AgentOutput::Assistant(text) => {
-                let _ = state
-                    .store
-                    .add_message(&session_id, Role::Assistant, text.clone())
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            }
-            crate::agent::AgentOutput::Tool(result) => {
-                state
-                    .store
-                    .add_message(&session_id, Role::Tool, result.output.to_string())
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                state
-                    .events
-                    .publish(&session_id, ServerEvent {
-                        event_type: "tool_result".to_string(),
-                        data: serde_json::json!({
-                            "name": result.name,
-                            "output": result.output,
-                            "is_error": result.is_error
-                        }),
-                    })
-                    .await;
-            }
-        }
+    for execution in outcome.tool_executions {
+        state
+            .store
+            .add_message(&session_id, Role::Tool, execution.result.output.to_string())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        state
+            .events
+            .publish(&session_id, ServerEvent {
+                event_type: "tool_result".to_string(),
+                data: serde_json::json!({
+                    "name": execution.result.name,
+                    "output": execution.result.output,
+                    "is_error": execution.result.is_error,
+                    "call_id": execution.call.id,
+                }),
+            })
+            .await;
+    }
+
+    if !outcome.output.is_empty() {
+        let _ = state
+            .store
+            .add_message(&session_id, Role::Assistant, outcome.output.clone())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     state
         .events
