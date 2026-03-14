@@ -1,20 +1,29 @@
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use regex::Regex;
 use serde_json::Value;
 
-use zerobot_core::{builtin_tools, ToolDefinition, ToolPolicy, ToolResult};
+use zerobot_core::{
+    builtin_tools, PermissionRules, ToolDefinition, ToolPolicy, ToolResult, ZeroSettings,
+};
 
 pub struct ToolRegistry {
     tools: Vec<ToolDefinition>,
     policy: ToolPolicy,
+    rules: PermissionRules,
+    env: BTreeMap<String, String>,
     root: PathBuf,
     data_dir: PathBuf,
 }
 
 impl ToolRegistry {
-    pub fn new(config: &zerobot_core::ServerConfig, data_dir: PathBuf) -> anyhow::Result<Arc<Self>> {
+    pub fn new(
+        config: &zerobot_core::ServerConfig,
+        settings: &ZeroSettings,
+        data_dir: PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
         let mut tools = builtin_tools();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Arc::new(Self {
@@ -25,6 +34,8 @@ impl ToolRegistry {
                 allow_edit: config.allow_edit,
                 allow_delete: config.allow_delete,
             },
+            rules: settings.permissions.clone(),
+            env: settings.env.clone(),
             root: std::env::current_dir()?,
             data_dir,
         }))
@@ -39,6 +50,13 @@ impl ToolRegistry {
             return ToolResult {
                 name: name.to_string(),
                 output: serde_json::json!({"error":"tool not allowed"}),
+                is_error: true,
+            };
+        }
+        if let Err(reason) = self.check_rules(name, args) {
+            return ToolResult {
+                name: name.to_string(),
+                output: serde_json::json!({"error": reason}),
                 is_error: true,
             };
         }
@@ -226,11 +244,12 @@ impl ToolRegistry {
 
     fn bash(&self, args: &Value) -> ToolResult {
         let cmd = args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
-        let result = std::process::Command::new("sh")
-            .arg("-lc")
-            .arg(cmd)
-            .current_dir(&self.root)
-            .output();
+        let mut command = std::process::Command::new("sh");
+        command.arg("-lc").arg(cmd).current_dir(&self.root);
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let result = command.output();
         match result {
             Ok(output) => ToolResult {
                 name: "bash".to_string(),
@@ -265,5 +284,106 @@ impl ToolRegistry {
                 is_error: true,
             },
         }
+    }
+
+    fn check_rules(&self, tool: &str, args: &Value) -> Result<(), String> {
+        if self
+            .rules
+            .deny
+            .iter()
+            .any(|rule| rule_matches(rule, tool, args))
+        {
+            return Err("blocked by deny rule".to_string());
+        }
+        if self
+            .rules
+            .ask
+            .iter()
+            .any(|rule| rule_matches(rule, tool, args))
+        {
+            return Err("approval required".to_string());
+        }
+        if self.rules.allow.is_empty() {
+            return Ok(());
+        }
+        if self
+            .rules
+            .allow
+            .iter()
+            .any(|rule| rule_matches(rule, tool, args))
+        {
+            Ok(())
+        } else {
+            Err("not allowed by allow rules".to_string())
+        }
+    }
+}
+
+fn rule_matches(rule: &str, tool: &str, args: &Value) -> bool {
+    let (rule_tool, pattern) = parse_rule(rule);
+    if normalize_name(&rule_tool) != normalize_name(tool) {
+        return false;
+    }
+    match pattern {
+        None => true,
+        Some(pattern) => {
+            if pattern.trim().is_empty() || pattern.trim() == "*" {
+                return true;
+            }
+            let target = tool_argument_text(tool, args);
+            glob::Pattern::new(pattern.trim())
+                .map(|pat| pat.matches(&target))
+                .unwrap_or(false)
+        }
+    }
+}
+
+fn parse_rule(rule: &str) -> (String, Option<String>) {
+    let trimmed = rule.trim();
+    if let Some(start) = trimmed.find('(') {
+        if trimmed.ends_with(')') && start + 1 <= trimmed.len() - 1 {
+            let tool = trimmed[..start].trim().to_string();
+            let pattern = trimmed[start + 1..trimmed.len() - 1].trim().to_string();
+            return (tool, Some(pattern));
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
+fn normalize_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn tool_argument_text(tool: &str, args: &Value) -> String {
+    match tool {
+        "bash" => args
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "read" | "write" | "edit" | "delete" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "glob" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "find" => args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "grep" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => args.to_string(),
     }
 }

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use zerobot_core::ToolDefinition;
 
@@ -22,11 +22,5 @@ impl McpRegistry {
 
     pub fn list(&self) -> Vec<ToolDefinition> {
         self.tools.lock().unwrap().clone()
-    }
-}
-
-impl From<McpRegistry> for Arc<McpRegistry> {
-    fn from(value: McpRegistry) -> Self {
-        Arc::new(value)
     }
 }

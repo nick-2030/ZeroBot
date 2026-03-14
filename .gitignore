@@ -11,6 +11,7 @@
 
 # Local data
 /data/
+.zero/settings.local.yaml
 
 # Logs
 *.log

@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-
 use tokio::sync::{broadcast, Mutex};
 
 use zerobot_core::SessionId;
@@ -39,11 +37,5 @@ impl EventBus {
             })
             .clone();
         let _ = sender.send(event);
-    }
-}
-
-impl From<EventBus> for Arc<EventBus> {
-    fn from(value: EventBus) -> Self {
-        Arc::new(value)
     }
 }

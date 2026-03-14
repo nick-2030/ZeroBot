@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
+use rusqlite::types::Type;
 use uuid::Uuid;
 
 use zerobot_core::{MemoryItem, Message, Role, Session, SessionId, SessionState, Task, TaskStatus};
@@ -80,7 +81,7 @@ impl SqliteStore {
                 session.title,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
-                session.forked_from.map(|s| s.0.to_string()),
+                session.forked_from.clone().map(|s| s.0.to_string()),
             ],
         )?;
         Ok(session)
@@ -92,7 +93,7 @@ impl SqliteStore {
         let rows = stmt.query_map([], |row| {
             let forked: Option<String> = row.get(4)?;
             Ok(Session {
-                id: SessionId(Uuid::parse_str(&row.get::<_, String>(0)?)?),
+                id: SessionId(parse_uuid_text(row.get::<_, String>(0)?)?),
                 title: row.get(1)?,
                 created_at: parse_dt(row.get(2)?),
                 updated_at: parse_dt(row.get(3)?),
@@ -109,7 +110,7 @@ impl SqliteStore {
         if let Some(row) = rows.next()? {
             let forked: Option<String> = row.get(4)?;
             Ok(Some(Session {
-                id: SessionId(Uuid::parse_str(&row.get::<_, String>(0)?)?),
+                id: SessionId(parse_uuid_text(row.get::<_, String>(0)?)?),
                 title: row.get(1)?,
                 created_at: parse_dt(row.get(2)?),
                 updated_at: parse_dt(row.get(3)?),
@@ -153,8 +154,8 @@ impl SqliteStore {
         )?;
         let rows = stmt.query_map(params![session_id.0.to_string()], |row| {
             Ok(Message {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?)?,
-                session_id: SessionId(Uuid::parse_str(&row.get::<_, String>(1)?)?),
+                id: parse_uuid_text(row.get::<_, String>(0)?)?,
+                session_id: SessionId(parse_uuid_text(row.get::<_, String>(1)?)?),
                 role: role_from_str(row.get::<_, String>(2)?.as_str()),
                 content: row.get(3)?,
                 created_at: parse_dt(row.get(4)?),
@@ -223,7 +224,7 @@ impl SqliteStore {
             let status: String = row.get(4)?;
             let session_id: Option<String> = row.get(1)?;
             Ok(Some(Task {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?)?,
+                id: parse_uuid_text(row.get::<_, String>(0)?)?,
                 session_id: session_id.and_then(|id| Uuid::parse_str(&id).ok()),
                 name: row.get(2)?,
                 cron: row.get(3)?,
@@ -261,7 +262,7 @@ impl SqliteStore {
             let rows = stmt.query_map(params![id.to_string()], |row| {
                 let session_id: Option<String> = row.get(1)?;
                 Ok(MemoryItem {
-                    id: Uuid::parse_str(&row.get::<_, String>(0)?)?,
+                    id: parse_uuid_text(row.get::<_, String>(0)?)?,
                     session_id: session_id.and_then(|id| Uuid::parse_str(&id).ok()),
                     kind: row.get(2)?,
                     content: row.get(3)?,
@@ -276,7 +277,7 @@ impl SqliteStore {
             let rows = stmt.query_map([], |row| {
                 let session_id: Option<String> = row.get(1)?;
                 Ok(MemoryItem {
-                    id: Uuid::parse_str(&row.get::<_, String>(0)?)?,
+                    id: parse_uuid_text(row.get::<_, String>(0)?)?,
                     session_id: session_id.and_then(|id| Uuid::parse_str(&id).ok()),
                     kind: row.get(2)?,
                     content: row.get(3)?,
@@ -314,6 +315,11 @@ fn parse_dt(value: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&value)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+fn parse_uuid_text(value: String) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(&value)
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(err)))
 }
 
 fn role_to_str(role: &Role) -> &str {

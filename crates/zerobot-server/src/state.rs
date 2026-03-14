@@ -16,6 +16,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub store: Arc<SqliteStore>,
     pub tools: Arc<ToolRegistry>,
+    pub settings: Arc<zerobot_core::SettingsBundle>,
     pub events: Arc<EventBus>,
     pub mcp: Arc<McpRegistry>,
     pub plugins: Arc<PluginRegistry>,

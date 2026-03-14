@@ -9,9 +9,9 @@ use axum::{
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use uuid::Uuid;
 
-use zerobot_core::{ContextSummary, Role, SessionId, Task, TaskStatus, ToolDefinition};
+use zerobot_core::{ContextSummary, Role, SessionId, Task, TaskStatus, ToolDefinition, SettingsBundle};
 
-use crate::{agent::Supervisor, context::compress_messages, events::ServerEvent, state::AppState};
+use crate::{agent::Supervisor, context::compress_messages, events::ServerEvent, llm, state::AppState};
 
 #[derive(serde::Deserialize)]
 struct CreateSessionRequest {
@@ -75,6 +75,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/tasks", axum::routing::post(create_task))
         .route("/tasks/:id", axum::routing::get(get_task))
         .route("/permissions", axum::routing::get(get_permissions))
+        .route("/settings", axum::routing::get(get_settings))
+        .route("/llm/test", axum::routing::post(test_llm))
         .route("/openapi.json", axum::routing::get(openapi))
 }
 
@@ -172,11 +174,9 @@ async fn stream_events(
     require_api_key(&state, &headers)?;
     let session_id = parse_session_id(&id)?;
     let receiver = state.events.subscribe(&session_id).await;
-    let stream = BroadcastStream::new(receiver).filter_map(|event| async move {
-        match event {
-            Ok(ev) => Some(Ok(Event::default().event(ev.event_type).data(ev.data.to_string()))),
-            Err(_) => None,
-        }
+    let stream = BroadcastStream::new(receiver).filter_map(|event| match event {
+        Ok(ev) => Some(Ok(Event::default().event(ev.event_type).data(ev.data.to_string()))),
+        Err(_) => None,
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -328,6 +328,26 @@ async fn get_permissions(
         allow_edit: state.config.allow_edit,
         allow_delete: state.config.allow_delete,
     }))
+}
+
+async fn get_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsBundle>, StatusCode> {
+    require_api_key(&state, &headers)?;
+    Ok(Json(state.settings.as_ref().clone()))
+}
+
+async fn test_llm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<llm::LlmTestRequest>,
+) -> Result<Json<llm::LlmTestResponse>, StatusCode> {
+    require_api_key(&state, &headers)?;
+    let result = llm::test_llm(&state.settings.active, payload)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(result))
 }
 
 async fn openapi(

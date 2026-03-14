@@ -5,6 +5,7 @@ pub mod memory;
 pub mod permissions;
 pub mod plugin;
 pub mod session;
+pub mod settings;
 pub mod task;
 pub mod tool;
 
@@ -15,5 +16,6 @@ pub use memory::*;
 pub use permissions::*;
 pub use plugin::*;
 pub use session::*;
+pub use settings::*;
 pub use task::*;
 pub use tool::*;

@@ -10,8 +10,10 @@ mod api;
 mod agent;
 mod context;
 mod events;
+mod llm;
 mod mcp;
 mod plugins;
+mod settings;
 mod state;
 mod storage;
 mod tasks;
@@ -33,17 +35,20 @@ async fn main() -> anyhow::Result<()> {
     let store = storage::SqliteStore::new(data_dir.join("zerobot.db"))?;
     store.init()?;
 
-    let tool_registry = tools::ToolRegistry::new(&config, data_dir.clone())?;
+    let project_root = std::env::current_dir()?;
+    let settings_bundle = settings::load_settings(&project_root);
+    let tool_registry = tools::ToolRegistry::new(&config, &settings_bundle.active, data_dir.clone())?;
 
     let app_state = Arc::new(AppState {
         config: config.clone(),
         data_dir: data_dir.clone(),
         store,
         tools: tool_registry,
-        events: events::EventBus::default().into(),
-        mcp: mcp::McpRegistry::default().into(),
-        plugins: plugins::PluginRegistry::default().into(),
-        tasks: tasks::TaskScheduler::default().into(),
+        settings: Arc::new(settings_bundle),
+        events: Arc::new(events::EventBus::default()),
+        mcp: Arc::new(mcp::McpRegistry::default()),
+        plugins: Arc::new(plugins::PluginRegistry::default()),
+        tasks: Arc::new(tasks::TaskScheduler::default()),
     });
 
     app_state.plugins.load_from_dir(app_state.data_dir.join("plugins"))?;
@@ -57,9 +62,8 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = config.bind_addr.parse()?;
     tracing::info!("zerobot server listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(router.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }
 

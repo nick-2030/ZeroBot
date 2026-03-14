@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use zerobot_core::PluginManifest;
 
@@ -32,11 +32,5 @@ impl PluginRegistry {
 
     pub fn list(&self) -> Vec<PluginManifest> {
         self.plugins.lock().unwrap().clone()
-    }
-}
-
-impl From<PluginRegistry> for Arc<PluginRegistry> {
-    fn from(value: PluginRegistry) -> Self {
-        Arc::new(value)
     }
 }
