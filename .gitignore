@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Local data
+/data/
+
+# Logs
+*.log
