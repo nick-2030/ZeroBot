@@ -70,6 +70,8 @@ pub struct ChatResponse {
     pub output: String,
     pub raw: Value,
     pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,12 +221,19 @@ async fn chat_openai(settings: &ZeroSettings, request: ChatRequest) -> anyhow::R
         .unwrap_or("")
         .to_string();
     let tool_calls = parse_openai_tool_calls(&json);
+    let finish_reason = json
+        .get("choices")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Ok(ChatResponse {
         provider: "openai".to_string(),
         model,
         output,
         raw: json,
         tool_calls,
+        finish_reason,
     })
 }
 
@@ -282,12 +291,17 @@ async fn chat_anthropic(settings: &ZeroSettings, request: ChatRequest) -> anyhow
         .unwrap_or("")
         .to_string();
     let tool_calls = parse_anthropic_tool_calls(&json);
+    let finish_reason = json
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Ok(ChatResponse {
         provider: "anthropic".to_string(),
         model,
         output,
         raw: json,
         tool_calls,
+        finish_reason,
     })
 }
 
@@ -368,6 +382,7 @@ where
                         output,
                         raw: Value::Null,
                         tool_calls,
+                        finish_reason: None,
                     });
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(data) {
@@ -406,6 +421,7 @@ where
         output,
         raw: Value::Null,
         tool_calls,
+        finish_reason: None,
     })
 }
 
@@ -483,6 +499,7 @@ where
                         output,
                         raw: Value::Null,
                         tool_calls,
+                        finish_reason: None,
                     });
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(data) {
@@ -502,6 +519,7 @@ where
         output,
         raw: Value::Null,
         tool_calls,
+        finish_reason: None,
     })
 }
 

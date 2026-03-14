@@ -7,6 +7,23 @@ pub struct Supervisor {
     tools: std::sync::Arc<ToolRegistry>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AgentLimits {
+    max_steps: usize,
+    max_tool_calls_per_step: usize,
+    max_repeated_tool_calls: usize,
+}
+
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: 8,
+            max_tool_calls_per_step: 16,
+            max_repeated_tool_calls: 3,
+        }
+    }
+}
+
 impl Supervisor {
     pub fn new(tools: std::sync::Arc<ToolRegistry>) -> Self {
         Self { tools }
@@ -27,8 +44,10 @@ impl Supervisor {
         inject_tool_system_prompt(&mut llm_messages, tools);
         let tool_specs = build_tool_specs(tools);
         let mut tool_executions = Vec::new();
+        let limits = AgentLimits::default();
+        let mut recent_tool_signatures: Vec<String> = Vec::new();
 
-        for _ in 0..3 {
+        for _ in 0..limits.max_steps {
             let req = ChatRequest {
                 provider: None,
                 model: None,
@@ -41,7 +60,10 @@ impl Supervisor {
             let resp = llm::chat_stream_with_tools(settings, req, &mut on_chunk).await?;
 
             if !resp.tool_calls.is_empty() {
-                let calls: Vec<LlmToolCall> = resp.tool_calls.into_iter().map(ensure_call_id).collect();
+                let mut calls: Vec<LlmToolCall> = resp.tool_calls.into_iter().map(ensure_call_id).collect();
+                if calls.len() > limits.max_tool_calls_per_step {
+                    calls.truncate(limits.max_tool_calls_per_step);
+                }
                 let assistant_tool_calls = llm::to_openai_tool_calls(&calls);
                 llm_messages.push(LlmMessage {
                     role: "assistant".to_string(),
@@ -51,6 +73,18 @@ impl Supervisor {
                     tool_calls: Some(assistant_tool_calls),
                 });
                 for call in calls {
+                    let signature = format!("{}::{}", call.name, call.arguments);
+                    recent_tool_signatures.push(signature.clone());
+                    let repeats = recent_tool_signatures
+                        .iter()
+                        .filter(|sig| **sig == signature)
+                        .count();
+                    if repeats >= limits.max_repeated_tool_calls {
+                        return Ok(AgentOutcome {
+                            output: "检测到重复工具调用，已终止本轮。".to_string(),
+                            tool_executions,
+                        });
+                    }
                     on_tool_call(&call);
                     let result = self.tools.execute(&call.name, &call.arguments);
                     llm_messages.push(LlmMessage {
