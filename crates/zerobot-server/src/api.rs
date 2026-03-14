@@ -135,24 +135,65 @@ async fn send_message(
         .store
         .list_messages(&session_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let outputs = supervisor
-        .handle_user_message(&state.settings.active, &history, &payload.content)
+    state
+        .events
+        .publish(
+            &session_id,
+            ServerEvent {
+                event_type: "agent_status".to_string(),
+                data: serde_json::json!({ "state": "running" }),
+            },
+        )
+        .await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let events = state.events.clone();
+    let session_for_events = session_id.clone();
+    let publish_task = tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            events
+                .publish(
+                    &session_for_events,
+                    ServerEvent {
+                        event_type: "token".to_string(),
+                        data: serde_json::json!({ "content": chunk }),
+                    },
+                )
+                .await;
+        }
+    });
+
+    let outputs = match supervisor
+        .handle_user_message_stream(&state.settings.active, &history, &payload.content, |chunk| {
+            let _ = tx.send(chunk.to_string());
+        })
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    {
+        Ok(outputs) => outputs,
+        Err(err) => {
+            state
+                .events
+                .publish(
+                    &session_id,
+                    ServerEvent {
+                        event_type: "agent_status".to_string(),
+                        data: serde_json::json!({ "state": "failed", "error": err.to_string() }),
+                    },
+                )
+                .await;
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    drop(tx);
+    let _ = publish_task.await;
+
     for output in outputs {
         match output {
             crate::agent::AgentOutput::Assistant(text) => {
-                let msg = state
+                let _ = state
                     .store
                     .add_message(&session_id, Role::Assistant, text.clone())
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                state
-                    .events
-                    .publish(&session_id, ServerEvent {
-                        event_type: "token".to_string(),
-                        data: serde_json::json!({"content": msg.content}),
-                    })
-                    .await;
             }
             crate::agent::AgentOutput::Tool(result) => {
                 state
@@ -163,12 +204,26 @@ async fn send_message(
                     .events
                     .publish(&session_id, ServerEvent {
                         event_type: "tool_result".to_string(),
-                        data: serde_json::json!({"name": result.name, "output": result.output}),
+                        data: serde_json::json!({
+                            "name": result.name,
+                            "output": result.output,
+                            "is_error": result.is_error
+                        }),
                     })
                     .await;
             }
         }
     }
+    state
+        .events
+        .publish(
+            &session_id,
+            ServerEvent {
+                event_type: "agent_status".to_string(),
+                data: serde_json::json!({ "state": "completed" }),
+            },
+        )
+        .await;
 
     Ok(Json(serde_json::json!({"ok": true})))
 }

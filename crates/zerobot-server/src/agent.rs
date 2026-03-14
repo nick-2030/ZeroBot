@@ -14,12 +14,16 @@ impl Supervisor {
         Self { tools }
     }
 
-    pub async fn handle_user_message(
+    pub async fn handle_user_message_stream<F>(
         &self,
         settings: &ZeroSettings,
         messages: &[Message],
         content: &str,
-    ) -> anyhow::Result<Vec<AgentOutput>> {
+        mut on_chunk: F,
+    ) -> anyhow::Result<Vec<AgentOutput>>
+    where
+        F: FnMut(&str) + Send,
+    {
         if let Some(call) = parse_tool_call(content) {
             let result = self.tools.execute(&call.name, &call.arguments);
             return Ok(vec![
@@ -52,8 +56,8 @@ impl Supervisor {
             temperature: Some(0.2),
             max_tokens: Some(512),
         };
-        let resp = llm::chat(settings, req).await?;
-        Ok(vec![AgentOutput::Assistant(resp.output)])
+        let output = llm::chat_stream(settings, req, &mut on_chunk).await?;
+        Ok(vec![AgentOutput::Assistant(output)])
     }
 }
 
