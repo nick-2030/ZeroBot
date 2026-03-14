@@ -131,7 +131,14 @@ async fn send_message(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let supervisor = Supervisor::new(state.tools.clone());
-    let outputs = supervisor.handle_user_message(&session_id, &payload.content);
+    let history = state
+        .store
+        .list_messages(&session_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let outputs = supervisor
+        .handle_user_message(&state.settings.active, &history, &payload.content)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     for output in outputs {
         match output {
             crate::agent::AgentOutput::Assistant(text) => {

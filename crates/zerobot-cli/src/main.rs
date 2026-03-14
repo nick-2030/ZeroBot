@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
@@ -27,6 +28,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    ensure_server_running(&cli.server)?;
     match cli.command {
         Commands::Tui => tui::run(cli.server, cli.api_key),
         Commands::Acp => run_acp(cli.server, cli.api_key),
@@ -173,4 +175,43 @@ fn handle_rpc(client: &ZerobotClient, req: RpcRequest) -> RpcResponse {
             error: Some(RpcError { code: -32601, message: "method not found".to_string() }),
         },
     }
+}
+
+fn ensure_server_running(server: &str) -> anyhow::Result<()> {
+    if is_server_healthy(server) {
+        return Ok(());
+    }
+
+    let cmd = std::env::var("ZEROBOT_SERVER_CMD")
+        .unwrap_or_else(|_| "cargo run -p zerobot-server".to_string());
+
+    let mut child = std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(&cmd)
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("failed to start server via '{}': {}", cmd, err))?;
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        if is_server_healthy(server) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = child.try_wait();
+    anyhow::bail!("server did not become ready in time (waited 60s)")
+}
+
+fn is_server_healthy(server: &str) -> bool {
+    let url = format!("{}/health", server.trim_end_matches('/'));
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        return false;
+    };
+    rt.block_on(async move {
+        match reqwest::get(url).await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    })
 }

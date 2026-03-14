@@ -2671,6 +2671,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

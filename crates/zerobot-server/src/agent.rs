@@ -1,8 +1,8 @@
 use serde_json::Value;
-use uuid::Uuid;
 
-use zerobot_core::{Message, Role, SessionId, ToolCall, ToolResult};
+use zerobot_core::{Message, Role, ToolCall, ToolResult, ZeroSettings};
 
+use crate::llm::{self, ChatRequest, LlmMessage};
 use crate::tools::ToolRegistry;
 
 pub struct Supervisor {
@@ -14,16 +14,46 @@ impl Supervisor {
         Self { tools }
     }
 
-    pub fn handle_user_message(&self, session_id: &SessionId, content: &str) -> Vec<AgentOutput> {
-        let _ = session_id;
+    pub async fn handle_user_message(
+        &self,
+        settings: &ZeroSettings,
+        messages: &[Message],
+        content: &str,
+    ) -> anyhow::Result<Vec<AgentOutput>> {
         if let Some(call) = parse_tool_call(content) {
             let result = self.tools.execute(&call.name, &call.arguments);
-            return vec![
+            return Ok(vec![
                 AgentOutput::Tool(result),
                 AgentOutput::Assistant(format!("Tool `{}` executed", call.name)),
-            ];
+            ]);
         }
-        vec![AgentOutput::Assistant(format!("Stub response: {}", content))]
+        let chat_messages = messages
+            .iter()
+            .filter_map(|msg| match msg.role {
+                Role::System => Some(LlmMessage {
+                    role: "system".to_string(),
+                    content: msg.content.clone(),
+                }),
+                Role::User => Some(LlmMessage {
+                    role: "user".to_string(),
+                    content: msg.content.clone(),
+                }),
+                Role::Assistant => Some(LlmMessage {
+                    role: "assistant".to_string(),
+                    content: msg.content.clone(),
+                }),
+                Role::Tool => None,
+            })
+            .collect::<Vec<_>>();
+        let req = ChatRequest {
+            provider: None,
+            model: None,
+            messages: chat_messages,
+            temperature: Some(0.2),
+            max_tokens: Some(512),
+        };
+        let resp = llm::chat(settings, req).await?;
+        Ok(vec![AgentOutput::Assistant(resp.output)])
     }
 }
 
@@ -44,14 +74,4 @@ fn parse_tool_call(content: &str) -> Option<ToolCall> {
     let args = parts.next().unwrap_or("{}");
     let json: Value = serde_json::from_str(args).ok()?;
     Some(ToolCall { name, arguments: json })
-}
-
-pub fn tool_message(session_id: &SessionId, result: &ToolResult) -> Message {
-    Message {
-        id: Uuid::new_v4(),
-        session_id: session_id.clone(),
-        role: Role::Tool,
-        content: result.output.to_string(),
-        created_at: chrono::Utc::now(),
-    }
 }
