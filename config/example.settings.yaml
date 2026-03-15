@@ -52,6 +52,13 @@ tools:
     - grep
     - shell
   allow_paths: []
+  output:
+    # 工具输出的最大行数
+    max_lines: 2000
+    # 工具输出的最大字节数
+    max_bytes: 51200
+    # 截断方向：head 或 tail
+    direction: "head"
 
 # Agent 设置
 agent:

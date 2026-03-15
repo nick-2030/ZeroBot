@@ -31,6 +31,10 @@
 - `session.max_history`：历史消息最大数量。
 - `tools.enabled`：启用的工具列表。
 - `tools.allow_paths`：允许访问的路径（为空表示不限制）。
+- `tools.output.max_lines`：工具输出最大行数，超出会被截断并保存完整输出到文件。
+- `tools.output.max_bytes`：工具输出最大字节数。
+- `tools.output.direction`：截断方向，`head` 表示保留前部，`tail` 表示保留尾部。
+- `tools.output.max_lines` / `tools.output.max_bytes` 会同时生效，任一超过即截断。
 - `agent.system_prompt`：系统提示词。
 - `agent.max_steps`：单次回合最大步骤数。
 - `logging.level`：日志级别。

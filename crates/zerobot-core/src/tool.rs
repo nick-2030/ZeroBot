@@ -1,3 +1,4 @@
+use crate::config::{ToolOutputDirection, ToolOutputSettings};
 use crate::error::{ZeroBotError, ZeroBotResult};
 use async_trait::async_trait;
 use diffy::Patch;
@@ -49,6 +50,23 @@ impl ToolContext {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
+    pub truncated: bool,
+}
+
+impl ToolOutput {
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            truncated: false,
+        }
+    }
+
+    pub fn truncated(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            truncated: true,
+        }
+    }
 }
 
 #[async_trait]
@@ -97,10 +115,25 @@ impl ToolRegistry {
         name: &str,
         args: JsonValue,
     ) -> ZeroBotResult<ToolOutput> {
+        self.run_with_settings(ctx, name, args, &ToolOutputSettings::default())
+            .await
+    }
+
+    pub async fn run_with_settings(
+        &self,
+        ctx: &ToolContext,
+        name: &str,
+        args: JsonValue,
+        output_settings: &ToolOutputSettings,
+    ) -> ZeroBotResult<ToolOutput> {
         let tool = self
             .get(name)
             .ok_or_else(|| ZeroBotError::Tool(format!("未知工具: {name}")))?;
-        tool.run(ctx, args).await
+        let output = tool.run(ctx, args).await?;
+        if output.truncated {
+            return Ok(output);
+        }
+        truncate_tool_output(&output.content, output_settings).await
     }
 
     pub fn with_builtin() -> Self {
@@ -116,11 +149,77 @@ impl ToolRegistry {
     }
 }
 
+async fn truncate_tool_output(
+    content: &str,
+    settings: &ToolOutputSettings,
+) -> ZeroBotResult<ToolOutput> {
+    let max_lines = settings.max_lines;
+    let max_bytes = settings.max_bytes;
+    let direction = settings.direction;
+
+    let lines: Vec<&str> = content.split('\n').collect();
+    let total_bytes = content.as_bytes().len();
+
+    if lines.len() <= max_lines && total_bytes <= max_bytes {
+        return Ok(ToolOutput::new(content));
+    }
+
+    let mut out: Vec<&str> = Vec::new();
+    let mut bytes = 0usize;
+    let mut hit_bytes = false;
+
+    if direction == ToolOutputDirection::Head {
+        for line in lines.iter().take(max_lines) {
+            let size = line.as_bytes().len() + if out.is_empty() { 0 } else { 1 };
+            if bytes + size > max_bytes {
+                hit_bytes = true;
+                break;
+            }
+            out.push(*line);
+            bytes += size;
+        }
+    } else {
+        for line in lines.iter().rev().take(max_lines) {
+            let size = line.as_bytes().len() + if out.is_empty() { 0 } else { 1 };
+            if bytes + size > max_bytes {
+                hit_bytes = true;
+                break;
+            }
+            out.push(*line);
+            bytes += size;
+        }
+        out.reverse();
+    }
+
+    let removed = if hit_bytes {
+        total_bytes.saturating_sub(bytes)
+    } else {
+        lines.len().saturating_sub(out.len())
+    };
+    let unit = if hit_bytes { "字节" } else { "行" };
+    let preview = out.join("\n");
+
+    let summary = format!("...已截断 {removed} {unit}...");
+    let hint = "输出过长已截断，建议使用 grep 搜索，或使用 read 搭配 offset/limit 查看指定范围。"
+        .to_string();
+    let message = if direction == ToolOutputDirection::Head {
+        format!("{preview}\n\n{summary}\n\n{hint}")
+    } else {
+        format!("{summary}\n\n{hint}\n\n{preview}")
+    };
+
+    Ok(ToolOutput::truncated(message))
+}
+
 struct ReadTool;
 
 #[derive(Deserialize)]
 struct ReadArgs {
     path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[async_trait]
@@ -137,7 +236,9 @@ impl Tool for ReadTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径"}
+                "path": {"type": "string", "description": "文件路径"},
+                "offset": {"type": "integer", "description": "起始行号（从 0 开始）"},
+                "limit": {"type": "integer", "description": "返回的最大行数"}
             },
             "required": ["path"]
         })
@@ -148,7 +249,17 @@ impl Tool for ReadTool {
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         let path = ctx.resolve_path(&args.path)?;
         let content = tokio::fs::read_to_string(path).await?;
-        Ok(ToolOutput { content })
+        let offset = args.offset.unwrap_or(0);
+        let limit = args.limit.unwrap_or(usize::MAX);
+        if offset == 0 && limit == usize::MAX {
+            return Ok(ToolOutput::new(content));
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        if offset >= lines.len() {
+            return Ok(ToolOutput::new(""));
+        }
+        let end = offset.saturating_add(limit).min(lines.len());
+        Ok(ToolOutput::new(lines[offset..end].join("\n")))
     }
 }
 
@@ -202,7 +313,7 @@ impl Tool for WriteTool {
         } else {
             tokio::fs::write(path, args.content).await?;
         }
-        Ok(ToolOutput { content: "写入完成".to_string() })
+        Ok(ToolOutput::new("写入完成"))
     }
 }
 
@@ -257,7 +368,7 @@ impl Tool for EditTool {
             0
         };
         tokio::fs::write(&path, content).await?;
-        Ok(ToolOutput { content: format!("已替换 {count} 处") })
+        Ok(ToolOutput::new(format!("已替换 {count} 处")))
     }
 }
 
@@ -300,7 +411,7 @@ impl Tool for PatchTool {
         let updated = diffy::apply(&content, &patch)
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         tokio::fs::write(&path, updated).await?;
-        Ok(ToolOutput { content: "补丁已应用".to_string() })
+        Ok(ToolOutput::new("补丁已应用"))
     }
 }
 
@@ -343,7 +454,7 @@ impl Tool for GlobTool {
                 results.push(path.to_string_lossy().to_string());
             }
         }
-        Ok(ToolOutput { content: results.join("\n") })
+        Ok(ToolOutput::new(results.join("\n")))
     }
 }
 
@@ -399,7 +510,7 @@ impl Tool for GrepTool {
             }
         }
 
-        Ok(ToolOutput { content: matches.join("\n") })
+        Ok(ToolOutput::new(matches.join("\n")))
     }
 }
 
@@ -453,7 +564,7 @@ impl Tool for ShellTool {
         text.push_str("\n[stderr]\n");
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         text.push_str(&format!("\n[exit_code]\n{}", output.status.code().unwrap_or(-1)));
-        Ok(ToolOutput { content: text })
+        Ok(ToolOutput::new(text))
     }
 }
 
@@ -471,5 +582,19 @@ mod tests {
         let args = serde_json::json!({"path": "test.txt", "content": "hi"});
         let output = registry.run(&ctx, "write", args).await.unwrap();
         assert_eq!(output.content, "写入完成");
+    }
+
+    #[tokio::test]
+    async fn truncates_tool_output_without_persisting() {
+        let _dir = TempDir::new().unwrap();
+        let settings = ToolOutputSettings {
+            max_lines: 2,
+            max_bytes: 16,
+            direction: ToolOutputDirection::Head,
+        };
+        let content = "line1\nline2\nline3\nline4";
+        let output = truncate_tool_output(content, &settings).await.unwrap();
+        assert!(output.truncated);
+        assert!(output.content.contains("已截断"));
     }
 }

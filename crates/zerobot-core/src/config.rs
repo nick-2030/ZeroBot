@@ -70,6 +70,8 @@ pub struct ToolSettings {
     pub enabled: Vec<String>,
     #[serde(default)]
     pub allow_paths: Vec<String>,
+    #[serde(default)]
+    pub output: ToolOutputSettings,
 }
 
 fn default_tool_list() -> Vec<String> {
@@ -83,6 +85,36 @@ fn default_tool_list() -> Vec<String> {
         "shell".to_string(),
     ]
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutputSettings {
+    #[serde(default = "default_tool_output_max_lines")]
+    pub max_lines: usize,
+    #[serde(default = "default_tool_output_max_bytes")]
+    pub max_bytes: usize,
+    #[serde(default = "default_tool_output_direction")]
+    pub direction: ToolOutputDirection,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputDirection {
+    Head,
+    Tail,
+}
+
+fn default_tool_output_max_lines() -> usize {
+    2000
+}
+
+fn default_tool_output_max_bytes() -> usize {
+    50 * 1024
+}
+
+fn default_tool_output_direction() -> ToolOutputDirection {
+    ToolOutputDirection::Head
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
@@ -149,6 +181,17 @@ impl Default for ToolSettings {
         Self {
             enabled: default_tool_list(),
             allow_paths: Vec::new(),
+            output: ToolOutputSettings::default(),
+        }
+    }
+}
+
+impl Default for ToolOutputSettings {
+    fn default() -> Self {
+        Self {
+            max_lines: default_tool_output_max_lines(),
+            max_bytes: default_tool_output_max_bytes(),
+            direction: default_tool_output_direction(),
         }
     }
 }

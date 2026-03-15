@@ -202,7 +202,11 @@ impl Agent {
             self.settings.tools.allow_paths.iter().map(std::path::PathBuf::from).collect(),
         );
 
-        match self.tools.run(&ctx, &call.name, call.arguments).await {
+        match self
+            .tools
+            .run_with_settings(&ctx, &call.name, call.arguments, &self.settings.tools.output)
+            .await
+        {
             Ok(output) => {
                 self.store
                     .record_tool_output(&tool_call_id, &output.content)
