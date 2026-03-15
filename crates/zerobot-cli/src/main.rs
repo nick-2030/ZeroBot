@@ -284,6 +284,7 @@ async fn run_repl(
                         AgentEvent::AssistantMessage { content } => {
                             blink.stop();
                             print_block(DotColor::White, &content);
+                            print_gap();
                         }
                         AgentEvent::ToolCallStarted { name, input } => {
                             if streaming {
@@ -298,16 +299,17 @@ async fn run_repl(
                             };
                             blink.start(&label);
                         }
-                        AgentEvent::ToolCallFinished { name, output, ok } => {
+                        AgentEvent::ToolCallFinished { name: _name, output, ok } => {
                             blink.stop();
                             let color = if ok { DotColor::Green } else { DotColor::Red };
-                            let label = format!("工具 {} 完成", name);
-                            print_tool_output(color, &label, output.trim());
+                            print_tool_output(color, output.trim());
+                            print_gap();
                             blink.start("思考中");
                         }
                         AgentEvent::Error { message } => {
                             blink.stop();
                             print_block(DotColor::Red, &message);
+                            print_gap();
                         }
                         _ => {}
                     }
@@ -319,6 +321,7 @@ async fn run_repl(
                     }
                     if let Ok(Err(err)) = result {
                         print_block(DotColor::Red, &format!("{}", err));
+                        print_gap();
                     }
                     break;
                 }
@@ -435,12 +438,10 @@ fn print_block(color: DotColor, text: &str) {
         DotColor::Green => style("●").green(),
         DotColor::Red => style("●").red(),
     };
-    let had_trailing_newline = text.ends_with('\n');
     let cleaned = text.trim_end_matches('\n');
 
     if cleaned.trim().is_empty() {
         println!("{} ", dot);
-        println!();
         return;
     }
 
@@ -451,24 +452,15 @@ fn print_block(color: DotColor, text: &str) {
             println!("  {}", line);
         }
     }
-
-    if had_trailing_newline {
-        println!();
-    } else {
-        println!();
-        println!();
-    }
 }
 
-fn print_tool_output(color: DotColor, label: &str, output: &str) {
+fn print_tool_output(color: DotColor, output: &str) {
     if output.trim().is_empty() {
-        print_block(color, label);
+        print_block(color, "");
         return;
     }
     let (lines, omitted) = truncate_lines(output, 3);
-    let mut joined = String::from(label);
-    joined.push('\n');
-    joined.push_str(&lines.join("\n"));
+    let mut joined = lines.join("\n");
     if omitted > 0 {
         joined.push_str(&format!("\n... 已省略 {} 行", omitted));
     }
@@ -498,6 +490,7 @@ struct StreamPrinter {
     started: bool,
     ended_with_newline: bool,
     color: DotColor,
+    at_line_start: bool,
 }
 
 impl StreamPrinter {
@@ -506,6 +499,7 @@ impl StreamPrinter {
             started: false,
             ended_with_newline: false,
             color,
+            at_line_start: false,
         }
     }
 
@@ -519,6 +513,7 @@ impl StreamPrinter {
             print!("{} ", dot);
             let _ = std::io::stdout().flush();
             self.started = true;
+            self.at_line_start = false;
         }
     }
 
@@ -526,12 +521,17 @@ impl StreamPrinter {
         if text.is_empty() {
             return;
         }
-        let chunk = if self.started {
-            text
-        } else {
-            text.trim_start_matches('\n')
-        };
-        print!("{chunk}");
+        let chunk = if self.started { text } else { text.trim_start_matches('\n') };
+        for ch in chunk.chars() {
+            if self.at_line_start {
+                print!("  ");
+                self.at_line_start = false;
+            }
+            print!("{ch}");
+            if ch == '\n' {
+                self.at_line_start = true;
+            }
+        }
         let _ = std::io::stdout().flush();
         self.ended_with_newline = chunk.ends_with('\n');
     }
@@ -540,15 +540,18 @@ impl StreamPrinter {
         if !self.started {
             return;
         }
-        if self.ended_with_newline {
-            println!();
-        } else {
-            println!();
+        if !self.ended_with_newline {
             println!();
         }
+        print_gap();
         self.started = false;
         self.ended_with_newline = false;
+        self.at_line_start = false;
     }
+}
+
+fn print_gap() {
+    println!();
 }
 
 struct Blink {
