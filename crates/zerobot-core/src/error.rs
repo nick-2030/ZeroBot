@@ -14,6 +14,10 @@ pub enum ZeroBotError {
     Tool(String),
     #[error("代理执行错误: {0}")]
     Agent(String),
+    #[error("MCP 错误: {0}")]
+    Mcp(String),
+    #[error("Skill 错误: {0}")]
+    Skill(String),
     #[error("IO 错误: {0}")]
     Io(String),
     #[error("网络请求错误: {0}")]

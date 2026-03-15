@@ -17,5 +17,5 @@ pub use error::{ZeroBotError, ZeroBotResult};
 pub use events::AgentEvent;
 pub use provider::{Provider, ProviderEvent, ProviderRequest, ProviderResponse, ToolSpec};
 pub use session::{Message, MessageRole, Session, SessionStore, SqliteSessionStore};
-pub use skills::Skill;
+pub use skills::{SkillContent, SkillInfo, SkillManager};
 pub use tool::{ToolContext, ToolRegistry};

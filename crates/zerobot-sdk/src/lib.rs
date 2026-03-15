@@ -28,7 +28,7 @@ impl ZeroBot {
         Ok(Self {
             settings,
             store: Arc::new(store),
-            tools: ToolRegistry::with_builtin(),
+            tools: ToolRegistry::with_builtin_async(&settings, &cwd).await?,
             cwd,
             model,
         })

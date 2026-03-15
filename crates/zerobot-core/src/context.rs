@@ -1,6 +1,7 @@
 use crate::config::Settings;
 use crate::provider::{ProviderMessage, ProviderMessageRole};
 use crate::session::{Message, MessageRole, StoredToolCall};
+use crate::skills::{format_skill_index, SkillInfo};
 use chrono::Local;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,15 @@ impl ContextManager {
     }
 
     pub fn build(&self, model: &str, history: &[Message]) -> ContextBuild {
+        self.build_with_skills(model, history, None)
+    }
+
+    pub fn build_with_skills(
+        &self,
+        model: &str,
+        history: &[Message],
+        skills: Option<&[SkillInfo]>,
+    ) -> ContextBuild {
         let max_messages = if self.settings.context.max_messages == 0 {
             self.settings.session.max_history
         } else {
@@ -69,7 +79,7 @@ impl ContextManager {
             .map(message_to_provider)
             .collect::<Vec<_>>();
 
-        let system = self.build_system_prompt(model, dropped_messages);
+        let system = self.build_system_prompt(model, dropped_messages, skills);
 
         ContextBuild {
             system,
@@ -79,7 +89,12 @@ impl ContextManager {
         }
     }
 
-    fn build_system_prompt(&self, model: &str, dropped_messages: usize) -> Option<String> {
+    fn build_system_prompt(
+        &self,
+        model: &str,
+        dropped_messages: usize,
+        skills: Option<&[SkillInfo]>,
+    ) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(prompt) = self.settings.agent.system_prompt.as_deref() {
             let trimmed = prompt.trim();
@@ -90,6 +105,12 @@ impl ContextManager {
 
         if self.settings.context.include_environment {
             parts.push(build_environment_block(model, &self.cwd));
+        }
+
+        if self.settings.skills.enabled {
+            if let Some(list) = skills {
+                parts.push(format_skill_index(list));
+            }
         }
 
         if dropped_messages > 0 {

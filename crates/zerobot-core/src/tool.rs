@@ -1,5 +1,7 @@
 use crate::config::{ToolOutputDirection, ToolOutputSettings};
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
+use crate::skills::{SkillManager, SkillContent};
 use async_trait::async_trait;
 use diffy::Patch;
 use regex::Regex;
@@ -95,6 +97,10 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
     pub fn specs(&self, enabled: &[String]) -> Vec<crate::provider::ToolSpec> {
         let mut specs = Vec::new();
         for name in enabled {
@@ -146,6 +152,104 @@ impl ToolRegistry {
         registry.register(GrepTool);
         registry.register(ShellTool);
         registry
+    }
+
+    pub async fn with_builtin_async(settings: &crate::config::Settings, cwd: &std::path::Path) -> ZeroBotResult<Self> {
+        let mut registry = Self::with_builtin();
+
+        if settings.skills.enabled {
+            let manager = Arc::new(SkillManager::new(settings, cwd));
+            registry.register(SkillTool { manager });
+        }
+
+        if let Some(mcp) = McpManager::new(settings, cwd).await? {
+            let mcp = Arc::new(mcp);
+            for tool in mcp.tools() {
+                let name = format!("mcp__{}__{}", tool.server, tool.name);
+                registry.tools.insert(
+                    name.clone(),
+                    Arc::new(McpToolAdapter {
+                        manager: Arc::clone(&mcp),
+                        full_name: name,
+                        tool,
+                    }),
+                );
+            }
+        }
+
+        Ok(registry)
+    }
+}
+
+struct SkillTool {
+    manager: Arc<SkillManager>,
+}
+
+#[derive(Deserialize)]
+struct SkillArgs {
+    name: String,
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        "skill"
+    }
+
+    fn description(&self) -> &str {
+        "加载指定 Skill 的内容"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill 名称"}
+            },
+            "required": ["name"]
+        })
+    }
+
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: SkillArgs = serde_json::from_value(args)
+            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let SkillContent { info, body } = self.manager.load(&args.name)?;
+        let output = format!(
+            "<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>",
+            info.name,
+            info.path.display(),
+            body
+        );
+        Ok(ToolOutput::new(output))
+    }
+}
+
+struct McpToolAdapter {
+    manager: Arc<McpManager>,
+    full_name: String,
+    tool: McpToolInfo,
+}
+
+#[async_trait]
+impl Tool for McpToolAdapter {
+    fn name(&self) -> &str {
+        &self.full_name
+    }
+
+    fn description(&self) -> &str {
+        &self.tool.description
+    }
+
+    fn parameters(&self) -> JsonValue {
+        self.tool.parameters.clone()
+    }
+
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let result = self
+            .manager
+            .call_tool(&self.tool.server, &self.tool.name, args)
+            .await?;
+        Ok(ToolOutput::new(format_tool_output(result)))
     }
 }
 
@@ -573,6 +677,9 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
+    use httpmock::Method::POST;
+    use httpmock::MockServer;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn registry_runs_builtin_tool() {
@@ -595,5 +702,62 @@ mod tests {
         let output = truncate_tool_output(content, &settings).await.unwrap();
         assert!(output.truncated);
         assert!(output.content.contains("已截断"));
+    }
+
+    #[tokio::test]
+    async fn registry_registers_mcp_tool() {
+        let server = MockServer::start();
+        let _init_mock = server.mock(|when, then| {
+            when.method(POST).body_contains("initialize");
+            then.json_body(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"ok": true}
+            }));
+        });
+        let _list_mock = server.mock(|when, then| {
+            when.method(POST).body_contains("tools/list");
+            then.json_body(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "tools": [
+                        {"name":"echo","description":"echo","inputSchema":{"type":"object"}}
+                    ]
+                }
+            }));
+        });
+        let _call_mock = server.mock(|when, then| {
+            when.method(POST).body_contains("tools/call");
+            then.json_body(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{"type":"text","text":"ok"}]
+                }
+            }));
+        });
+
+        let mut settings = crate::config::Settings::default();
+        settings.mcp.enabled = true;
+        settings.mcp.servers = vec![crate::config::McpServerConfig::Remote {
+            name: "remote-one".to_string(),
+            url: server.url("/mcp"),
+            headers: HashMap::new(),
+            timeout_ms: Some(5000),
+            enabled: Some(true),
+        }];
+        let registry = ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."))
+            .await
+            .unwrap();
+        let tool_name = "mcp__remote-one__echo";
+        assert!(registry.get(tool_name).is_some());
+
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![]);
+        let output = registry
+            .run(&ctx, tool_name, serde_json::json!({"text":"hi"}))
+            .await
+            .unwrap();
+        assert_eq!(output.content, "ok");
     }
 }

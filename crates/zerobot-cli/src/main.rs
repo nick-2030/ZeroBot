@@ -203,7 +203,7 @@ async fn run_exec(
         model,
         settings.clone(),
         store,
-        ToolRegistry::with_builtin(),
+        ToolRegistry::with_builtin_async(settings, cwd).await?,
         cwd.clone(),
     );
 
@@ -230,6 +230,7 @@ async fn run_repl(
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let store = Arc::new(store);
+    let tools = ToolRegistry::with_builtin_async(settings, cwd).await?;
 
     let rl_config = Config::builder()
         .auto_add_history(true)
@@ -265,7 +266,7 @@ async fn run_repl(
             model.clone(),
             settings.clone(),
             store.clone(),
-            ToolRegistry::with_builtin(),
+            tools.clone(),
             cwd.clone(),
         );
         let mut runner =

@@ -42,5 +42,16 @@
 - `agent.system_prompt`：系统提示词。
 - `agent.max_steps`：单次回合最大步骤数。
 - `logging.level`：日志级别。
-- `mcp.enabled`：预留开关。
-- `skills.enabled`：预留开关。
+- `mcp.enabled`：是否启用 MCP。
+- `mcp.servers`：MCP 服务器列表。
+  - `name`：服务器名称。
+  - `type`：`local` 或 `remote`。
+  - `command`：本地 MCP 启动命令（local）。
+  - `env`：本地 MCP 环境变量（local）。
+  - `protocol`：本地 MCP 协议（`content_length` 或 `line`，默认 `content_length`）。
+  - `url`：远程 MCP 地址（remote）。
+  - `headers`：远程 MCP 额外请求头（remote）。
+  - `timeout_ms`：请求超时毫秒数。
+  - `enabled`：是否启用该服务器。
+- `skills.enabled`：是否启用 Skill。
+- `skills.paths`：额外 Skill 目录列表。

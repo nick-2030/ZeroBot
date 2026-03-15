@@ -167,12 +167,72 @@ fn default_log_level() -> String {
 pub struct McpSettings {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsSettings {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpServerConfig {
+    Local {
+        name: String,
+        command: Vec<String>,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        protocol: Option<McpLocalProtocol>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        enabled: Option<bool>,
+    },
+    Remote {
+        name: String,
+        url: String,
+        #[serde(default)]
+        headers: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        enabled: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpLocalProtocol {
+    ContentLength,
+    Line,
+}
+
+impl Default for McpLocalProtocol {
+    fn default() -> Self {
+        McpLocalProtocol::ContentLength
+    }
+}
+
+impl McpServerConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            McpServerConfig::Local { name, .. } => name,
+            McpServerConfig::Remote { name, .. } => name,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            McpServerConfig::Local { enabled, .. } => enabled.unwrap_or(true),
+            McpServerConfig::Remote { enabled, .. } => enabled.unwrap_or(true),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -251,13 +311,19 @@ impl Default for LoggingSettings {
 
 impl Default for McpSettings {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            servers: Vec::new(),
+        }
     }
 }
 
 impl Default for SkillsSettings {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            paths: Vec::new(),
+        }
     }
 }
 
@@ -586,5 +652,45 @@ mod tests {
         let loader = ConfigLoader::new(cwd.to_path_buf());
         let loaded = loader.load().unwrap();
         assert_eq!(loaded.settings.default_provider, None);
+    }
+
+    #[test]
+    fn mcp_and_skills_config_parses() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        write_file(
+            &cwd.join(".zerobot/settings.yaml"),
+            r#"
+mcp:
+  enabled: true
+  servers:
+    - name: "local-one"
+      type: "local"
+      command: ["mcp-server", "--stdio"]
+      env:
+        KEY: "VALUE"
+      timeout_ms: 3000
+      enabled: true
+    - name: "remote-one"
+      type: "remote"
+      url: "https://example.com/mcp"
+      headers:
+        X-Token: "abc"
+      timeout_ms: 5000
+      enabled: false
+skills:
+  enabled: true
+  paths:
+    - "/tmp/skills"
+"#,
+        );
+        let loader = ConfigLoader::new(cwd.to_path_buf());
+        let loaded = loader.load().unwrap();
+        assert!(loaded.settings.mcp.enabled);
+        assert_eq!(loaded.settings.mcp.servers.len(), 2);
+        assert_eq!(loaded.settings.mcp.servers[0].name(), "local-one");
+        assert_eq!(loaded.settings.mcp.servers[1].name(), "remote-one");
+        assert!(loaded.settings.skills.enabled);
+        assert_eq!(loaded.settings.skills.paths.len(), 1);
     }
 }

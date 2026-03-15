@@ -97,10 +97,29 @@ agent:
 logging:
   level: "info"
 
-# MCP 预留
+# MCP 配置
 mcp:
   enabled: false
+  # MCP 服务器列表
+  servers:
+    - name: "local-tools"
+      type: "local"
+      command: ["mcp-server", "--stdio"]
+      env: {}
+      protocol: "content_length"
+      timeout_ms: 5000
+      enabled: true
+    - name: "remote-tools"
+      type: "remote"
+      url: "https://example.com/mcp"
+      headers: {}
+      timeout_ms: 5000
+      enabled: false
 
-# Skill 预留
+# Skill 配置
 skills:
   enabled: false
+  # 额外 Skill 目录
+  paths:
+    - "~/.zerobot/skills"
+    - "./.zerobot/skills"

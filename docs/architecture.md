@@ -17,7 +17,7 @@ Provider 层
 Context 层
   - 上下文裁剪、系统提示词与环境信息注入
 MCP 层（预留）
-  - 外部工具协议扩展
+  - 外部工具协议扩展（MCP 本地/远程）
 Infrastructure 层
   - 配置、日志、文件系统与持久化
 ```
@@ -41,4 +41,7 @@ Infrastructure 层
 
 - Provider：新增供应商适配器。
 - Tool：新增工具实现并注册。
-- MCP/Skill：一期预留 trait，后续实现协议与加载逻辑。
+- MCP：本地/远程 MCP 服务接入，工具统一注入。
+- Skill：Skill 发现与按需加载。
+- MCP：通过 ToolRegistry 注入 MCP 工具。
+- Skill：提供 skill 工具按需加载 Skill 内容。

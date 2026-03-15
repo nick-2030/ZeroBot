@@ -4,3 +4,4 @@
 # ZeroBot 本地配置与运行状态
 .zerobot/settings.local.yaml
 .zerobot/state/
+.zerobot/skills/

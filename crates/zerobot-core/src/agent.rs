@@ -69,10 +69,30 @@ impl Agent {
             }
 
             let history = self.store.list_messages(session_id).await?;
-            let context = ContextManager::new(&self.settings, self.cwd.clone())
-                .build(&self.model, &history);
+            let skill_list = if self.settings.skills.enabled {
+                let manager = crate::skills::SkillManager::new(&self.settings, &self.cwd);
+                manager.discover().ok()
+            } else {
+                None
+            };
+            let context = ContextManager::new(&self.settings, self.cwd.clone()).build_with_skills(
+                &self.model,
+                &history,
+                skill_list.as_deref(),
+            );
 
-            let tool_specs = self.tools.specs(&self.settings.tools.enabled);
+            let mut enabled = self.settings.tools.enabled.clone();
+            if self.settings.skills.enabled && !enabled.iter().any(|t| t == "skill") {
+                enabled.push("skill".to_string());
+            }
+            if self.settings.mcp.enabled {
+                for name in self.tools.names() {
+                    if name.starts_with("mcp__") && !enabled.contains(&name) {
+                        enabled.push(name);
+                    }
+                }
+            }
+            let tool_specs = self.tools.specs(&enabled);
             let request = ProviderRequest {
                 model: self.model.clone(),
                 system: context.system,
