@@ -212,7 +212,7 @@ async fn run_exec(
         })
     };
     let provider = (provider_factory)()?;
-    let mut tools = ToolRegistry::with_builtin_async(settings, cwd).await?;
+    let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
         settings.clone(),
@@ -273,7 +273,7 @@ async fn run_repl(
                 .map_err(|err| ZeroBotError::Provider(err.to_string()))
         })
     };
-    let mut tools = ToolRegistry::with_builtin_async(settings, cwd).await?;
+    let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
         settings.clone(),

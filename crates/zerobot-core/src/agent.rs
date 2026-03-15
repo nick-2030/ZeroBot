@@ -8,6 +8,7 @@ use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
 use crate::tool::{ToolContext, ToolRegistry};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
+use crate::skills::format_skill_stack;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -53,12 +54,14 @@ impl Agent {
         self.emit(&events, AgentEvent::UserMessage { content: input.to_string() });
 
         let mut input_text = input.to_string();
+        let skill_hooks = self.load_skill_hooks(session_id).await?;
         let decision = self
             .hooks
             .apply_event(
                 HookEvent::UserPromptSubmit,
                 session_id,
                 serde_json::json!({ "prompt": input_text }),
+                &skill_hooks,
             )
             .await?;
         if matches!(decision.action, HookAction::Deny) {
@@ -105,6 +108,14 @@ impl Agent {
                 &history,
                 skill_list.as_deref(),
             );
+            let skill_stack = self.store.get_skill_stack(session_id).await?;
+            let mut system = context.system.unwrap_or_default();
+            if !skill_stack.is_empty() {
+                if !system.trim().is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&format_skill_stack(&skill_stack));
+            }
 
             let mut enabled = self.settings.tools.enabled.clone();
             if self.settings.skills.enabled && !enabled.iter().any(|t| t == "skill") {
@@ -120,12 +131,13 @@ impl Agent {
             let tool_specs = self.tools.specs(&enabled);
             let mut request = ProviderRequest {
                 model: self.model.clone(),
-                system: context.system,
+                system: if system.trim().is_empty() { None } else { Some(system) },
                 messages: context.messages,
                 tools: tool_specs,
                 max_tokens: None,
             };
 
+            let skill_hooks = self.load_skill_hooks(session_id).await?;
             let decision = self
                 .hooks
                 .apply_event(
@@ -133,6 +145,7 @@ impl Agent {
                     session_id,
                     serde_json::to_value(&request)
                         .map_err(|err| ZeroBotError::Agent(err.to_string()))?,
+                    &skill_hooks,
                 )
                 .await?;
             if matches!(decision.action, HookAction::Deny) {
@@ -175,9 +188,10 @@ impl Agent {
                 "content": content.clone(),
                 "tool_calls": tool_calls.clone(),
             });
+            let skill_hooks = self.load_skill_hooks(session_id).await?;
             let post_decision = self
                 .hooks
-                .apply_event(HookEvent::PostProvider, session_id, post_payload)
+                .apply_event(HookEvent::PostProvider, session_id, post_payload, &skill_hooks)
                 .await?;
             if matches!(post_decision.action, HookAction::Deny) {
                 let message = post_decision
@@ -218,6 +232,24 @@ impl Agent {
                         );
                     }
                 }
+                let skill_stack = self.store.get_skill_stack(session_id).await?;
+                if !skill_stack.is_empty() {
+                    let notice = format_skill_stack(&skill_stack);
+                    let _ = self
+                        .append_message_with_hooks(Message {
+                            id: Uuid::new_v4().to_string(),
+                            session_id: session_id.to_string(),
+                            role: MessageRole::System,
+                            content: format!(
+                                "Skill 仍在执行中，请继续完成并调用 skill end。\n\n{notice}"
+                            ),
+                            tool_call_id: None,
+                            tool_calls: None,
+                            created_at: Utc::now().timestamp(),
+                        })
+                        .await?;
+                    continue;
+                }
                 self.emit(&events, AgentEvent::Done);
                 break;
             }
@@ -255,12 +287,14 @@ impl Agent {
             }
         }
 
+        let skill_hooks = self.load_skill_hooks(session_id).await?;
         let _ = self
             .hooks
             .apply_event(
                 HookEvent::TaskCompleted,
                 session_id,
                 serde_json::json!({ "last_response": last_response }),
+                &skill_hooks,
             )
             .await;
         let _ = self
@@ -269,6 +303,7 @@ impl Agent {
                 HookEvent::Stop,
                 session_id,
                 serde_json::json!({ "last_response": last_response }),
+                &skill_hooks,
             )
             .await;
 
@@ -276,6 +311,7 @@ impl Agent {
     }
 
     async fn append_message_with_hooks(&self, mut message: Message) -> ZeroBotResult<Message> {
+        let skill_hooks = self.load_skill_hooks(&message.session_id).await?;
         let payload = serde_json::json!({
             "role": message.role.to_string(),
             "content": message.content.clone(),
@@ -283,7 +319,7 @@ impl Agent {
         });
         let decision = self
             .hooks
-            .apply_event(HookEvent::MessageAppend, &message.session_id, payload)
+            .apply_event(HookEvent::MessageAppend, &message.session_id, payload, &skill_hooks)
             .await?;
         if matches!(decision.action, HookAction::Deny) {
             let message = decision
@@ -310,9 +346,10 @@ impl Agent {
             "tool_name": call.name,
             "tool_input": args,
         });
+        let skill_hooks = self.load_skill_hooks(session_id).await?;
         let decision = self
             .hooks
-            .apply_event(HookEvent::PreToolUse, session_id, pre_payload)
+            .apply_event(HookEvent::PreToolUse, session_id, pre_payload, &skill_hooks)
             .await?;
         if matches!(decision.action, HookAction::Deny) {
             let message = decision
@@ -341,6 +378,7 @@ impl Agent {
                     created_at: Utc::now().timestamp(),
                 })
                 .await;
+            let skill_hooks = self.load_skill_hooks(session_id).await?;
             let _ = self
                 .hooks
                 .apply_event(
@@ -352,6 +390,7 @@ impl Agent {
                         "tool_output": message,
                         "ok": false,
                     }),
+                    &skill_hooks,
                 )
                 .await;
             self.emit(
@@ -402,9 +441,10 @@ impl Agent {
                     "tool_output": output_content,
                     "ok": ok,
                 });
+                let skill_hooks = self.load_skill_hooks(session_id).await?;
                 let post_decision = self
                     .hooks
-                    .apply_event(HookEvent::PostToolUse, session_id, post_payload)
+                    .apply_event(HookEvent::PostToolUse, session_id, post_payload, &skill_hooks)
                     .await?;
                 if matches!(post_decision.action, HookAction::Deny) {
                     ok = false;
@@ -448,6 +488,7 @@ impl Agent {
             Err(err) => {
                 let message = err.to_string();
                 let mut output_content = message.clone();
+                let skill_hooks = self.load_skill_hooks(session_id).await?;
                 let post_decision = self
                     .hooks
                     .apply_event(
@@ -459,6 +500,7 @@ impl Agent {
                             "tool_output": output_content,
                             "ok": false,
                         }),
+                        &skill_hooks,
                     )
                     .await?;
                 if matches!(post_decision.action, HookAction::Deny) {
@@ -506,5 +548,17 @@ impl Agent {
         if let Some(tx) = events {
             let _ = tx.send(event);
         }
+    }
+
+    async fn load_skill_hooks(
+        &self,
+        session_id: &str,
+    ) -> ZeroBotResult<Vec<crate::hooks::HookDefinition>> {
+        let stack = self.store.get_skill_stack(session_id).await?;
+        let mut hooks = Vec::new();
+        for entry in stack {
+            hooks.extend(entry.hooks);
+        }
+        Ok(hooks)
     }
 }

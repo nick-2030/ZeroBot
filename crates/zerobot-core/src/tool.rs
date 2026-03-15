@@ -6,7 +6,7 @@ use crate::hooks::HookManager;
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::provider::ProviderFactory;
 use crate::session::{SessionKind, SessionStore};
-use crate::skills::{SkillManager, SkillContent};
+use crate::skills::{SkillAction, SkillManager, SkillContent, SkillStackEntry};
 use async_trait::async_trait;
 use diffy::Patch;
 use regex::Regex;
@@ -164,12 +164,17 @@ impl ToolRegistry {
         registry
     }
 
-    pub async fn with_builtin_async(settings: &crate::config::Settings, cwd: &std::path::Path) -> ZeroBotResult<Self> {
+    pub async fn with_builtin_async(
+        settings: &crate::config::Settings,
+        cwd: &std::path::Path,
+        store: Option<Arc<dyn SessionStore>>,
+    ) -> ZeroBotResult<Self> {
         let mut registry = Self::with_builtin();
 
         if settings.skills.enabled {
+            let store = store.ok_or_else(|| ZeroBotError::Tool("Skill 需要 SessionStore".to_string()))?;
             let manager = Arc::new(SkillManager::new(settings, cwd));
-            registry.register(SkillTool { manager });
+            registry.register(SkillTool { manager, store });
         }
 
         if let Some(mcp) = McpManager::new(settings, cwd).await? {
@@ -290,6 +295,13 @@ impl Tool for SubagentTool {
         )
         .await?;
 
+        let parent_skill_hooks = self
+            .store
+            .get_skill_stack(&ctx.session_id)
+            .await?
+            .into_iter()
+            .flat_map(|entry| entry.hooks)
+            .collect::<Vec<_>>();
         let start_decision = self
             .parent_hooks
             .apply_event(
@@ -301,6 +313,7 @@ impl Tool for SubagentTool {
                     "subagent_session_id": session.id,
                     "prompt": args.prompt.clone(),
                 }),
+                &parent_skill_hooks,
             )
             .await?;
         if matches!(start_decision.action, crate::hooks::HookAction::Deny) {
@@ -337,6 +350,7 @@ impl Tool for SubagentTool {
                     "subagent_session_id": session.id,
                     "output": output_for_hook,
                 }),
+                &parent_skill_hooks,
             )
             .await;
         Ok(ToolOutput::new(output))
@@ -345,11 +359,15 @@ impl Tool for SubagentTool {
 
 struct SkillTool {
     manager: Arc<SkillManager>,
+    store: Arc<dyn SessionStore>,
 }
 
 #[derive(Deserialize)]
 struct SkillArgs {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    action: Option<SkillAction>,
 }
 
 #[async_trait]
@@ -366,23 +384,64 @@ impl Tool for SkillTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Skill 名称"}
+                "name": {"type": "string", "description": "Skill 名称"},
+                "action": {"type": "string", "enum": ["start", "end"], "description": "start 或 end"}
             },
-            "required": ["name"]
+            "required": []
         })
     }
 
     async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: SkillArgs = serde_json::from_value(args)
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
-        let SkillContent { info, body } = self.manager.load(&args.name)?;
-        let output = format!(
-            "<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>",
-            info.name,
-            info.path.display(),
-            body
-        );
-        Ok(ToolOutput::new(output))
+        let action = args.action.unwrap_or(SkillAction::Start);
+        match action {
+            SkillAction::Start => {
+                let name = args
+                    .name
+                    .ok_or_else(|| ZeroBotError::Tool("skill 缺少 name".to_string()))?;
+                let SkillContent { info, body } = self.manager.load(&name)?;
+                self.store
+                    .push_skill_stack(
+                        &_ctx.session_id,
+                        SkillStackEntry {
+                            name: info.name.clone(),
+                            description: info.description.clone(),
+                            path: info.path.clone(),
+                            hooks: info.hooks.clone(),
+                            started_at: chrono::Utc::now().timestamp(),
+                        },
+                    )
+                    .await?;
+                let output = format!(
+                    "<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>",
+                    info.name,
+                    info.path.display(),
+                    body
+                );
+                Ok(ToolOutput::new(output))
+            }
+            SkillAction::End => {
+                let current = self.store.get_skill_stack(&_ctx.session_id).await?;
+                if current.is_empty() {
+                    return Ok(ToolOutput::new("skill 栈为空，无需结束"));
+                }
+                let top = current.last().cloned();
+                if let Some(name) = args.name {
+                    if let Some(top) = top.as_ref() {
+                        if top.name != name {
+                            return Err(ZeroBotError::Tool(format!(
+                                "skill 栈顶为 {}，与 end 名称不一致",
+                                top.name
+                            )));
+                        }
+                    }
+                }
+                let popped = self.store.pop_skill_stack(&_ctx.session_id).await?;
+                let name = popped.map(|s| s.name).unwrap_or_else(|| "未知".to_string());
+                Ok(ToolOutput::new(format!("skill 已结束: {name}")))
+            }
+        }
     }
 }
 
@@ -912,7 +971,7 @@ mod tests {
             timeout_ms: Some(5000),
             enabled: Some(true),
         }];
-        let registry = ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."))
+        let registry = ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."), None)
             .await
             .unwrap();
         let tool_name = "mcp__remote-one__echo";

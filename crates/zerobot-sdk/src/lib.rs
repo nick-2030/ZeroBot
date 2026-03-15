@@ -31,12 +31,13 @@ impl ZeroBot {
         let settings = loaded.settings;
         let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
         store.init().await?;
+        let store = Arc::new(store);
         let model = resolve_model(&settings, None, None)?;
         let hooks = zerobot_core::hooks::HookManager::load(&settings, &cwd, None)?;
         Ok(Self {
             settings,
-            store: Arc::new(store),
-            tools: ToolRegistry::with_builtin_async(&settings, &cwd).await?,
+            store: store.clone(),
+            tools: ToolRegistry::with_builtin_async(&settings, &cwd, Some(store.clone())).await?,
             hooks,
             cwd,
             model,

@@ -88,6 +88,12 @@ agent:
     - 执行命令：使用 shell 并关注输出与错误。
     - 输出过长时，会被截断；可以用 read 的 offset/limit 获取局部内容。
 
+    ## Skill 协议
+    - 当调用 skill 工具时，会把 Skill 信息压入当前会话的 Skill 栈。
+    - 完成 Skill 后，必须调用 skill 工具并设置 action=end 来出栈。
+    - 只要 Skill 栈未清空，会话不会结束，会自动要求继续完成 Skill。
+    - skill 工具输出包含 name 与 path，需使用 read/glob/grep 按需读取 Skill 目录内的文件内容。
+
     ## 输出要求
     - 先给结论或下一步，再给必要的细节。
     - 如果需要用户决策或补充，明确提出问题。

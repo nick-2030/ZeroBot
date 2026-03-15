@@ -118,3 +118,10 @@ hooks:
 - `stop`：当前回合停止时触发。
 - `pre_provider`：调用模型前触发。
 - `post_provider`：模型响应后触发。
+
+## Skill 执行规则（内置）
+
+- 当调用 `skill` 工具时，会把 Skill 信息压入当前会话的 Skill 栈。
+- 完成 Skill 后，必须调用 `skill` 工具并设置 `action: end` 来出栈。
+- 只要 Skill 栈未清空，会话不会结束，会自动要求继续完成 Skill。
+- `skill` 工具输出包含 `name` 与 `path`，便于使用 `read/glob/grep` 读取 Skill 目录内的文件。

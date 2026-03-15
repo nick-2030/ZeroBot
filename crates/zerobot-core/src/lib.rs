@@ -32,5 +32,5 @@ pub use session::{
     SessionStore,
     SqliteSessionStore,
 };
-pub use skills::{SkillContent, SkillInfo, SkillManager};
+pub use skills::{format_skill_stack, SkillAction, SkillContent, SkillInfo, SkillManager, SkillStackEntry};
 pub use tool::{ToolContext, ToolRegistry};

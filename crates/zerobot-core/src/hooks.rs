@@ -1,6 +1,5 @@
 use crate::config::Settings;
 use crate::error::{ZeroBotError, ZeroBotResult};
-use crate::skills::SkillManager;
 use serde::Deserialize;
 use serde::{Serialize};
 use serde_json::Value as JsonValue;
@@ -65,7 +64,7 @@ pub enum HookAction {
     Modify,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookDefinition {
     pub name: String,
     pub command: Vec<String>,
@@ -131,16 +130,20 @@ pub struct HookDecision {
 
 #[derive(Debug, Clone)]
 pub struct HookManager {
-    hooks: Vec<HookDefinition>,
+    agent_hooks: Vec<HookDefinition>,
+    dir_hooks: Vec<HookDefinition>,
 }
 
 impl HookManager {
-    pub fn new(hooks: Vec<HookDefinition>) -> Self {
-        Self { hooks }
+    pub fn new(agent_hooks: Vec<HookDefinition>, dir_hooks: Vec<HookDefinition>) -> Self {
+        Self { agent_hooks, dir_hooks }
     }
 
     pub fn empty() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            agent_hooks: Vec::new(),
+            dir_hooks: Vec::new(),
+        }
     }
 
     pub fn load(
@@ -149,27 +152,16 @@ impl HookManager {
         agent_hooks: Option<Vec<HookDefinition>>,
     ) -> ZeroBotResult<Self> {
         let dir_hooks = read_hooks_dir(&cwd.join(".zerobot").join("hooks"))?;
-        let skill_hooks = if settings.skills.enabled {
-            let manager = SkillManager::new(settings, cwd);
-            let mut hooks = Vec::new();
-            for skill in manager.discover()? {
-                hooks.extend(skill.hooks);
-            }
-            hooks
-        } else {
-            Vec::new()
-        };
-
-        let merged = merge_hooks(
-            agent_hooks.unwrap_or_default(),
-            skill_hooks,
+        let _ = settings;
+        let _ = cwd;
+        Ok(Self {
+            agent_hooks: agent_hooks.unwrap_or_default(),
             dir_hooks,
-        );
-        Ok(Self { hooks: merged })
+        })
     }
 
     pub fn hooks(&self) -> &[HookDefinition] {
-        &self.hooks
+        &self.agent_hooks
     }
 
     pub async fn apply_event(
@@ -177,9 +169,11 @@ impl HookManager {
         event: HookEvent,
         session_id: &str,
         payload: JsonValue,
+        skill_hooks: &[HookDefinition],
     ) -> ZeroBotResult<HookDecision> {
+        let hooks = merge_hooks(self.agent_hooks.clone(), skill_hooks.to_vec(), self.dir_hooks.clone());
         let mut current = payload;
-        for hook in &self.hooks {
+        for hook in &hooks {
             if !hook.enabled() || !hook.matches(event, &current) {
                 continue;
             }
@@ -224,14 +218,14 @@ impl HookManager {
             "kind": kind.to_string(),
         });
         let _ = self
-            .apply_event(HookEvent::SessionStart, session_id, payload)
+            .apply_event(HookEvent::SessionStart, session_id, payload, &[])
             .await;
     }
 
     pub async fn run_session_end(&self, session_id: &str) {
         let payload = serde_json::json!({ "session_id": session_id });
         let _ = self
-            .apply_event(HookEvent::SessionEnd, session_id, payload)
+            .apply_event(HookEvent::SessionEnd, session_id, payload, &[])
             .await;
     }
 }
@@ -408,12 +402,13 @@ mod tests {
             enabled: Some(true),
             events: vec![HookEvent::PreToolUse],
         };
-        let manager = HookManager::new(vec![hook]);
+        let manager = HookManager::new(vec![hook], Vec::new());
         let decision = manager
             .apply_event(
                 HookEvent::PreToolUse,
                 "s1",
                 serde_json::json!({"tool_name":"shell","tool_input":{}}),
+                &[],
             )
             .await
             .unwrap();
@@ -435,12 +430,13 @@ mod tests {
             enabled: Some(true),
             events: vec![HookEvent::PreToolUse],
         };
-        let manager = HookManager::new(vec![hook]);
+        let manager = HookManager::new(vec![hook], Vec::new());
         let decision = manager
             .apply_event(
                 HookEvent::PreToolUse,
                 "s1",
                 serde_json::json!({"tool_name":"shell","tool_input":{}}),
+                &[],
             )
             .await
             .unwrap();

@@ -6,6 +6,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAction {
+    Start,
+    End,
+}
+
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
     pub name: String,
@@ -18,6 +25,15 @@ pub struct SkillInfo {
 pub struct SkillContent {
     pub info: SkillInfo,
     pub body: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkillStackEntry {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+    pub hooks: Vec<HookDefinition>,
+    pub started_at: i64,
 }
 
 pub struct SkillManager {
@@ -139,6 +155,24 @@ pub fn format_skill_index(skills: &[SkillInfo]) -> String {
         lines.push(format!("- {}：{}", skill.name, skill.description));
     }
     lines.push("当需要某个 Skill 时，调用 skill 工具加载具体内容。".to_string());
+    lines.join("\n")
+}
+
+pub fn format_skill_stack(stack: &[SkillStackEntry]) -> String {
+    if stack.is_empty() {
+        return "当前没有进行中的 Skill。".to_string();
+    }
+    let mut lines = Vec::new();
+    lines.push("当前 Skill 栈（必须按顺序完成并调用 skill end）：".to_string());
+    for skill in stack.iter().rev() {
+        lines.push(format!(
+            "- {}：{}（{}）",
+            skill.name,
+            skill.description,
+            skill.path.display()
+        ));
+    }
+    lines.push("未结束的 Skill 会阻止会话停止。".to_string());
     lines.join("\n")
 }
 
