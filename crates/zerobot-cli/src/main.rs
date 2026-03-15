@@ -298,11 +298,7 @@ async fn run_repl(
                                 streaming = false;
                             }
                             let args = one_line(&input);
-                            let label = if args.is_empty() {
-                                format!("{}", name)
-                            } else {
-                                format!("{} {}", name, args)
-                            };
+                            let label = format_tool_label(&name, &args);
                             last_tool_label = Some(label.clone());
                             blink.start(&label);
                         }
@@ -489,12 +485,48 @@ fn truncate_lines(text: &str, max: usize) -> (Vec<String>, usize) {
 }
 
 fn one_line(text: &str) -> String {
-    let mut out = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    const LIMIT: usize = 160;
-    if out.len() > LIMIT {
-        out.truncate(LIMIT);
-        out.push_str("...");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_tool_label(name: &str, args: &str) -> String {
+    let base = name.to_string();
+    if args.is_empty() {
+        return base;
     }
+    let mut full = format!("{base} {args}");
+    let max_label = terminal_width().unwrap_or(160).saturating_sub(2);
+    if full.chars().count() <= max_label {
+        return full;
+    }
+    let max_args = max_label.saturating_sub(base.chars().count() + 1);
+    if max_args == 0 {
+        return base;
+    }
+    let trimmed = truncate_chars(args, max_args);
+    full = format!("{base} {trimmed}");
+    full
+}
+
+fn terminal_width() -> Option<usize> {
+    let (cols, _rows) = console::Term::stdout().size();
+    if cols == 0 {
+        None
+    } else {
+        Some(cols as usize)
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return text.chars().take(max_chars).collect();
+    }
+    let keep = max_chars - 3;
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
     out
 }
 
@@ -598,7 +630,10 @@ impl Blink {
         self.visible = false;
         self.label = label.to_string();
         self.visible = true;
-        self.draw();
+        let symbol = "●";
+        let dot = style(symbol).white();
+        print!("\r\x1b[2K{} {}", dot, self.label);
+        let _ = std::io::stdout().flush();
     }
 
     fn stop(&mut self) {
@@ -619,15 +654,14 @@ impl Blink {
     }
 
     fn clear_line(&self) {
-        let len = self.label.chars().count() + 2;
-        print!("\r{}\r", " ".repeat(len));
+        print!("\r\x1b[2K\r");
         let _ = std::io::stdout().flush();
     }
 
     fn draw(&self) {
         let symbol = if self.visible { "●" } else { " " };
         let dot = style(symbol).white();
-        print!("\r{} {}", dot, self.label);
+        print!("\x1b[s\r{}\x1b[u", dot);
         let _ = std::io::stdout().flush();
     }
 }
