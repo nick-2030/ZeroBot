@@ -1,38 +1,42 @@
 [workspace]
+resolver = "2"
 members = [
   "crates/zerobot-core",
-  "crates/zerobot-server",
+  "crates/zerobot-cli",
   "crates/zerobot-sdk",
-  "crates/zerobot-cli"
 ]
-resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
-anyhow = "1"
-axum = { version = "0.7", features = ["macros", "json", "http2", "multipart"] }
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-crossterm = "0.27"
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+console = "0.15"
+diffy = "0.3"
 futures = "0.3"
 glob = "0.3"
-ratatui = "0.27"
-regex = "1"
-reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+httpmock = "0.7"
+ignore = "0.4"
+pretty_assertions = "1.4"
+regex = "1.10"
+tempfile = "3.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 serde_yaml = "0.9"
-thiserror = "1"
-tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+thiserror = "1.0"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "process", "time", "io-std"] }
+tokio-stream = "0.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["serde", "v4"] }
-walkdir = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.8", features = ["v4"] }
+walkdir = "2.5"
+
+[workspace.dependencies.sqlx]
+version = "0.8"
+features = ["runtime-tokio", "sqlite"]

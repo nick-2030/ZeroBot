@@ -1,0 +1,71 @@
+# ZeroBot 配置示例（YAML）
+# 作用域优先级: CLI > Managed > Local > Project > User > Defaults
+
+version: "1"
+
+# 默认提供商与模型
+# 如果在 providers 中指定了 model，会覆盖 default_model
+# 未设置时，CLI 需通过 --model 指定
+
+default_provider: "openai"
+default_model: "gpt-4o-mini"
+
+# 提供商配置
+providers:
+  openai:
+    kind: "openai"
+    # 直接写入 key（不推荐）
+    api_key: ""
+    # 或使用环境变量
+    api_key_env: "OPENAI_API_KEY"
+    # 可选，默认 https://api.openai.com/v1
+    base_url: ""
+    # 可选，优先于 default_model
+    model: ""
+    timeout_secs: 60
+  anthropic:
+    kind: "anthropic"
+    api_key: ""
+    api_key_env: "ANTHROPIC_API_KEY"
+    base_url: ""
+    model: ""
+    timeout_secs: 60
+
+# 会话与存储
+session:
+  # 默认数据库路径
+  db_path: "~/.zerobot/state/zerobot.db"
+  # 历史消息保留数量
+  max_history: 200
+
+# 工具开关
+# enabled 列表决定可用工具
+# allow_paths 为空表示不限制路径
+
+tools:
+  enabled:
+    - read
+    - write
+    - edit
+    - patch
+    - glob
+    - grep
+    - shell
+  allow_paths: []
+
+# Agent 设置
+agent:
+  system_prompt: ""
+  max_steps: 6
+
+# 日志设置
+logging:
+  level: "info"
+
+# MCP 预留
+mcp:
+  enabled: false
+
+# Skill 预留
+skills:
+  enabled: false

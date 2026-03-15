@@ -1,450 +1,378 @@
-use std::io::{self, BufRead, BufReader, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::{Duration, Instant};
-
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-
-use serde_json::Value;
-use zerobot_sdk::ZerobotClient;
+use console::style;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::{self, AsyncBufReadExt};
+use tokio::sync::mpsc;
+use tracing_subscriber::EnvFilter;
+use zerobot_core::agent::Agent;
+use zerobot_core::config::{ConfigLoader, Settings};
+use zerobot_core::events::AgentEvent;
+use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
+use zerobot_core::session::{SessionStore, SqliteSessionStore};
+use zerobot_core::tool::ToolRegistry;
 
 #[derive(Parser)]
 #[command(name = "zerobot")]
+#[command(about = "ZeroBot CLI", version = "0.1.0")]
 struct Cli {
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
     #[command(subcommand)]
-    command: Option<Commands>,
-
-    #[arg(long, default_value = "http://127.0.0.1:9080")]
-    server: String,
-
-    #[arg(long, default_value = "dev-key")]
-    api_key: String,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    Acp,
+enum Command {
+    Exec { prompt: String },
+    Session { #[command(subcommand)] cmd: SessionCmd },
+    Config { #[command(subcommand)] cmd: ConfigCmd },
+    Provider { #[command(subcommand)] cmd: ProviderCmd },
 }
 
-fn main() -> anyhow::Result<()> {
+#[derive(Subcommand)]
+enum SessionCmd {
+    New { title: Option<String> },
+    List,
+    Show { id: String },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    Show,
+    Layers,
+}
+
+#[derive(Subcommand)]
+enum ProviderCmd {
+    List,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
-    ensure_server_running(&cli.server)?;
-    match cli.command {
-        Some(Commands::Acp) => run_acp(cli.server, cli.api_key),
-        None => run_chat(cli.server, cli.api_key),
-    }
-}
+    init_tracing();
 
-#[derive(serde::Deserialize)]
-struct RpcRequest {
-    jsonrpc: String,
-    id: serde_json::Value,
-    method: String,
-    params: Option<serde_json::Value>,
-}
+    let cwd = cli
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let overrides = parse_overrides(cli.set)?;
 
-#[derive(serde::Serialize)]
-struct RpcResponse {
-    jsonrpc: &'static str,
-    id: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<RpcError>,
-}
+    let loader = ConfigLoader::new(cwd.clone()).with_cli_overrides(overrides);
+    let loaded = loader.load()?;
 
-#[derive(serde::Serialize)]
-struct RpcError {
-    code: i64,
-    message: String,
-}
-
-fn run_acp(server: String, api_key: String) -> anyhow::Result<()> {
-    let client = ZerobotClient::new(server, api_key);
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    if !loaded.warnings.is_empty() {
+        for warning in &loaded.warnings {
+            eprintln!("{} {}", style("警告").yellow(), warning);
         }
-        let request: Result<RpcRequest, _> = serde_json::from_str(&line);
-        let response = match request {
-            Ok(req) => handle_rpc(&client, req),
-            Err(err) => RpcResponse {
-                jsonrpc: "2.0",
-                id: serde_json::Value::Null,
-                result: None,
-                error: Some(RpcError { code: -32700, message: err.to_string() }),
-            },
-        };
-        let payload = serde_json::to_string(&response)?;
-        writeln!(stdout, "{}", payload)?;
-        stdout.flush()?;
+    }
+
+    let settings = loaded.settings.clone();
+
+    match cli.command {
+        Some(Command::Exec { prompt }) => {
+            run_exec(&settings, &cwd, cli.provider, cli.model, &prompt).await?;
+        }
+        Some(Command::Session { cmd }) => {
+            handle_session_cmd(&settings, cmd).await?;
+        }
+        Some(Command::Config { cmd }) => {
+            handle_config_cmd(&loaded, cmd)?;
+        }
+        Some(Command::Provider { cmd }) => {
+            handle_provider_cmd(&settings, cmd)?;
+        }
+        None => {
+            run_repl(&settings, &cwd, cli.provider, cli.model).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
+
+fn parse_overrides(values: Vec<String>) -> Result<Vec<(String, String)>> {
+    let mut overrides = Vec::new();
+    for raw in values {
+        if let Some((key, value)) = raw.split_once('=') {
+            overrides.push((key.trim().to_string(), value.trim().to_string()));
+        } else {
+            anyhow::bail!("覆盖配置格式错误，需使用 KEY=VALUE: {raw}");
+        }
+    }
+    Ok(overrides)
+}
+
+async fn handle_session_cmd(settings: &Settings, cmd: SessionCmd) -> Result<()> {
+    let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+    store.init().await?;
+
+    match cmd {
+        SessionCmd::New { title } => {
+            let session = store
+                .create_session(title.unwrap_or_else(|| "新会话".to_string()))
+                .await?;
+            println!("{} {}", style("会话创建成功:").green(), session.id);
+        }
+        SessionCmd::List => {
+            let sessions = store.list_sessions().await?;
+            for session in sessions {
+                println!("{}\t{}", session.id, session.title);
+            }
+        }
+        SessionCmd::Show { id } => {
+            let messages = store.list_messages(&id).await?;
+            for message in messages {
+                println!("[{}] {}", message.role.to_string(), message.content);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_config_cmd(loaded: &zerobot_core::config::LoadedConfig, cmd: ConfigCmd) -> Result<()> {
+    match cmd {
+        ConfigCmd::Show => {
+            let yaml = serde_yaml::to_string(&loaded.settings)?;
+            println!("{yaml}");
+        }
+        ConfigCmd::Layers => {
+            for layer in &loaded.layers {
+                let scope = format!("{:?}", layer.scope);
+                let path = layer
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<内置>".to_string());
+                let applied = if layer.applied { "应用" } else { "跳过" };
+                println!("{}\t{}\t{}", scope, applied, path);
+                if let Some(reason) = &layer.reason {
+                    println!("  原因: {reason}");
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn run_chat(server: String, api_key: String) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let client = ZerobotClient::new(server.clone(), api_key.clone());
-    let session_id = rt.block_on(client.create_session(Some("CLI Session".to_string())))?;
+fn handle_provider_cmd(settings: &Settings, cmd: ProviderCmd) -> Result<()> {
+    match cmd {
+        ProviderCmd::List => {
+            for (name, info) in &settings.providers {
+                println!("{}\t{}", name, info.kind);
+            }
+        }
+    }
+    Ok(())
+}
 
-    let (event_tx, event_rx) = mpsc::channel();
-    spawn_sse_thread(server.clone(), api_key.clone(), session_id.clone(), event_tx);
+async fn run_exec(
+    settings: &Settings,
+    cwd: &PathBuf,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    prompt: &str,
+) -> Result<()> {
+    let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+    store.init().await?;
+    let session = store
+        .create_session("一次性执行".to_string())
+        .await?;
 
-    let mut stdout = io::stdout();
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    loop {
-        write_line_user_prefix(&mut stdout)?;
-        let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
+    let provider = build_provider(settings, provider_override.as_deref())?;
+    let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
+
+    let agent = Agent::new(
+        provider,
+        model,
+        settings.clone(),
+        Arc::new(store),
+        ToolRegistry::with_builtin(),
+        cwd.clone(),
+    );
+
+    let output = agent.run_turn(&session.id, prompt, None).await?;
+    println!("{output}");
+    Ok(())
+}
+
+async fn run_repl(
+    settings: &Settings,
+    cwd: &PathBuf,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+) -> Result<()> {
+    let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+    store.init().await?;
+    let session = store
+        .create_session("交互会话".to_string())
+        .await?;
+
+    println!("{} {}", style("会话已启动:").green(), session.id);
+    println!("输入 /exit 退出");
+
+    let provider = build_provider(settings, provider_override.as_deref())?;
+    let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
+
+    let agent = Agent::new(
+        provider,
+        model,
+        settings.clone(),
+        Arc::new(store),
+        ToolRegistry::with_builtin(),
+        cwd.clone(),
+    );
+
+    let stdin = io::BufReader::new(io::stdin());
+    let mut lines = stdin.lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "/exit" || line == "exit" {
             break;
         }
-        let content = line.trim().to_string();
-        if content.is_empty() {
-            continue;
-        }
-        if let Err(err) = rt.block_on(client.send_message(&session_id, content)) {
-            write_line_error(&mut stdout, &format!("发送失败: {}", err))?;
-            continue;
-        }
-        wait_for_turn(&event_rx, &mut stdout)?;
-    }
-    Ok(())
-}
 
-fn handle_rpc(client: &ZerobotClient, req: RpcRequest) -> RpcResponse {
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    match req.method.as_str() {
-        "initialize" => RpcResponse {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: Some(serde_json::json!({
-                "serverInfo": {"name":"zerobot-acp","version":"0.1.0"},
-                "capabilities": {"sessions": true, "tools": true}
-            })),
-            error: None,
-        },
-        "session.create" => {
-            let title = req
-                .params
-                .as_ref()
-                .and_then(|v| v.get("title"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let result = rt.block_on(client.create_session(title));
-            match result {
-                Ok(id) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({"session_id": id})),
-                    error: None,
-                },
-                Err(err) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError { code: -32000, message: err.to_string() }),
-                },
-            }
-        }
-        "session.message" => {
-            let content = req
-                .params
-                .as_ref()
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let session_id = req
-                .params
-                .as_ref()
-                .and_then(|v| v.get("session_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let result = rt.block_on(client.send_message(&session_id, content));
-            match result {
-                Ok(_) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({"ok": true})),
-                    error: None,
-                },
-                Err(err) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError { code: -32000, message: err.to_string() }),
-                },
-            }
-        }
-        "tools.list" => {
-            let result = rt.block_on(client.list_tools());
-            match result {
-                Ok(tools) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: Some(serde_json::json!({"tools": tools})),
-                    error: None,
-                },
-                Err(err) => RpcResponse {
-                    jsonrpc: "2.0",
-                    id: req.id,
-                    result: None,
-                    error: Some(RpcError { code: -32000, message: err.to_string() }),
-                },
-            }
-        }
-        _ => RpcResponse {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: None,
-            error: Some(RpcError { code: -32601, message: "method not found".to_string() }),
-        },
-    }
-}
-
-enum UiEvent {
-    Sse { event_type: String, data: Value },
-}
-
-fn wait_for_turn(rx: &Receiver<UiEvent>, stdout: &mut io::Stdout) -> anyhow::Result<()> {
-    let mut output = String::new();
-    let mut assistant_started = false;
-    let mut assistant_line_open = false;
-    let mut can_rewrite = true;
-    loop {
-        let event = rx.recv().map_err(|_| anyhow::anyhow!("事件流已断开"))?;
-        match event {
-            UiEvent::Sse { event_type, data } => match event_type.as_str() {
-                "token" => {
-                    let chunk = data
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !assistant_started {
-                        render_pending(stdout)?;
-                        assistant_started = true;
-                        assistant_line_open = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handler = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AgentEvent::ToolCallStarted { name } => {
+                        println!("{} {}", style("调用工具:").cyan(), name);
                     }
-                    if !chunk.is_empty() {
-                        write!(stdout, "{}", chunk)?;
-                        stdout.flush()?;
-                    }
-                    output.push_str(chunk);
-                }
-                "tool_call" => {
-                    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
-                    let args = data.get("arguments").cloned().unwrap_or(Value::Null);
-                    if assistant_line_open {
-                        write!(stdout, "\n")?;
-                        stdout.flush()?;
-                        assistant_line_open = false;
-                        can_rewrite = false;
-                    }
-                    write_line_tool_pending(stdout, name, &args)?;
-                }
-                "tool_result" => {
-                    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
-                    let out = data.get("output").cloned().unwrap_or(Value::Null);
-                    let is_error = data.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if assistant_line_open {
-                        write!(stdout, "\n")?;
-                        stdout.flush()?;
-                        assistant_line_open = false;
-                        can_rewrite = false;
-                    }
-                    write_line_tool_result(stdout, name, &out, !is_error)?;
-                }
-                "agent_status" => {
-                    let state = data.get("state").and_then(|v| v.as_str()).unwrap_or("");
-                    match state {
-                        "completed" => {
-                            if assistant_started && can_rewrite {
-                                render_final(stdout, &output, true)?;
-                            } else if assistant_started {
-                                write_final_line(stdout, "", true)?;
-                            } else if output.trim().is_empty() {
-                                write_final_line(stdout, "", true)?;
-                            } else {
-                                write_final_line(stdout, &output, true)?;
-                            }
-                            return Ok(());
+                    AgentEvent::ToolCallFinished { name, output } => {
+                        println!("{} {}", style("工具完成:").cyan(), name);
+                        if !output.trim().is_empty() {
+                            println!("{}\n{}", style("工具输出:").dim(), output);
                         }
-                        "failed" => {
-                            let err = data.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                            let mut msg = output.clone();
-                            if msg.trim().is_empty() {
-                                msg = err.to_string();
-                            } else {
-                                msg.push_str(" ");
-                                msg.push_str(err);
-                            }
-                            if assistant_started && can_rewrite {
-                                render_final(stdout, &msg, false)?;
-                            } else {
-                                write_final_line(stdout, &msg, false)?;
-                            }
-                            return Ok(());
-                        }
-                        _ => {}
                     }
+                    AgentEvent::AssistantMessage { content } => {
+                        println!("{} {}", style("助手:").green(), content);
+                    }
+                    AgentEvent::Error { message } => {
+                        println!("{} {}", style("错误:").red(), message);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
+        });
+
+        let result = agent.run_turn(&session.id, &line, Some(tx)).await;
+        if let Err(err) = result {
+            println!("{} {}", style("错误:").red(), err);
         }
-    }
-}
-
-fn spawn_sse_thread(server: String, api_key: String, session_id: String, tx: Sender<UiEvent>) {
-    thread::spawn(move || loop {
-        let url = format!("{}/v1/sessions/{}/events", server.trim_end_matches('/'), session_id);
-        let client = reqwest::blocking::Client::new();
-        let resp = client
-            .get(url)
-            .header("x-zerobot-api-key", api_key.clone())
-            .send();
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(_) => {
-                thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
-        let mut event_type = String::new();
-        let mut data_buf = String::new();
-        let reader = BufReader::new(resp);
-        for line in reader.lines().flatten() {
-            let line = line.trim_end();
-            if line.is_empty() {
-                if !data_buf.is_empty() {
-                    let data = serde_json::from_str::<Value>(&data_buf)
-                        .unwrap_or_else(|_| Value::String(data_buf.clone()));
-                    let evt = UiEvent::Sse {
-                        event_type: if event_type.is_empty() {
-                            "message".to_string()
-                        } else {
-                            event_type.clone()
-                        },
-                        data,
-                    };
-                    let _ = tx.send(evt);
-                    event_type.clear();
-                    data_buf.clear();
-                }
-                continue;
-            }
-            if let Some(value) = line.strip_prefix("event:") {
-                event_type = value.trim().to_string();
-                continue;
-            }
-            if let Some(value) = line.strip_prefix("data:") {
-                if !data_buf.is_empty() {
-                    data_buf.push('\n');
-                }
-                data_buf.push_str(value.trim());
-            }
-        }
-        thread::sleep(Duration::from_millis(300));
-    });
-}
-
-fn write_line_user_prefix(stdout: &mut io::Stdout) -> anyhow::Result<()> {
-    write!(stdout, "\x1b[36m> \x1b[0m\n")?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn write_line_error(stdout: &mut io::Stdout, content: &str) -> anyhow::Result<()> {
-    let line = sanitize_output(content);
-    write!(stdout, "\x1b[31m● \x1b[0m{}\n", line)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn write_line_tool_pending(stdout: &mut io::Stdout, name: &str, args: &Value) -> anyhow::Result<()> {
-    let payload = sanitize_output(&format!("[tool:{}] {}", name, args));
-    write!(stdout, "\x1b[37m\x1b[5m● \x1b[0m{}\n", payload)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn write_line_tool_result(stdout: &mut io::Stdout, name: &str, output: &Value, ok: bool) -> anyhow::Result<()> {
-    let payload = sanitize_output(&format!("[tool:{}] {}", name, output));
-    let color = if ok { "\x1b[32m" } else { "\x1b[31m" };
-    write!(stdout, "{}● \x1b[0m{}\n", color, payload)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn render_pending(stdout: &mut io::Stdout) -> anyhow::Result<()> {
-    write!(stdout, "\r\x1b[2K\x1b[37m\x1b[5m● \x1b[0m")?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn render_final(stdout: &mut io::Stdout, content: &str, success: bool) -> anyhow::Result<()> {
-    let line = sanitize_output(content);
-    let color = if success { "\x1b[32m" } else { "\x1b[31m" };
-    write!(stdout, "\r\x1b[2K{}● \x1b[0m{}\n", color, line)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn write_final_line(stdout: &mut io::Stdout, content: &str, success: bool) -> anyhow::Result<()> {
-    let line = sanitize_output(content);
-    let color = if success { "\x1b[32m" } else { "\x1b[31m" };
-    write!(stdout, "{}● \x1b[0m{}\n", color, line)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn sanitize_output(input: &str) -> String {
-    input
-        .replace('\r', " ")
-        .replace('\n', " ")
-        .trim_end()
-        .to_string()
-}
-
-fn ensure_server_running(server: &str) -> anyhow::Result<()> {
-    if is_server_healthy(server) {
-        return Ok(());
+        let _ = handler.await;
     }
 
-    let cmd = std::env::var("ZEROBOT_SERVER_CMD")
-        .unwrap_or_else(|_| "cargo run -p zerobot-server".to_string());
-
-    let mut child = std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(&cmd)
-        .spawn()
-        .map_err(|err| anyhow::anyhow!("failed to start server via '{}': {}", cmd, err))?;
-
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(60) {
-        if is_server_healthy(server) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    let _ = child.try_wait();
-    anyhow::bail!("server did not become ready in time (waited 60s)")
+    Ok(())
 }
 
-fn is_server_healthy(server: &str) -> bool {
-    let url = format!("{}/health", server.trim_end_matches('/'));
-    let Ok(rt) = tokio::runtime::Runtime::new() else {
-        return false;
+fn build_provider(settings: &Settings, override_id: Option<&str>) -> Result<Box<dyn Provider>> {
+    let provider_id = override_id
+        .map(|s| s.to_string())
+        .or_else(|| settings.default_provider.clone())
+        .unwrap_or_else(|| "openai".to_string());
+
+    let info = settings.providers.get(&provider_id);
+    let (kind, key, base_url) = if let Some(info) = info {
+        (
+            info.kind.clone(),
+            resolve_api_key(info.api_key.clone(), info.api_key_env.clone(), &provider_id),
+            info.base_url.clone(),
+        )
+    } else {
+        (
+            provider_id.clone(),
+            resolve_api_key(None, None, &provider_id),
+            None,
+        )
     };
-    rt.block_on(async move {
-        match reqwest::get(url).await {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+
+    match kind.as_str() {
+        "openai" => Ok(Box::new(OpenAIProvider::new(key, base_url))),
+        "anthropic" => Ok(Box::new(AnthropicProvider::new(key, base_url))),
+        _ => anyhow::bail!("不支持的提供商类型: {kind}"),
+    }
+}
+
+fn resolve_model(
+    settings: &Settings,
+    provider_override: Option<&str>,
+    model_override: Option<&str>,
+) -> Result<String> {
+    if let Some(model) = model_override {
+        return Ok(model.to_string());
+    }
+
+    let provider_id = provider_override
+        .map(|s| s.to_string())
+        .or_else(|| settings.default_provider.clone())
+        .unwrap_or_else(|| "openai".to_string());
+
+    if let Some(info) = settings.providers.get(&provider_id) {
+        if let Some(model) = &info.model {
+            return Ok(model.clone());
         }
-    })
+    }
+
+    if let Some(model) = &settings.default_model {
+        return Ok(model.clone());
+    }
+
+    anyhow::bail!("未配置默认模型，请在 settings.yaml 中设置 default_model 或在 CLI 指定 --model")
+}
+
+fn resolve_api_key(api_key: Option<String>, api_key_env: Option<String>, provider_id: &str) -> String {
+    if let Some(key) = api_key {
+        return key;
+    }
+    if let Some(env) = api_key_env {
+        if let Ok(value) = std::env::var(env) {
+            return value;
+        }
+    }
+
+    let env_name = match provider_id {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        _ => "OPENAI_API_KEY",
+    };
+    std::env::var(env_name).unwrap_or_default()
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_exec() {
+        let args = ["zerobot", "exec", "hello"];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Command::Exec { prompt }) => assert_eq!(prompt, "hello"),
+            _ => panic!("命令解析失败"),
+        }
+    }
 }
