@@ -1,10 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use console::style;
+use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::{ColorMode, Config, Editor};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::Write;
-use tokio::io::{self, AsyncBufReadExt};
 use tokio::time::{self, Duration};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -229,13 +231,20 @@ async fn run_repl(
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let store = Arc::new(store);
 
-    let stdin = io::BufReader::new(io::stdin());
-    let mut lines = stdin.lines();
+    let rl_config = Config::builder()
+        .auto_add_history(true)
+        .color_mode(ColorMode::Enabled)
+        .build();
+    let mut rl = Editor::<(), DefaultHistory>::with_config(rl_config)?;
 
     loop {
-        print_prompt();
-        let Some(line) = lines.next_line().await? else {
-            break;
+        let prompt = format!("{} ", style(">").cyan());
+        let line = tokio::task::block_in_place(|| rl.readline(&prompt));
+        let line = match line {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(err) => return Err(anyhow::anyhow!("读取输入失败: {err}")),
         };
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -421,11 +430,6 @@ fn expand_home(path: &str) -> PathBuf {
 
 fn print_logo() {
     println!("{}", style("ZeroBot").cyan().bold());
-}
-
-fn print_prompt() {
-    print!("{} ", style(">").cyan());
-    let _ = std::io::stdout().flush();
 }
 
 #[derive(Copy, Clone)]
