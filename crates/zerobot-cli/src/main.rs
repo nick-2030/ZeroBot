@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::io::Write;
 use tokio::time::{self, Duration};
 use tokio::sync::mpsc;
-use tracing_subscriber::EnvFilter;
 use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::events::AgentEvent;
+use zerobot_core::logging::init_logging;
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
 use zerobot_core::session::{SessionStore, SqliteSessionStore};
 use zerobot_core::tool::ToolRegistry;
@@ -62,8 +62,6 @@ enum ProviderCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing();
-
     let cwd = cli
         .cwd
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -99,11 +97,6 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 fn parse_overrides(values: Vec<String>) -> Result<Vec<(String, String)>> {
@@ -194,6 +187,7 @@ async fn run_exec(
     let session = store
         .create_session("一次性执行".to_string())
         .await?;
+    let _log_guard = init_logging(settings, Some(&session.id))?;
 
     let provider = build_provider(settings, provider_override.as_deref())?;
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
@@ -223,6 +217,7 @@ async fn run_repl(
     let session = store
         .create_session("交互会话".to_string())
         .await?;
+    let _log_guard = init_logging(settings, Some(&session.id))?;
 
     print_logo();
     println!("{} {}", style("会话已启动:").green(), session.id);

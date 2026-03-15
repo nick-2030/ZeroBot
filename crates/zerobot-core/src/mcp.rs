@@ -204,8 +204,8 @@ impl McpClient for RemoteMcpClient {
     async fn initialize(&self) -> ZeroBotResult<()> {
         let params = serde_json::json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "clientInfo": { "name": "zerobot", "version": "0.1.0" },
-            "capabilities": {}
+            "capabilities": {},
+            "clientInfo": { "name": "zerobot", "version": "0.1.0" }
         });
         let _ = self.call("initialize", Some(params)).await?;
         Ok(())
@@ -363,8 +363,8 @@ impl McpClient for LocalMcpClient {
     async fn initialize(&self) -> ZeroBotResult<()> {
         let params = serde_json::json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "clientInfo": { "name": "zerobot", "version": "0.1.0" },
-            "capabilities": {}
+            "capabilities": {},
+            "clientInfo": { "name": "zerobot", "version": "0.1.0" }
         });
         let _ = self.call("initialize", Some(params)).await?;
         let _ = self.notify_initialized().await;
