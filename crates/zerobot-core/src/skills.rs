@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::hooks::HookDefinition;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use walkdir::WalkDir;
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    pub hooks: Vec<HookDefinition>,
     pub path: PathBuf,
 }
 
@@ -55,6 +57,7 @@ impl SkillManager {
                     out.push(SkillInfo {
                         name: meta.name,
                         description: meta.description,
+                        hooks: meta.hooks.unwrap_or_default(),
                         path: entry.path().to_path_buf(),
                     });
                 }
@@ -82,6 +85,8 @@ struct SkillFrontmatter {
     #[allow(dead_code)]
     #[serde(default)]
     metadata: HashMap<String, serde_yaml::Value>,
+    #[serde(default)]
+    hooks: Option<Vec<HookDefinition>>,
 }
 
 fn parse_skill_file(input: &str) -> ZeroBotResult<(SkillFrontmatter, String)> {

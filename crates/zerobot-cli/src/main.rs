@@ -14,8 +14,14 @@ use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::events::AgentEvent;
 use zerobot_core::logging::init_logging;
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
-use zerobot_core::session::{SessionStore, SqliteSessionStore};
-use zerobot_core::tool::ToolRegistry;
+use zerobot_core::session::{
+    create_session_with_hooks,
+    end_session_with_hooks,
+    SessionStore,
+    SqliteSessionStore,
+};
+use zerobot_core::tool::{SubagentTool, ToolRegistry};
+use zerobot_core::ZeroBotError;
 
 #[derive(Parser)]
 #[command(name = "zerobot")]
@@ -184,24 +190,52 @@ async fn run_exec(
 ) -> Result<()> {
     let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
     store.init().await?;
-    let session = store
-        .create_session("一次性执行".to_string())
-        .await?;
+    let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
+    let session = create_session_with_hooks(
+        &store,
+        &hooks,
+        "一次性执行".to_string(),
+        None,
+        zerobot_core::session::SessionKind::Main,
+    )
+    .await?;
     let _log_guard = init_logging(settings, Some(&session.id))?;
 
-    let provider = build_provider(settings, provider_override.as_deref())?;
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let store = Arc::new(store);
+    let provider_factory = {
+        let settings = settings.clone();
+        let provider_override = provider_override.clone();
+        Arc::new(move || {
+            build_provider(&settings, provider_override.as_deref())
+                .map_err(|err| ZeroBotError::Provider(err.to_string()))
+        })
+    };
+    let provider = (provider_factory)()?;
+    let mut tools = ToolRegistry::with_builtin_async(settings, cwd).await?;
+    let subagent_tools = tools.clone();
+    tools.register(SubagentTool::new(
+        settings.clone(),
+        store.clone(),
+        subagent_tools,
+        cwd.clone(),
+        provider_factory.clone(),
+        model.clone(),
+        hooks.clone(),
+    ));
     let agent = Agent::new(
         provider,
         model,
         settings.clone(),
         store,
-        ToolRegistry::with_builtin_async(settings, cwd).await?,
+        tools,
         cwd.clone(),
+        hooks.clone(),
     );
 
-    let output = agent.run_turn(&session.id, prompt, None).await?;
+    let result = agent.run_turn(&session.id, prompt, None).await;
+    end_session_with_hooks(&hooks, &session.id).await;
+    let output = result?;
     println!("{output}");
     Ok(())
 }
@@ -214,9 +248,15 @@ async fn run_repl(
 ) -> Result<()> {
     let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
     store.init().await?;
-    let session = store
-        .create_session("交互会话".to_string())
-        .await?;
+    let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
+    let session = create_session_with_hooks(
+        &store,
+        &hooks,
+        "交互会话".to_string(),
+        None,
+        zerobot_core::session::SessionKind::Main,
+    )
+    .await?;
     let _log_guard = init_logging(settings, Some(&session.id))?;
 
     print_logo();
@@ -225,7 +265,25 @@ async fn run_repl(
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let store = Arc::new(store);
-    let tools = ToolRegistry::with_builtin_async(settings, cwd).await?;
+    let provider_factory = {
+        let settings = settings.clone();
+        let provider_override = provider_override.clone();
+        Arc::new(move || {
+            build_provider(&settings, provider_override.as_deref())
+                .map_err(|err| ZeroBotError::Provider(err.to_string()))
+        })
+    };
+    let mut tools = ToolRegistry::with_builtin_async(settings, cwd).await?;
+    let subagent_tools = tools.clone();
+    tools.register(SubagentTool::new(
+        settings.clone(),
+        store.clone(),
+        subagent_tools,
+        cwd.clone(),
+        provider_factory.clone(),
+        model.clone(),
+        hooks.clone(),
+    ));
 
     let rl_config = Config::builder()
         .auto_add_history(true)
@@ -255,7 +313,7 @@ async fn run_repl(
         let (tx, mut rx) = mpsc::unbounded_channel();
         let session_id = session.id.clone();
         let input = line.clone();
-        let provider = build_provider(settings, provider_override.as_deref())?;
+        let provider = (provider_factory)()?;
         let agent = Agent::new(
             provider,
             model.clone(),
@@ -263,6 +321,7 @@ async fn run_repl(
             store.clone(),
             tools.clone(),
             cwd.clone(),
+            hooks.clone(),
         );
         let mut runner =
             tokio::spawn(async move { agent.run_turn(&session_id, &input, Some(tx)).await });
@@ -336,6 +395,7 @@ async fn run_repl(
         }
     }
 
+    end_session_with_hooks(&hooks, &session.id).await;
     Ok(())
 }
 

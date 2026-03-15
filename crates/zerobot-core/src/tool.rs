@@ -1,6 +1,11 @@
-use crate::config::{ToolOutputDirection, ToolOutputSettings};
+use crate::agent::Agent;
+use crate::agents::AgentManager;
+use crate::config::{Settings, ToolOutputDirection, ToolOutputSettings};
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::hooks::HookManager;
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
+use crate::provider::ProviderFactory;
+use crate::session::{SessionKind, SessionStore};
 use crate::skills::{SkillManager, SkillContent};
 use async_trait::async_trait;
 use diffy::Patch;
@@ -17,11 +22,16 @@ use walkdir::WalkDir;
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub allow_paths: Vec<PathBuf>,
+    pub session_id: String,
 }
 
 impl ToolContext {
-    pub fn new(cwd: PathBuf, allow_paths: Vec<PathBuf>) -> Self {
-        Self { cwd, allow_paths }
+    pub fn new(cwd: PathBuf, allow_paths: Vec<PathBuf>, session_id: impl Into<String>) -> Self {
+        Self {
+            cwd,
+            allow_paths,
+            session_id: session_id.into(),
+        }
     }
 
     pub fn resolve_path(&self, input: &str) -> ZeroBotResult<PathBuf> {
@@ -178,6 +188,158 @@ impl ToolRegistry {
         }
 
         Ok(registry)
+    }
+}
+
+pub struct SubagentTool {
+    settings: Settings,
+    store: Arc<dyn SessionStore>,
+    tools: ToolRegistry,
+    cwd: PathBuf,
+    provider_factory: ProviderFactory,
+    fallback_model: String,
+    parent_hooks: HookManager,
+}
+
+impl SubagentTool {
+    pub fn new(
+        settings: Settings,
+        store: Arc<dyn SessionStore>,
+        tools: ToolRegistry,
+        cwd: PathBuf,
+        provider_factory: ProviderFactory,
+        fallback_model: String,
+        parent_hooks: HookManager,
+    ) -> Self {
+        Self {
+            settings,
+            store,
+            tools,
+            cwd,
+            provider_factory,
+            fallback_model,
+            parent_hooks,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SubagentArgs {
+    name: String,
+    prompt: String,
+}
+
+#[async_trait]
+impl Tool for SubagentTool {
+    fn name(&self) -> &str {
+        "subagent"
+    }
+
+    fn description(&self) -> &str {
+        "调用指定子代理处理任务"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "子代理名称"},
+                "prompt": {"type": "string", "description": "子代理输入内容"}
+            },
+            "required": ["name", "prompt"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: SubagentArgs = serde_json::from_value(args)
+            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+
+        let manager = AgentManager::new(&self.cwd);
+        let def = manager.load(&args.name)?;
+
+        let name = def.name.clone();
+        let description = def.description.clone();
+        let model = def
+            .model
+            .clone()
+            .unwrap_or_else(|| self.fallback_model.clone());
+
+        let mut settings = self.settings.clone();
+        let mut system_prompt = String::new();
+        system_prompt.push_str(&format!("子代理描述：{}", def.description));
+        if !def.body.trim().is_empty() {
+            if !system_prompt.trim().is_empty() {
+                system_prompt.push_str("\n\n");
+            }
+            system_prompt.push_str(def.body.trim());
+        }
+        if !system_prompt.trim().is_empty() {
+            settings.agent.system_prompt = Some(system_prompt);
+        }
+        if let Some(tools) = def.tools.clone() {
+            settings.tools.enabled = tools;
+        }
+
+        let hooks = HookManager::load(&settings, &self.cwd, Some(def.hooks.clone()))?;
+        let session = crate::session::create_session_with_hooks(
+            self.store.as_ref(),
+            &hooks,
+            format!("子代理:{}", name),
+            Some(ctx.session_id.clone()),
+            SessionKind::Sub,
+        )
+        .await?;
+
+        let start_decision = self
+            .parent_hooks
+            .apply_event(
+                crate::hooks::HookEvent::SubagentStart,
+                &ctx.session_id,
+                serde_json::json!({
+                    "subagent_name": name,
+                    "subagent_description": description,
+                    "subagent_session_id": session.id,
+                    "prompt": args.prompt.clone(),
+                }),
+            )
+            .await?;
+        if matches!(start_decision.action, crate::hooks::HookAction::Deny) {
+            let message = start_decision
+                .message
+                .unwrap_or_else(|| "子代理调用被 Hook 拒绝".to_string());
+            crate::session::end_session_with_hooks(&hooks, &session.id).await;
+            return Err(ZeroBotError::Tool(message));
+        }
+
+        let provider = (self.provider_factory)()?;
+        let agent = Agent::new(
+            provider,
+            model,
+            settings,
+            self.store.clone(),
+            self.tools.clone(),
+            self.cwd.clone(),
+            hooks.clone(),
+        );
+
+        let result = agent.run_turn(&session.id, &args.prompt, None).await;
+        crate::session::end_session_with_hooks(&hooks, &session.id).await;
+        let output = result?;
+        let output_for_hook = output.clone();
+
+        let _ = self
+            .parent_hooks
+            .apply_event(
+                crate::hooks::HookEvent::SubagentStop,
+                &ctx.session_id,
+                serde_json::json!({
+                    "subagent_name": name,
+                    "subagent_session_id": session.id,
+                    "output": output_for_hook,
+                }),
+            )
+            .await;
+        Ok(ToolOutput::new(output))
     }
 }
 
@@ -680,11 +842,14 @@ mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use std::collections::HashMap;
+    use crate::provider::{Provider, ProviderFactory, ProviderRequest, ProviderResponse};
+    use crate::session::{SessionKind, SqliteSessionStore};
+    use async_trait::async_trait;
 
     #[tokio::test]
     async fn registry_runs_builtin_tool() {
         let dir = TempDir::new().unwrap();
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![]);
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1");
         let registry = ToolRegistry::with_builtin();
         let args = serde_json::json!({"path": "test.txt", "content": "hi"});
         let output = registry.run(&ctx, "write", args).await.unwrap();
@@ -753,11 +918,75 @@ mod tests {
         let tool_name = "mcp__remote-one__echo";
         assert!(registry.get(tool_name).is_some());
 
-        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![]);
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![], "s1");
         let output = registry
             .run(&ctx, tool_name, serde_json::json!({"text":"hi"}))
             .await
             .unwrap();
         assert_eq!(output.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_creates_child_session() {
+        struct DummyProvider;
+
+        #[async_trait]
+        impl Provider for DummyProvider {
+            fn id(&self) -> &str {
+                "dummy"
+            }
+
+            async fn send(&self, _request: ProviderRequest) -> ZeroBotResult<ProviderResponse> {
+                Ok(ProviderResponse {
+                    content: "子代理输出".to_string(),
+                    tool_calls: Vec::new(),
+                    raw: serde_json::json!({}),
+                })
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let agents_dir = dir.path().join(".zerobot/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("demo.md"),
+            r#"---
+name: demo
+description: 示例
+---
+
+子代理内容
+"#,
+        )
+        .unwrap();
+
+        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        store.init().await.unwrap();
+        let parent = store
+            .create_session_with_parent("主会话".to_string(), None, SessionKind::Main)
+            .await
+            .unwrap();
+
+        let provider_factory: ProviderFactory = std::sync::Arc::new(|| Ok(Box::new(DummyProvider)));
+        let settings = Settings::default();
+        let mut registry = ToolRegistry::with_builtin();
+        let subagent_tools = registry.clone();
+        let hooks = crate::hooks::HookManager::empty();
+        registry.register(SubagentTool::new(
+            settings.clone(),
+            std::sync::Arc::new(store),
+            subagent_tools,
+            dir.path().to_path_buf(),
+            provider_factory,
+            "dummy-model".to_string(),
+            hooks,
+        ));
+
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], parent.id.clone());
+        let output = registry
+            .run(&ctx, "subagent", serde_json::json!({"name":"demo","prompt":"hi"}))
+            .await
+            .unwrap();
+        assert_eq!(output.content, "子代理输出");
     }
 }

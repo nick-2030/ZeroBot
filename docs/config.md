@@ -55,3 +55,66 @@
   - `enabled`：是否启用该服务器。
 - `skills.enabled`：是否启用 Skill。
 - `skills.paths`：额外 Skill 目录列表。
+
+## 子代理与 Hook
+
+### 子代理目录
+
+- 项目级：`./.zerobot/agents/*.md`
+- 用户级：`~/.zerobot/agents/*.md`
+
+子代理文件必须包含 frontmatter，最小格式如下：
+
+```
+---
+name: demo
+description: "用于执行复杂检索或子任务"
+model: "gpt-4o-mini" # 可选，默认继承主模型
+tools: "read,grep,glob" # 可选，留空表示继承
+hooks: [] # 可选
+---
+
+这里是子代理的提示词正文，会作为子代理的系统提示词。`tools` 支持逗号分隔字符串或 YAML 列表。
+```
+
+### Hook 目录
+
+- 项目级：`./.zerobot/hooks/*.yaml`
+Hook 也可以写在子代理或 Skill 的 frontmatter 里，优先级：agent > skill > hooks 目录。
+
+Hook 文件格式：
+
+```
+hooks:
+  - name: "guard"
+    command: ["bash", "-lc", "echo '{\"action\":\"allow\"}'"]
+    matcher: "shell"
+    timeout_ms: 3000
+    enabled: true
+    events: ["pre_tool_use", "post_tool_use"]
+```
+
+### Hook 协议
+
+- stdin JSON：`{hook, session_id, payload}`
+- stdout JSON：`{action, message, patch}`
+  - `action`：`allow | deny | modify`
+  - `modify` 时会对 payload 做浅合并
+
+### Hook 事件
+
+`matcher` 目前仅对工具事件生效（匹配 `tool_name`），支持精确匹配或 `*` 通配。
+
+- `session_start`：会话创建后触发。
+- `session_end`：会话结束时触发。
+- `user_prompt_submit`：用户输入提交时触发。
+- `message_append`：追加消息时触发。
+- `pre_tool_use`：工具执行前触发。
+- `post_tool_use`：工具执行后触发。
+- `post_tool_use_failure`：工具执行失败触发。
+- `subagent_start`：子代理启动时触发。
+- `subagent_stop`：子代理结束时触发。
+- `task_completed`：当前回合完成时触发。
+- `stop`：当前回合停止时触发。
+- `pre_provider`：调用模型前触发。
+- `post_provider`：模型响应后触发。

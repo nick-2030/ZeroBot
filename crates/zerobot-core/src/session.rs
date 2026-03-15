@@ -7,14 +7,24 @@ use sqlx::{Pool, Sqlite};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
+use crate::hooks::HookManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub title: String,
+    pub parent_id: Option<String>,
+    pub kind: SessionKind,
     pub created_at: i64,
     pub updated_at: i64,
     pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    Main,
+    Sub,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +57,16 @@ pub struct StoredToolCall {
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn init(&self) -> ZeroBotResult<()>;
-    async fn create_session(&self, title: String) -> ZeroBotResult<Session>;
+    async fn create_session_with_parent(
+        &self,
+        title: String,
+        parent_id: Option<String>,
+        kind: SessionKind,
+    ) -> ZeroBotResult<Session>;
+    async fn create_session(&self, title: String) -> ZeroBotResult<Session> {
+        self.create_session_with_parent(title, None, SessionKind::Main)
+            .await
+    }
     async fn get_session(&self, id: &str) -> ZeroBotResult<Option<Session>>;
     async fn list_sessions(&self) -> ZeroBotResult<Vec<Session>>;
     async fn append_message(&self, message: Message) -> ZeroBotResult<()>;
@@ -98,6 +117,8 @@ impl SessionStore for SqliteSessionStore {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                parent_id TEXT,
+                kind TEXT NOT NULL DEFAULT 'main',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 archived_at INTEGER
@@ -106,6 +127,13 @@ impl SessionStore for SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
+
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN parent_id TEXT;")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'main';")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query(
             r#"
@@ -164,20 +192,29 @@ impl SessionStore for SqliteSessionStore {
         Ok(())
     }
 
-    async fn create_session(&self, title: String) -> ZeroBotResult<Session> {
+    async fn create_session_with_parent(
+        &self,
+        title: String,
+        parent_id: Option<String>,
+        kind: SessionKind,
+    ) -> ZeroBotResult<Session> {
         let now = Utc::now().timestamp();
         let session = Session {
             id: Uuid::new_v4().to_string(),
             title,
+            parent_id,
+            kind,
             created_at: now,
             updated_at: now,
             archived_at: None,
         };
         sqlx::query(
-            "INSERT INTO sessions (id, title, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id, title, parent_id, kind, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&session.id)
         .bind(&session.title)
+        .bind(&session.parent_id)
+        .bind(session.kind.to_string())
         .bind(session.created_at)
         .bind(session.updated_at)
         .bind(session.archived_at)
@@ -187,8 +224,8 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn get_session(&self, id: &str) -> ZeroBotResult<Option<Session>> {
-        let row = sqlx::query_as::<_, (String, String, i64, i64, Option<i64>)>(
-            "SELECT id, title, created_at, updated_at, archived_at FROM sessions WHERE id = ?",
+        let row = sqlx::query_as::<_, (String, String, Option<String>, String, i64, i64, Option<i64>)>(
+            "SELECT id, title, parent_id, kind, created_at, updated_at, archived_at FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -197,15 +234,17 @@ impl SessionStore for SqliteSessionStore {
         Ok(row.map(|row| Session {
             id: row.0,
             title: row.1,
-            created_at: row.2,
-            updated_at: row.3,
-            archived_at: row.4,
+            parent_id: row.2,
+            kind: SessionKind::from_str(&row.3),
+            created_at: row.4,
+            updated_at: row.5,
+            archived_at: row.6,
         }))
     }
 
     async fn list_sessions(&self) -> ZeroBotResult<Vec<Session>> {
-        let rows = sqlx::query_as::<_, (String, String, i64, i64, Option<i64>)>(
-            "SELECT id, title, created_at, updated_at, archived_at FROM sessions ORDER BY updated_at DESC",
+        let rows = sqlx::query_as::<_, (String, String, Option<String>, String, i64, i64, Option<i64>)>(
+            "SELECT id, title, parent_id, kind, created_at, updated_at, archived_at FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -215,9 +254,11 @@ impl SessionStore for SqliteSessionStore {
             .map(|row| Session {
                 id: row.0,
                 title: row.1,
-                created_at: row.2,
-                updated_at: row.3,
-                archived_at: row.4,
+                parent_id: row.2,
+                kind: SessionKind::from_str(&row.3),
+                created_at: row.4,
+                updated_at: row.5,
+                archived_at: row.6,
             })
             .collect())
     }
@@ -310,12 +351,21 @@ impl SessionStore for SqliteSessionStore {
 }
 
 impl MessageRole {
-    fn from_str(raw: &str) -> Self {
+    pub fn from_str(raw: &str) -> Self {
         match raw {
             "system" => MessageRole::System,
             "assistant" => MessageRole::Assistant,
             "tool" => MessageRole::Tool,
             _ => MessageRole::User,
+        }
+    }
+}
+
+impl SessionKind {
+    pub fn from_str(raw: &str) -> Self {
+        match raw {
+            "sub" => SessionKind::Sub,
+            _ => SessionKind::Main,
         }
     }
 }
@@ -349,6 +399,38 @@ impl ToString for MessageRole {
     }
 }
 
+impl ToString for SessionKind {
+    fn to_string(&self) -> String {
+        match self {
+            SessionKind::Main => "main".to_string(),
+            SessionKind::Sub => "sub".to_string(),
+        }
+    }
+}
+
+pub async fn create_session_with_hooks(
+    store: &dyn SessionStore,
+    hooks: &HookManager,
+    title: String,
+    parent_id: Option<String>,
+    kind: SessionKind,
+) -> ZeroBotResult<Session> {
+    let session = store
+        .create_session_with_parent(title, parent_id, kind)
+        .await?;
+    hooks
+        .run_session_start(&session.id, session.parent_id.clone(), session.kind.clone())
+        .await;
+    Ok(session)
+}
+
+pub async fn end_session_with_hooks(
+    hooks: &HookManager,
+    session_id: &str,
+) {
+    hooks.run_session_end(session_id).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +445,20 @@ mod tests {
         let session = store.create_session("test".to_string()).await.unwrap();
         let fetched = store.get_session(&session.id).await.unwrap().unwrap();
         assert_eq!(session.id, fetched.id);
+        assert_eq!(fetched.kind, SessionKind::Main);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_creates_child_session() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        store.init().await.unwrap();
+        let parent = store.create_session("parent".to_string()).await.unwrap();
+        let child = store
+            .create_session_with_parent("child".to_string(), Some(parent.id.clone()), SessionKind::Sub)
+            .await
+            .unwrap();
+        assert_eq!(child.parent_id, Some(parent.id));
+        assert_eq!(child.kind, SessionKind::Sub);
     }
 }

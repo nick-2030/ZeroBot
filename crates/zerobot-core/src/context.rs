@@ -1,6 +1,7 @@
 use crate::config::Settings;
 use crate::provider::{ProviderMessage, ProviderMessageRole};
 use crate::session::{Message, MessageRole, StoredToolCall};
+use crate::agents::{format_agent_index, AgentManager};
 use crate::skills::{format_skill_index, SkillInfo};
 use chrono::Local;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,21 @@ impl ContextManager {
         if self.settings.skills.enabled {
             if let Some(list) = skills {
                 parts.push(format_skill_index(list));
+            }
+        }
+
+        if self
+            .settings
+            .tools
+            .enabled
+            .iter()
+            .any(|t| t == "subagent")
+        {
+            let manager = AgentManager::new(&self.cwd);
+            if let Ok(list) = manager.discover() {
+                if !list.is_empty() {
+                    parts.push(format_agent_index(&list));
+                }
             }
         }
 

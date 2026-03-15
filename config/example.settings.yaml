@@ -60,6 +60,7 @@ tools:
     - glob
     - grep
     - shell
+    - subagent
   allow_paths: []
   output:
     # 工具输出的最大行数
@@ -123,3 +124,10 @@ skills:
   paths:
     - "~/.zerobot/skills"
     - "./.zerobot/skills"
+
+# 子代理与 Hook 目录（无需在配置中声明）
+# 子代理定义:
+# - 项目级: ./.zerobot/agents/*.md
+# - 用户级: ~/.zerobot/agents/*.md
+# Hook 定义:
+# - 项目级: ./.zerobot/hooks/*.yaml

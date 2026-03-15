@@ -6,13 +6,20 @@ use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::events::AgentEvent;
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
-use zerobot_core::session::{Session, SessionStore, SqliteSessionStore};
-use zerobot_core::tool::ToolRegistry;
+use zerobot_core::session::{
+    create_session_with_hooks,
+    Session,
+    SessionStore,
+    SqliteSessionStore,
+};
+use zerobot_core::tool::{SubagentTool, ToolRegistry};
+use zerobot_core::ZeroBotError;
 
 pub struct ZeroBot {
     settings: Settings,
     store: Arc<dyn SessionStore>,
     tools: ToolRegistry,
+    hooks: zerobot_core::hooks::HookManager,
     cwd: PathBuf,
     model: String,
 }
@@ -25,25 +32,32 @@ impl ZeroBot {
         let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
         store.init().await?;
         let model = resolve_model(&settings, None, None)?;
+        let hooks = zerobot_core::hooks::HookManager::load(&settings, &cwd, None)?;
         Ok(Self {
             settings,
             store: Arc::new(store),
             tools: ToolRegistry::with_builtin_async(&settings, &cwd).await?,
+            hooks,
             cwd,
             model,
         })
     }
 
     pub async fn start_session(&self, title: Option<String>) -> Result<SessionHandle> {
-        let session = self
-            .store
-            .create_session(title.unwrap_or_else(|| "新会话".to_string()))
-            .await?;
+        let session = create_session_with_hooks(
+            self.store.as_ref(),
+            &self.hooks,
+            title.unwrap_or_else(|| "新会话".to_string()),
+            None,
+            zerobot_core::session::SessionKind::Main,
+        )
+        .await?;
         Ok(SessionHandle {
             session,
             settings: self.settings.clone(),
             store: self.store.clone(),
             tools: self.tools.clone(),
+            hooks: self.hooks.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
         })
@@ -60,6 +74,7 @@ impl ZeroBot {
             settings: self.settings.clone(),
             store: self.store.clone(),
             tools: self.tools.clone(),
+            hooks: self.hooks.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
         })
@@ -72,32 +87,73 @@ pub struct SessionHandle {
     settings: Settings,
     store: Arc<dyn SessionStore>,
     tools: ToolRegistry,
+    hooks: zerobot_core::hooks::HookManager,
     cwd: PathBuf,
     model: String,
 }
 
 impl SessionHandle {
     pub async fn run(&self, input: &str) -> Result<String> {
+        let provider_factory = {
+            let settings = self.settings.clone();
+            Arc::new(move || {
+                build_provider(&settings, None)
+                    .map_err(|err| ZeroBotError::Provider(err.to_string()))
+            })
+        };
+        let provider = (provider_factory)()?;
+        let mut tools = self.tools.clone();
+        let subagent_tools = tools.clone();
+        tools.register(SubagentTool::new(
+            self.settings.clone(),
+            self.store.clone(),
+            subagent_tools,
+            self.cwd.clone(),
+            provider_factory.clone(),
+            self.model.clone(),
+            self.hooks.clone(),
+        ));
         let agent = Agent::new(
-            build_provider(&self.settings, None)?,
+            provider,
             self.model.clone(),
             self.settings.clone(),
             self.store.clone(),
-            self.tools.clone(),
+            tools,
             self.cwd.clone(),
+            self.hooks.clone(),
         );
         let output = agent.run_turn(&self.session.id, input, None).await?;
         Ok(output)
     }
 
     pub async fn run_stream(&self, input: &str) -> Result<mpsc::UnboundedReceiver<AgentEvent>> {
+        let provider_factory = {
+            let settings = self.settings.clone();
+            Arc::new(move || {
+                build_provider(&settings, None)
+                    .map_err(|err| ZeroBotError::Provider(err.to_string()))
+            })
+        };
+        let provider = (provider_factory)()?;
+        let mut tools = self.tools.clone();
+        let subagent_tools = tools.clone();
+        tools.register(SubagentTool::new(
+            self.settings.clone(),
+            self.store.clone(),
+            subagent_tools,
+            self.cwd.clone(),
+            provider_factory.clone(),
+            self.model.clone(),
+            self.hooks.clone(),
+        ));
         let agent = Agent::new(
-            build_provider(&self.settings, None)?,
+            provider,
             self.model.clone(),
             self.settings.clone(),
             self.store.clone(),
-            self.tools.clone(),
+            tools,
             self.cwd.clone(),
+            self.hooks.clone(),
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let session_id = self.session.id.clone();

@@ -9,6 +9,7 @@ Session 层
   - 会话管理、消息循环、状态持久化
 Agent 层
   - 任务编排、工具调用、权限边界
+  - 子代理（subagent）与 Hook 触发
 Tool 层
   - 工具注册、执行、结果处理
   - 工具输出截断
@@ -43,5 +44,7 @@ Infrastructure 层
 - Tool：新增工具实现并注册。
 - MCP：本地/远程 MCP 服务接入，工具统一注入。
 - Skill：Skill 发现与按需加载。
+- Subagent：通过 agent 定义文件扩展子代理能力。
+- Hook：通过 hooks 目录与元数据挂接扩展校验/改写。
 - MCP：通过 ToolRegistry 注入 MCP 工具。
 - Skill：提供 skill 工具按需加载 Skill 内容。

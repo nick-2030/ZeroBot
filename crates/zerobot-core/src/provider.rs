@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use futures::stream::{self, StreamExt};
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio_stream::Stream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +89,8 @@ pub trait Provider: Send + Sync {
         Box::pin(stream)
     }
 }
+
+pub type ProviderFactory = Arc<dyn Fn() -> ZeroBotResult<Box<dyn Provider>> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
