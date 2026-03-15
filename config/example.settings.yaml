@@ -60,6 +60,9 @@ tools:
     - glob
     - grep
     - shell
+    # 待办列表
+    - todoread
+    - todowrite
     - subagent
   allow_paths: []
   output:
@@ -87,6 +90,11 @@ agent:
     - 写代码：使用 write/edit/patch，避免手工描述改动。
     - 执行命令：使用 shell 并关注输出与错误。
     - 输出过长时，会被截断；可以用 read 的 offset/limit 获取局部内容。
+
+    ## Todo 规则
+    - 任务包含 3 步及以上时，优先使用 todowrite 创建 Todo 列表。
+    - Todo 只能有一个 in_progress，其余为 pending/completed/cancelled。
+    - 完成一个任务后立即更新对应 Todo 状态。
 
     ## Skill 协议
     - 当调用 skill 工具时，会把 Skill 信息压入当前会话的 Skill 栈。

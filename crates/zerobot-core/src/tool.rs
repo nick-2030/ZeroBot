@@ -5,7 +5,7 @@ use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookManager;
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::provider::ProviderFactory;
-use crate::session::{SessionKind, SessionStore};
+use crate::session::{SessionKind, SessionStore, TodoItem};
 use crate::skills::{SkillAction, SkillManager, SkillContent, SkillStackEntry};
 use async_trait::async_trait;
 use diffy::Patch;
@@ -18,19 +18,26 @@ use std::sync::Arc;
 use tokio::process::Command;
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub allow_paths: Vec<PathBuf>,
     pub session_id: String,
+    pub store: Option<Arc<dyn SessionStore>>,
 }
 
 impl ToolContext {
-    pub fn new(cwd: PathBuf, allow_paths: Vec<PathBuf>, session_id: impl Into<String>) -> Self {
+    pub fn new(
+        cwd: PathBuf,
+        allow_paths: Vec<PathBuf>,
+        session_id: impl Into<String>,
+        store: Option<Arc<dyn SessionStore>>,
+    ) -> Self {
         Self {
             cwd,
             allow_paths,
             session_id: session_id.into(),
+            store,
         }
     }
 
@@ -56,6 +63,10 @@ impl ToolContext {
         }
 
         Err(ZeroBotError::Tool("路径不在允许范围内".to_string()))
+    }
+
+    pub fn store(&self) -> Option<Arc<dyn SessionStore>> {
+        self.store.clone()
     }
 }
 
@@ -161,6 +172,8 @@ impl ToolRegistry {
         registry.register(GlobTool);
         registry.register(GrepTool);
         registry.register(ShellTool);
+        registry.register(TodoReadTool);
+        registry.register(TodoWriteTool);
         registry
     }
 
@@ -893,6 +906,89 @@ impl Tool for ShellTool {
     }
 }
 
+struct TodoReadTool;
+
+#[async_trait]
+impl Tool for TodoReadTool {
+    fn name(&self) -> &str {
+        "todoread"
+    }
+
+    fn description(&self) -> &str {
+        "读取当前会话的待办列表，返回 JSON 数组"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, _args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let store = ctx
+            .store()
+            .ok_or_else(|| ZeroBotError::Tool("Todo 工具需要 SessionStore".to_string()))?;
+        let todos = store.get_todos(&ctx.session_id).await?;
+        let content = serde_json::to_string_pretty(&todos)
+            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        Ok(ToolOutput::new(content))
+    }
+}
+
+struct TodoWriteTool;
+
+#[derive(Deserialize)]
+struct TodoWriteArgs {
+    todos: Vec<TodoItem>,
+}
+
+#[async_trait]
+impl Tool for TodoWriteTool {
+    fn name(&self) -> &str {
+        "todowrite"
+    }
+
+    fn description(&self) -> &str {
+        "创建或更新当前会话的待办列表（适合多步骤任务）。请提供完整列表并保持有且只有一项 in_progress，其余为 pending/completed/cancelled。"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "更新后的待办列表（完整覆盖）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "待办内容" },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
+                            "priority": { "type": "string", "enum": ["high", "medium", "low"] }
+                        },
+                        "required": ["content", "status", "priority"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: TodoWriteArgs = serde_json::from_value(args)
+            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let store = ctx
+            .store()
+            .ok_or_else(|| ZeroBotError::Tool("Todo 工具需要 SessionStore".to_string()))?;
+        store.set_todos(&ctx.session_id, &args.todos).await?;
+        let content = serde_json::to_string_pretty(&args.todos)
+            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        Ok(ToolOutput::new(content))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +997,7 @@ mod tests {
     use httpmock::Method::POST;
     use httpmock::MockServer;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use crate::provider::{Provider, ProviderFactory, ProviderRequest, ProviderResponse};
     use crate::session::{SessionKind, SqliteSessionStore};
     use async_trait::async_trait;
@@ -908,7 +1005,7 @@ mod tests {
     #[tokio::test]
     async fn registry_runs_builtin_tool() {
         let dir = TempDir::new().unwrap();
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1");
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None);
         let registry = ToolRegistry::with_builtin();
         let args = serde_json::json!({"path": "test.txt", "content": "hi"});
         let output = registry.run(&ctx, "write", args).await.unwrap();
@@ -977,12 +1074,55 @@ mod tests {
         let tool_name = "mcp__remote-one__echo";
         assert!(registry.get(tool_name).is_some());
 
-        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![], "s1");
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![], "s1", None);
         let output = registry
             .run(&ctx, tool_name, serde_json::json!({"text":"hi"}))
             .await
             .unwrap();
         assert_eq!(output.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn todo_tools_read_write() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        store.init().await.unwrap();
+        let session = store.create_session("test".to_string()).await.unwrap();
+        let store = Arc::new(store);
+
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], session.id.clone(), Some(store));
+        let registry = ToolRegistry::with_builtin();
+
+        let write_args = serde_json::json!({
+            "todos": [
+                {"content": "第一步", "status": "pending", "priority": "high"},
+                {"content": "第二步", "status": "in_progress", "priority": "medium"}
+            ]
+        });
+        let output = registry.run(&ctx, "todowrite", write_args).await.unwrap();
+        assert!(output.content.contains("第一步"));
+
+        let output = registry.run(&ctx, "todoread", serde_json::json!({})).await.unwrap();
+        assert!(output.content.contains("第二步"));
+    }
+
+    #[tokio::test]
+    async fn todo_tools_reject_invalid_status() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        store.init().await.unwrap();
+        let session = store.create_session("test".to_string()).await.unwrap();
+        let store = Arc::new(store);
+
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], session.id.clone(), Some(store));
+        let registry = ToolRegistry::with_builtin();
+        let write_args = serde_json::json!({
+            "todos": [
+                {"content": "无效状态", "status": "doing", "priority": "low"}
+            ]
+        });
+        let result = registry.run(&ctx, "todowrite", write_args).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1041,7 +1181,7 @@ description: 示例
             hooks,
         ));
 
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], parent.id.clone());
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], parent.id.clone(), None);
         let output = registry
             .run(&ctx, "subagent", serde_json::json!({"name":"demo","prompt":"hi"}))
             .await

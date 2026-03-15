@@ -86,6 +86,8 @@ fn default_tool_list() -> Vec<String> {
         "glob".to_string(),
         "grep".to_string(),
         "shell".to_string(),
+        "todoread".to_string(),
+        "todowrite".to_string(),
         "subagent".to_string(),
     ]
 }

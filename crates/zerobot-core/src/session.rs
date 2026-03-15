@@ -55,6 +55,30 @@ pub struct StoredToolCall {
     pub arguments: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoPriority {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+    pub priority: TodoPriority,
+}
+
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn init(&self) -> ZeroBotResult<()>;
@@ -88,6 +112,8 @@ pub trait SessionStore: Send + Sync {
     ) -> ZeroBotResult<()>;
     async fn pop_skill_stack(&self, session_id: &str) -> ZeroBotResult<Option<SkillStackEntry>>;
     async fn clear_skill_stack(&self, session_id: &str) -> ZeroBotResult<()>;
+    async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>>;
+    async fn set_todos(&self, session_id: &str, todos: &[TodoItem]) -> ZeroBotResult<()>;
 }
 
 #[derive(Clone)]
@@ -195,6 +221,28 @@ impl SessionStore for SqliteSessionStore {
         .await?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS todos (
+                session_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, position),
+                FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);")
             .execute(&self.pool)
             .await?;
 
@@ -427,6 +475,62 @@ impl SessionStore for SqliteSessionStore {
             .await?;
         Ok(())
     }
+
+    async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>> {
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT content, status, priority FROM todos WHERE session_id = ? ORDER BY position ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut items = Vec::new();
+        for (content, status_raw, priority_raw) in rows {
+            let status = serde_json::from_str::<TodoStatus>(&format!("\"{status_raw}\""))
+                .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
+            let priority = serde_json::from_str::<TodoPriority>(&format!("\"{priority_raw}\""))
+                .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
+            items.push(TodoItem {
+                content,
+                status,
+                priority,
+            });
+        }
+        Ok(items)
+    }
+
+    async fn set_todos(&self, session_id: &str, todos: &[TodoItem]) -> ZeroBotResult<()> {
+        let now = Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM todos WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        for (position, todo) in todos.iter().enumerate() {
+            let status = serde_json::to_string(&todo.status)
+                .unwrap_or_else(|_| "\"pending\"".to_string())
+                .trim_matches('"')
+                .to_string();
+            let priority = serde_json::to_string(&todo.priority)
+                .unwrap_or_else(|_| "\"medium\"".to_string())
+                .trim_matches('"')
+                .to_string();
+            sqlx::query(
+                "INSERT INTO todos (session_id, position, content, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(session_id)
+            .bind(position as i64)
+            .bind(&todo.content)
+            .bind(status)
+            .bind(priority)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 impl MessageRole {
@@ -561,5 +665,34 @@ mod tests {
         assert_eq!(popped.name, "demo");
         let stack = store.get_skill_stack(&session.id).await.unwrap();
         assert!(stack.is_empty());
+    }
+
+    #[tokio::test]
+    async fn todo_set_and_get() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        store.init().await.unwrap();
+        let session = store.create_session("test".to_string()).await.unwrap();
+
+        let todos = vec![
+            TodoItem {
+                content: "第一步".to_string(),
+                status: TodoStatus::Pending,
+                priority: TodoPriority::High,
+            },
+            TodoItem {
+                content: "第二步".to_string(),
+                status: TodoStatus::InProgress,
+                priority: TodoPriority::Medium,
+            },
+        ];
+
+        store.set_todos(&session.id, &todos).await.unwrap();
+        let read_back = store.get_todos(&session.id).await.unwrap();
+        assert_eq!(read_back, todos);
+
+        store.set_todos(&session.id, &[]).await.unwrap();
+        let cleared = store.get_todos(&session.id).await.unwrap();
+        assert!(cleared.is_empty());
     }
 }

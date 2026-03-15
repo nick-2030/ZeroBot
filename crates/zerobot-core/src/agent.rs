@@ -425,6 +425,7 @@ impl Agent {
             self.cwd.clone(),
             self.settings.tools.allow_paths.iter().map(std::path::PathBuf::from).collect(),
             session_id,
+            Some(self.store.clone()),
         );
 
         match self

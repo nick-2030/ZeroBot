@@ -39,6 +39,7 @@
 - `tools.output.max_bytes`：工具输出最大字节数。
 - `tools.output.direction`：截断方向，`head` 表示保留前部，`tail` 表示保留尾部。
 - `tools.output.max_lines` / `tools.output.max_bytes` 会同时生效，任一超过即截断。
+- `todoread` / `todowrite`：读取与更新会话内 Todo 列表（当 `tools.enabled` 包含时可用）。
 - `agent.system_prompt`：系统提示词。
 - `agent.max_steps`：单次回合最大步骤数。
 - `logging.level`：日志级别。
