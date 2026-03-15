@@ -13,6 +13,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -70,6 +71,22 @@ impl ToolContext {
     }
 }
 
+fn param_error(err: serde_json::Error) -> ZeroBotError {
+    ZeroBotError::Tool(format!("参数解析失败: {err}"))
+}
+
+fn io_error(op: &str, path: &std::path::Path, err: &io::Error) -> ZeroBotError {
+    let detail = match err.kind() {
+        io::ErrorKind::NotFound => "路径不存在",
+        io::ErrorKind::PermissionDenied => "权限不足",
+        io::ErrorKind::AlreadyExists => "目标已存在",
+        io::ErrorKind::IsADirectory => "目标是目录",
+        io::ErrorKind::NotADirectory => "目标不是目录",
+        io::ErrorKind::InvalidInput => "输入非法",
+        _ => "IO 错误",
+    };
+    ZeroBotError::Tool(format!("{op}失败: {detail}: {}", path.display()))
+}
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
@@ -583,10 +600,11 @@ impl Tool for ReadTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: ReadArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: ReadArgs = serde_json::from_value(args).map_err(param_error)?;
         let path = ctx.resolve_path(&args.path)?;
-        let content = tokio::fs::read_to_string(path).await?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|err| io_error("读取文件", &path, &err))?;
         let offset = args.offset.unwrap_or(0);
         let limit = args.limit.unwrap_or(usize::MAX);
         if offset == 0 && limit == usize::MAX {
@@ -634,22 +652,28 @@ impl Tool for WriteTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: WriteArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: WriteArgs = serde_json::from_value(args).map_err(param_error)?;
         let path = ctx.resolve_path(&args.path)?;
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| io_error("创建目录", parent, &err))?;
         }
         if args.append {
             use tokio::io::AsyncWriteExt;
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
-                .await?;
-            file.write_all(args.content.as_bytes()).await?;
+                .open(&path)
+                .await
+                .map_err(|err| io_error("打开文件", &path, &err))?;
+            file.write_all(args.content.as_bytes())
+                .await
+                .map_err(|err| io_error("写入文件", &path, &err))?;
         } else {
-            tokio::fs::write(path, args.content).await?;
+            tokio::fs::write(&path, args.content)
+                .await
+                .map_err(|err| io_error("写入文件", &path, &err))?;
         }
         Ok(ToolOutput::new("写入完成"))
     }
@@ -690,10 +714,11 @@ impl Tool for EditTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: EditArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: EditArgs = serde_json::from_value(args).map_err(param_error)?;
         let path = ctx.resolve_path(&args.path)?;
-        let mut content = tokio::fs::read_to_string(&path).await?;
+        let mut content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|err| io_error("读取文件", &path, &err))?;
         let count = if args.replace_all {
             let replaced = content.replace(&args.find, &args.replace);
             let count = content.matches(&args.find).count();
@@ -705,7 +730,9 @@ impl Tool for EditTool {
         } else {
             0
         };
-        tokio::fs::write(&path, content).await?;
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|err| io_error("写入文件", &path, &err))?;
         Ok(ToolOutput::new(format!("已替换 {count} 处")))
     }
 }
@@ -740,15 +767,18 @@ impl Tool for PatchTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: PatchArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: PatchArgs = serde_json::from_value(args).map_err(param_error)?;
         let path = ctx.resolve_path(&args.path)?;
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|err| io_error("读取文件", &path, &err))?;
         let patch = Patch::from_str(&args.patch)
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         let updated = diffy::apply(&content, &patch)
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
-        tokio::fs::write(&path, updated).await?;
+        tokio::fs::write(&path, updated)
+            .await
+            .map_err(|err| io_error("写入文件", &path, &err))?;
         Ok(ToolOutput::new("补丁已应用"))
     }
 }
@@ -781,12 +811,11 @@ impl Tool for GlobTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: GlobArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: GlobArgs = serde_json::from_value(args).map_err(param_error)?;
         let pattern = ctx.cwd.join(&args.pattern);
         let mut results = Vec::new();
         for entry in glob::glob(pattern.to_string_lossy().as_ref())
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?
+            .map_err(|err| ZeroBotError::Tool(format!("glob 模式无效: {err}")))?
         {
             if let Ok(path) = entry {
                 results.push(path.to_string_lossy().to_string());
@@ -826,11 +855,16 @@ impl Tool for GrepTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: GrepArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: GrepArgs = serde_json::from_value(args).map_err(param_error)?;
         let root = ctx.resolve_path(&args.path)?;
         let regex = Regex::new(&args.pattern)
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        if !root.exists() {
+            return Err(ZeroBotError::Tool(format!(
+                "搜索路径不存在: {}",
+                root.display()
+            )));
+        }
 
         let mut matches = Vec::new();
         for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -883,8 +917,7 @@ impl Tool for ShellTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: ShellArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: ShellArgs = serde_json::from_value(args).map_err(param_error)?;
         let dir = if let Some(dir) = args.dir {
             ctx.resolve_path(&dir)?
         } else {
@@ -896,13 +929,18 @@ impl Tool for ShellTool {
             .current_dir(dir)
             .output()
             .await?;
-        let mut text = String::new();
-        text.push_str("[stdout]\n");
-        text.push_str(&String::from_utf8_lossy(&output.stdout));
-        text.push_str("\n[stderr]\n");
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        text.push_str(&format!("\n[exit_code]\n{}", output.status.code().unwrap_or(-1)));
-        Ok(ToolOutput::new(text))
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if output.status.success() {
+            Ok(ToolOutput::new(stdout))
+        } else {
+            let message = if stderr.trim().is_empty() {
+                "命令执行失败".to_string()
+            } else {
+                stderr
+            };
+            Err(ZeroBotError::Tool(message))
+        }
     }
 }
 
