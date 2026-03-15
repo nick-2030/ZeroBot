@@ -268,6 +268,7 @@ async fn run_repl(
 
         let mut stream = StreamPrinter::new(DotColor::White);
         let mut streaming = false;
+        let mut last_tool_label: Option<String> = None;
 
         loop {
             tokio::select! {
@@ -297,12 +298,14 @@ async fn run_repl(
                             } else {
                                 format!("工具 {} {}", name, args)
                             };
+                            last_tool_label = Some(label.clone());
                             blink.start(&label);
                         }
                         AgentEvent::ToolCallFinished { name: _name, output, ok } => {
                             blink.stop();
                             let color = if ok { DotColor::Green } else { DotColor::Red };
-                            print_tool_output(color, output.trim());
+                            print_tool_output(color, last_tool_label.as_deref(), output.trim());
+                            last_tool_label = None;
                             print_gap();
                             blink.start("思考中");
                         }
@@ -454,13 +457,22 @@ fn print_block(color: DotColor, text: &str) {
     }
 }
 
-fn print_tool_output(color: DotColor, output: &str) {
-    if output.trim().is_empty() {
-        print_block(color, "");
+fn print_tool_output(color: DotColor, label: Option<&str>, output: &str) {
+    let (lines, omitted) = truncate_lines(output, 3);
+    if lines.is_empty() {
+        if let Some(label) = label {
+            print_block(color, label);
+        } else {
+            print_block(color, "");
+        }
         return;
     }
-    let (lines, omitted) = truncate_lines(output, 3);
-    let mut joined = lines.join("\n");
+    let mut joined = String::new();
+    if let Some(label) = label {
+        joined.push_str(label);
+        joined.push('\n');
+    }
+    joined.push_str(&lines.join("\n"));
     if omitted > 0 {
         joined.push_str(&format!("\n... 已省略 {} 行", omitted));
     }
@@ -491,6 +503,7 @@ struct StreamPrinter {
     ended_with_newline: bool,
     color: DotColor,
     at_line_start: bool,
+    trailing_newlines: usize,
 }
 
 impl StreamPrinter {
@@ -500,6 +513,7 @@ impl StreamPrinter {
             ended_with_newline: false,
             color,
             at_line_start: false,
+            trailing_newlines: 0,
         }
     }
 
@@ -530,6 +544,9 @@ impl StreamPrinter {
             print!("{ch}");
             if ch == '\n' {
                 self.at_line_start = true;
+                self.trailing_newlines += 1;
+            } else {
+                self.trailing_newlines = 0;
             }
         }
         let _ = std::io::stdout().flush();
@@ -540,13 +557,20 @@ impl StreamPrinter {
         if !self.started {
             return;
         }
-        if !self.ended_with_newline {
-            println!();
+        match self.trailing_newlines {
+            0 => {
+                println!();
+                print_gap();
+            }
+            1 => {
+                print_gap();
+            }
+            _ => {}
         }
-        print_gap();
         self.started = false;
         self.ended_with_newline = false;
         self.at_line_start = false;
+        self.trailing_newlines = 0;
     }
 }
 
