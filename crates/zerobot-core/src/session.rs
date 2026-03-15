@@ -24,6 +24,7 @@ pub struct Message {
     pub role: MessageRole,
     pub content: String,
     pub tool_call_id: Option<String>,
+    pub tool_calls: Option<Vec<StoredToolCall>>,
     pub created_at: i64,
 }
 
@@ -36,6 +37,13 @@ pub enum MessageRole {
     Tool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn init(&self) -> ZeroBotResult<()>;
@@ -44,7 +52,13 @@ pub trait SessionStore: Send + Sync {
     async fn list_sessions(&self) -> ZeroBotResult<Vec<Session>>;
     async fn append_message(&self, message: Message) -> ZeroBotResult<()>;
     async fn list_messages(&self, session_id: &str) -> ZeroBotResult<Vec<Message>>;
-    async fn record_tool_call(&self, session_id: &str, name: &str, arguments: &str) -> ZeroBotResult<String>;
+    async fn record_tool_call(
+        &self,
+        call_id: &str,
+        session_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> ZeroBotResult<String>;
     async fn record_tool_output(&self, tool_call_id: &str, content: &str) -> ZeroBotResult<()>;
 }
 
@@ -101,6 +115,7 @@ impl SessionStore for SqliteSessionStore {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 tool_call_id TEXT,
+                tool_calls_json TEXT,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
@@ -108,6 +123,10 @@ impl SessionStore for SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
+
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT;")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query(
             r#"
@@ -204,14 +223,21 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn append_message(&self, message: Message) -> ZeroBotResult<()> {
+        let tool_calls_json = match &message.tool_calls {
+            Some(calls) => Some(serde_json::to_string(calls).map_err(|err| {
+                ZeroBotError::SessionStore(err.to_string())
+            })?),
+            None => None,
+        };
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, tool_call_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_calls_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&message.session_id)
         .bind(message.role.to_string())
         .bind(&message.content)
         .bind(&message.tool_call_id)
+        .bind(&tool_calls_json)
         .bind(message.created_at)
         .execute(&self.pool)
         .await?;
@@ -226,8 +252,8 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list_messages(&self, session_id: &str) -> ZeroBotResult<Vec<Message>> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, i64)>(
-            "SELECT id, session_id, role, content, tool_call_id, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, i64)>(
+            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -241,15 +267,22 @@ impl SessionStore for SqliteSessionStore {
                 role: MessageRole::from_str(&row.2),
                 content: row.3,
                 tool_call_id: row.4,
-                created_at: row.5,
+                tool_calls: row.5.and_then(|raw| serde_json::from_str(&raw).ok()),
+                created_at: row.6,
             })
             .collect())
     }
 
-    async fn record_tool_call(&self, session_id: &str, name: &str, arguments: &str) -> ZeroBotResult<String> {
-        let id = Uuid::new_v4().to_string();
+    async fn record_tool_call(
+        &self,
+        call_id: &str,
+        session_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> ZeroBotResult<String> {
+        let id = call_id.to_string();
         sqlx::query(
-            "INSERT INTO tool_calls (id, session_id, name, arguments, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO tool_calls (id, session_id, name, arguments, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(session_id)
@@ -283,6 +316,24 @@ impl MessageRole {
             "assistant" => MessageRole::Assistant,
             "tool" => MessageRole::Tool,
             _ => MessageRole::User,
+        }
+    }
+}
+
+impl StoredToolCall {
+    pub fn from_provider_call(call: crate::provider::ToolCall) -> Self {
+        Self {
+            id: call.id,
+            name: call.name,
+            arguments: call.arguments,
+        }
+    }
+
+    pub fn to_provider_call(&self) -> crate::provider::ToolCall {
+        crate::provider::ToolCall {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            arguments: self.arguments.clone(),
         }
     }
 }

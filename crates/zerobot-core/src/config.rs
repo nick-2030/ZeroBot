@@ -93,7 +93,7 @@ pub struct AgentSettings {
 }
 
 fn default_max_steps() -> usize {
-    6
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

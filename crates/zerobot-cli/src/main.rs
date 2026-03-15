@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use console::style;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Write;
 use tokio::io::{self, AsyncBufReadExt};
+use tokio::time::{self, Duration};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use zerobot_core::agent::Agent;
@@ -193,12 +195,12 @@ async fn run_exec(
 
     let provider = build_provider(settings, provider_override.as_deref())?;
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
-
+    let store = Arc::new(store);
     let agent = Agent::new(
         provider,
         model,
         settings.clone(),
-        Arc::new(store),
+        store,
         ToolRegistry::with_builtin(),
         cwd.clone(),
     );
@@ -220,25 +222,21 @@ async fn run_repl(
         .create_session("交互会话".to_string())
         .await?;
 
+    print_logo();
     println!("{} {}", style("会话已启动:").green(), session.id);
     println!("输入 /exit 退出");
 
-    let provider = build_provider(settings, provider_override.as_deref())?;
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
-
-    let agent = Agent::new(
-        provider,
-        model,
-        settings.clone(),
-        Arc::new(store),
-        ToolRegistry::with_builtin(),
-        cwd.clone(),
-    );
+    let store = Arc::new(store);
 
     let stdin = io::BufReader::new(io::stdin());
     let mut lines = stdin.lines();
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        print_prompt();
+        let Some(line) = lines.next_line().await? else {
+            break;
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -247,35 +245,88 @@ async fn run_repl(
             break;
         }
 
+        println!();
+
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let handler = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    AgentEvent::ToolCallStarted { name } => {
-                        println!("{} {}", style("调用工具:").cyan(), name);
-                    }
-                    AgentEvent::ToolCallFinished { name, output } => {
-                        println!("{} {}", style("工具完成:").cyan(), name);
-                        if !output.trim().is_empty() {
-                            println!("{}\n{}", style("工具输出:").dim(), output);
+        let session_id = session.id.clone();
+        let input = line.clone();
+        let provider = build_provider(settings, provider_override.as_deref())?;
+        let agent = Agent::new(
+            provider,
+            model.clone(),
+            settings.clone(),
+            store.clone(),
+            ToolRegistry::with_builtin(),
+            cwd.clone(),
+        );
+        let mut runner =
+            tokio::spawn(async move { agent.run_turn(&session_id, &input, Some(tx)).await });
+
+        let mut blink = Blink::new();
+        blink.start("思考中");
+        let mut ticker = time::interval(Duration::from_millis(350));
+
+        let mut stream = StreamPrinter::new(DotColor::White);
+        let mut streaming = false;
+
+        loop {
+            tokio::select! {
+                Some(event) = rx.recv() => {
+                    match event {
+                        AgentEvent::AssistantDelta { content } => {
+                            if !streaming {
+                                blink.stop();
+                                stream.start();
+                                streaming = true;
+                            }
+                            stream.push(&content);
                         }
+                        AgentEvent::AssistantMessage { content } => {
+                            blink.stop();
+                            print_block(DotColor::White, &content);
+                        }
+                        AgentEvent::ToolCallStarted { name, input } => {
+                            if streaming {
+                                stream.finish();
+                                streaming = false;
+                            }
+                            let args = one_line(&input);
+                            let label = if args.is_empty() {
+                                format!("工具 {}", name)
+                            } else {
+                                format!("工具 {} {}", name, args)
+                            };
+                            blink.start(&label);
+                        }
+                        AgentEvent::ToolCallFinished { name, output, ok } => {
+                            blink.stop();
+                            let color = if ok { DotColor::Green } else { DotColor::Red };
+                            let label = format!("工具 {} 完成", name);
+                            print_tool_output(color, &label, output.trim());
+                            blink.start("思考中");
+                        }
+                        AgentEvent::Error { message } => {
+                            blink.stop();
+                            print_block(DotColor::Red, &message);
+                        }
+                        _ => {}
                     }
-                    AgentEvent::AssistantMessage { content } => {
-                        println!("{} {}", style("助手:").green(), content);
+                }
+                result = &mut runner => {
+                    blink.stop();
+                    if streaming {
+                        stream.finish();
                     }
-                    AgentEvent::Error { message } => {
-                        println!("{} {}", style("错误:").red(), message);
+                    if let Ok(Err(err)) = result {
+                        print_block(DotColor::Red, &format!("{}", err));
                     }
-                    _ => {}
+                    break;
+                }
+                _ = ticker.tick() => {
+                    blink.render();
                 }
             }
-        });
-
-        let result = agent.run_turn(&session.id, &line, Some(tx)).await;
-        if let Err(err) = result {
-            println!("{} {}", style("错误:").red(), err);
         }
-        let _ = handler.await;
     }
 
     Ok(())
@@ -360,6 +411,198 @@ fn expand_home(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+fn print_logo() {
+    println!("{}", style("ZeroBot").cyan().bold());
+}
+
+fn print_prompt() {
+    print!("{} ", style(">").cyan());
+    let _ = std::io::stdout().flush();
+}
+
+#[derive(Copy, Clone)]
+enum DotColor {
+    White,
+    Green,
+    Red,
+}
+
+fn print_block(color: DotColor, text: &str) {
+    let dot = match color {
+        DotColor::White => style("●").white(),
+        DotColor::Green => style("●").green(),
+        DotColor::Red => style("●").red(),
+    };
+    let had_trailing_newline = text.ends_with('\n');
+    let cleaned = text.trim_end_matches('\n');
+
+    if cleaned.trim().is_empty() {
+        println!("{} ", dot);
+        println!();
+        return;
+    }
+
+    for (idx, line) in cleaned.lines().enumerate() {
+        if idx == 0 {
+            println!("{} {}", dot, line);
+        } else {
+            println!("  {}", line);
+        }
+    }
+
+    if had_trailing_newline {
+        println!();
+    } else {
+        println!();
+        println!();
+    }
+}
+
+fn print_tool_output(color: DotColor, label: &str, output: &str) {
+    if output.trim().is_empty() {
+        print_block(color, label);
+        return;
+    }
+    let (lines, omitted) = truncate_lines(output, 3);
+    let mut joined = String::from(label);
+    joined.push('\n');
+    joined.push_str(&lines.join("\n"));
+    if omitted > 0 {
+        joined.push_str(&format!("\n... 已省略 {} 行", omitted));
+    }
+    print_block(color, &joined);
+}
+
+fn truncate_lines(text: &str, max: usize) -> (Vec<String>, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max {
+        return (lines.into_iter().map(|s| s.to_string()).collect(), 0);
+    }
+    let kept = lines[..max].iter().map(|s| s.to_string()).collect();
+    (kept, lines.len() - max)
+}
+
+fn one_line(text: &str) -> String {
+    let mut out = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const LIMIT: usize = 160;
+    if out.len() > LIMIT {
+        out.truncate(LIMIT);
+        out.push_str("...");
+    }
+    out
+}
+
+struct StreamPrinter {
+    started: bool,
+    ended_with_newline: bool,
+    color: DotColor,
+}
+
+impl StreamPrinter {
+    fn new(color: DotColor) -> Self {
+        Self {
+            started: false,
+            ended_with_newline: false,
+            color,
+        }
+    }
+
+    fn start(&mut self) {
+        if !self.started {
+            let dot = match self.color {
+                DotColor::White => style("●").white(),
+                DotColor::Green => style("●").green(),
+                DotColor::Red => style("●").red(),
+            };
+            print!("{} ", dot);
+            let _ = std::io::stdout().flush();
+            self.started = true;
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let chunk = if self.started {
+            text
+        } else {
+            text.trim_start_matches('\n')
+        };
+        print!("{chunk}");
+        let _ = std::io::stdout().flush();
+        self.ended_with_newline = chunk.ends_with('\n');
+    }
+
+    fn finish(&mut self) {
+        if !self.started {
+            return;
+        }
+        if self.ended_with_newline {
+            println!();
+        } else {
+            println!();
+            println!();
+        }
+        self.started = false;
+        self.ended_with_newline = false;
+    }
+}
+
+struct Blink {
+    active: bool,
+    visible: bool,
+    label: String,
+}
+
+impl Blink {
+    fn new() -> Self {
+        Self {
+            active: false,
+            visible: false,
+            label: String::new(),
+        }
+    }
+
+    fn start(&mut self, label: &str) {
+        self.active = true;
+        self.visible = false;
+        self.label = label.to_string();
+        self.visible = true;
+        self.draw();
+    }
+
+    fn stop(&mut self) {
+        if self.active {
+            self.clear_line();
+        }
+        self.active = false;
+        self.visible = false;
+        self.label.clear();
+    }
+
+    fn render(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.visible = !self.visible;
+        self.draw();
+    }
+
+    fn clear_line(&self) {
+        let len = self.label.chars().count() + 2;
+        print!("\r{}\r", " ".repeat(len));
+        let _ = std::io::stdout().flush();
+    }
+
+    fn draw(&self) {
+        let symbol = if self.visible { "●" } else { " " };
+        let dot = style(symbol).white();
+        print!("\r{} {}", dot, self.label);
+        let _ = std::io::stdout().flush();
+    }
 }
 
 #[cfg(test)]

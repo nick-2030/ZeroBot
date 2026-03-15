@@ -22,6 +22,7 @@ pub struct ProviderMessage {
     pub content: String,
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,7 +146,7 @@ impl Provider for OpenAIProvider {
                     }));
                 }
                 _ => {
-                    messages.push(serde_json::json!({
+                    let mut message = serde_json::json!({
                         "role": match msg.role {
                             ProviderMessageRole::System => "system",
                             ProviderMessageRole::User => "user",
@@ -154,7 +155,28 @@ impl Provider for OpenAIProvider {
                         },
                         "content": msg.content,
                         "name": msg.name,
-                    }));
+                    });
+                    if matches!(msg.role, ProviderMessageRole::Assistant) {
+                        if let Some(calls) = msg.tool_calls {
+                            let tool_calls = calls
+                                .into_iter()
+                                .map(|call| {
+                                    serde_json::json!({
+                                        "id": call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": call.name,
+                                            "arguments": call.arguments.to_string()
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            if let Some(obj) = message.as_object_mut() {
+                                obj.insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls));
+                            }
+                        }
+                    }
+                    messages.push(message);
                 }
             }
         }
@@ -401,6 +423,7 @@ mod tests {
                     content: "hi".to_string(),
                     tool_call_id: None,
                     name: None,
+                    tool_calls: None,
                 }],
                 tools: vec![],
                 max_tokens: None,
@@ -436,6 +459,7 @@ mod tests {
                     content: "hi".to_string(),
                     tool_call_id: None,
                     name: None,
+                    tool_calls: None,
                 }],
                 tools: vec![],
                 max_tokens: None,
