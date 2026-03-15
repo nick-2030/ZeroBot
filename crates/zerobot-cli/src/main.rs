@@ -273,7 +273,7 @@ async fn run_repl(
             tokio::spawn(async move { agent.run_turn(&session_id, &input, Some(tx)).await });
 
         let mut blink = Blink::new();
-        blink.start("思考中");
+        blink.start("思考中...");
         let mut ticker = time::interval(Duration::from_millis(350));
 
         let mut stream = StreamPrinter::new(DotColor::White);
@@ -304,9 +304,9 @@ async fn run_repl(
                             }
                             let args = one_line(&input);
                             let label = if args.is_empty() {
-                                format!("工具 {}", name)
+                                format!("{}", name)
                             } else {
-                                format!("工具 {} {}", name, args)
+                                format!("{} {}", name, args)
                             };
                             last_tool_label = Some(label.clone());
                             blink.start(&label);
@@ -317,7 +317,7 @@ async fn run_repl(
                             print_tool_output(color, last_tool_label.as_deref(), output.trim());
                             last_tool_label = None;
                             print_gap();
-                            blink.start("思考中");
+                            blink.start("思考中...");
                         }
                         AgentEvent::Error { message } => {
                             blink.stop();
