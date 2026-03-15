@@ -1,7 +1,8 @@
 use crate::config::Settings;
+use crate::context::ContextManager;
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::events::AgentEvent;
-use crate::provider::{Provider, ProviderEvent, ProviderMessage, ProviderMessageRole, ProviderRequest, ToolCall};
+use crate::provider::{Provider, ProviderEvent, ProviderRequest, ToolCall};
 use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
 use crate::tool::{ToolContext, ToolRegistry};
 use chrono::Utc;
@@ -68,36 +69,14 @@ impl Agent {
             }
 
             let history = self.store.list_messages(session_id).await?;
-            let history = if history.len() > self.settings.session.max_history {
-                history[history.len() - self.settings.session.max_history..].to_vec()
-            } else {
-                history
-            };
-            let mut messages = Vec::new();
-            for message in history {
-                let role = match message.role {
-                    MessageRole::System => ProviderMessageRole::System,
-                    MessageRole::User => ProviderMessageRole::User,
-                    MessageRole::Assistant => ProviderMessageRole::Assistant,
-                    MessageRole::Tool => ProviderMessageRole::Tool,
-                };
-                messages.push(ProviderMessage {
-                    role,
-                    content: message.content,
-                    tool_call_id: message.tool_call_id,
-                    name: None,
-                    tool_calls: message
-                        .tool_calls
-                        .as_ref()
-                        .map(|calls| calls.iter().map(StoredToolCall::to_provider_call).collect()),
-                });
-            }
+            let context = ContextManager::new(&self.settings, self.cwd.clone())
+                .build(&self.model, &history);
 
             let tool_specs = self.tools.specs(&self.settings.tools.enabled);
             let request = ProviderRequest {
                 model: self.model.clone(),
-                system: self.settings.agent.system_prompt.clone(),
-                messages,
+                system: context.system,
+                messages: context.messages,
                 tools: tool_specs,
                 max_tokens: None,
             };

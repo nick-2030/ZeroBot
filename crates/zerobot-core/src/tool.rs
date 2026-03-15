@@ -586,7 +586,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_tool_output_without_persisting() {
-        let _dir = TempDir::new().unwrap();
         let settings = ToolOutputSettings {
             max_lines: 2,
             max_bytes: 16,

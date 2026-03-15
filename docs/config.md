@@ -21,6 +21,7 @@
 ## 配置示例
 
 参考 `config/example.settings.yaml`。
+系统提示词的说明见 `docs/prompt.md`。
 
 ## 字段说明
 
@@ -29,9 +30,12 @@
 - `providers`：多提供商配置表。
 - `session.db_path`：SQLite 数据库路径。
 - `session.max_history`：历史消息最大数量。
+- `context.max_messages`：上下文保留的最大消息条数（0 表示不限制）。
+- `context.max_chars`：上下文保留的最大字符数（0 表示不限制）。
+- `context.include_environment`：是否在系统提示词中注入环境信息。
 - `tools.enabled`：启用的工具列表。
 - `tools.allow_paths`：允许访问的路径（为空表示不限制）。
-- `tools.output.max_lines`：工具输出最大行数，超出会被截断并保存完整输出到文件。
+- `tools.output.max_lines`：工具输出最大行数，超出会被截断。
 - `tools.output.max_bytes`：工具输出最大字节数。
 - `tools.output.direction`：截断方向，`head` 表示保留前部，`tail` 表示保留尾部。
 - `tools.output.max_lines` / `tools.output.max_bytes` 会同时生效，任一超过即截断。

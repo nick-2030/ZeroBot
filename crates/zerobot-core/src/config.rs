@@ -1,4 +1,5 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::prompt::DEFAULT_SYSTEM_PROMPT;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
@@ -21,6 +22,8 @@ pub struct Settings {
     pub tools: ToolSettings,
     #[serde(default)]
     pub agent: AgentSettings,
+    #[serde(default)]
+    pub context: ContextSettings,
     #[serde(default)]
     pub logging: LoggingSettings,
     #[serde(default)]
@@ -129,6 +132,28 @@ fn default_max_steps() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSettings {
+    #[serde(default = "default_context_max_messages")]
+    pub max_messages: usize,
+    #[serde(default = "default_context_max_chars")]
+    pub max_chars: usize,
+    #[serde(default = "default_context_include_environment")]
+    pub include_environment: bool,
+}
+
+fn default_context_max_messages() -> usize {
+    200
+}
+
+fn default_context_max_chars() -> usize {
+    120_000
+}
+
+fn default_context_include_environment() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingSettings {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -160,6 +185,7 @@ impl Default for Settings {
             session: SessionSettings::default(),
             tools: ToolSettings::default(),
             agent: AgentSettings::default(),
+            context: ContextSettings::default(),
             logging: LoggingSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
@@ -199,8 +225,18 @@ impl Default for ToolOutputSettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
-            system_prompt: None,
+            system_prompt: Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             max_steps: default_max_steps(),
+        }
+    }
+}
+
+impl Default for ContextSettings {
+    fn default() -> Self {
+        Self {
+            max_messages: default_context_max_messages(),
+            max_chars: default_context_max_chars(),
+            include_environment: default_context_include_environment(),
         }
     }
 }
