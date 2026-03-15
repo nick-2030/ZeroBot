@@ -75,12 +75,31 @@ impl ContextManager {
             candidates = kept;
         }
 
-        let messages = candidates
+        let mut extra_system = Vec::new();
+        let mut normal_messages = Vec::new();
+        for message in candidates {
+            if matches!(message.role, MessageRole::System) {
+                if !message.content.trim().is_empty() {
+                    extra_system.push(message.content);
+                }
+            } else {
+                normal_messages.push(message);
+            }
+        }
+
+        let messages = normal_messages
             .into_iter()
             .map(message_to_provider)
             .collect::<Vec<_>>();
 
-        let system = self.build_system_prompt(model, dropped_messages, skills);
+        let mut system = self.build_system_prompt(model, dropped_messages, skills);
+        if !extra_system.is_empty() {
+            let extra = extra_system.join("\n\n");
+            system = Some(match system {
+                Some(base) if !base.trim().is_empty() => format!("{base}\n\n{extra}"),
+                _ => extra,
+            });
+        }
 
         ContextBuild {
             system,
