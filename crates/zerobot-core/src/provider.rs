@@ -139,9 +139,14 @@ impl Provider for OpenAIProvider {
         for msg in request.messages {
             match msg.role {
                 ProviderMessageRole::Tool => {
+                    let Some(call_id) = msg.tool_call_id else {
+                        return Err(ZeroBotError::Provider(
+                            "工具消息缺少 tool_call_id".to_string(),
+                        ));
+                    };
                     messages.push(serde_json::json!({
                         "role": "tool",
-                        "tool_call_id": msg.tool_call_id,
+                        "tool_call_id": call_id,
                         "content": msg.content
                     }));
                 }
@@ -154,8 +159,12 @@ impl Provider for OpenAIProvider {
                             ProviderMessageRole::Tool => "tool",
                         },
                         "content": msg.content,
-                        "name": msg.name,
                     });
+                    if let Some(name) = msg.name {
+                        if let Some(obj) = message.as_object_mut() {
+                            obj.insert("name".to_string(), serde_json::Value::String(name));
+                        }
+                    }
                     if matches!(msg.role, ProviderMessageRole::Assistant) {
                         if let Some(calls) = msg.tool_calls {
                             let tool_calls = calls
