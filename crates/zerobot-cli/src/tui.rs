@@ -1,7 +1,10 @@
 use anyhow::Result;
+use base64::Engine as _;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, event::EnableMouseCapture, event::DisableMouseCapture};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::{execute, Command};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -63,7 +66,7 @@ struct App {
     viewport_width: u16,
     blink_on: bool,
     last_blink: Instant,
-    mouse_capture: bool,
+    last_copyable_output: Option<String>,
 }
 
 impl App {
@@ -88,7 +91,7 @@ impl App {
             viewport_width: 0,
             blink_on: true,
             last_blink: Instant::now(),
-            mouse_capture: false,
+            last_copyable_output: None,
         }
     }
 
@@ -144,6 +147,9 @@ impl App {
         }
         let content = self.stream_buffer.clone();
         self.output.extend(format_block_lines(DotColor::White, &content));
+        if !content.trim().is_empty() {
+            self.last_copyable_output = Some(content);
+        }
         self.stream_buffer.clear();
         self.streaming = false;
     }
@@ -200,7 +206,7 @@ impl App {
 
     fn command_hint(&self) -> String {
         if self.input.trim_start().starts_with('/') {
-            "/exit /help /clear".to_string()
+            "/exit /help /clear /copy".to_string()
         } else {
             String::new()
         }
@@ -217,10 +223,13 @@ pub async fn run_tui(
     model: String,
     provider_id: String,
     hooks: HookManager,
+    use_alt_screen: bool,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if use_alt_screen {
+        execute!(stdout, EnterAlternateScreen, EnableAlternateScroll)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -239,7 +248,13 @@ pub async fn run_tui(
     .await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    if use_alt_screen {
+        execute!(
+            terminal.backend_mut(),
+            DisableAlternateScroll,
+            LeaveAlternateScreen
+        )?;
+    }
     terminal.show_cursor()?;
 
     result
@@ -269,7 +284,6 @@ async fn run_tui_inner(
     app.push_line(Line::from(Span::raw("输入 /exit 退出")));
 
     refresh_session_state(&mut app, &store).await;
-    set_mouse_capture(app.mouse_capture)?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let mut runner: Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>> =
@@ -393,7 +407,20 @@ async fn handle_event(
                     }
                     app.push_line(user_input_line(&input));
                     if input == "/help" {
-                        app.push_block(DotColor::White, "可用命令: /exit /help /clear");
+                        app.push_block(DotColor::White, "可用命令: /exit /help /clear /copy");
+                        app.input.clear();
+                        app.cursor = 0;
+                        return Ok(true);
+                    }
+                    if input == "/copy" {
+                        let message = match app.last_copyable_output.as_deref() {
+                            Some(text) => match copy_text_to_clipboard(text) {
+                                Ok(()) => "已复制最新回复到剪贴板".to_string(),
+                                Err(err) => format!("复制失败: {err}"),
+                            },
+                            None => "暂无可复制内容".to_string(),
+                        };
+                        app.push_block(DotColor::White, &message);
                         app.input.clear();
                         app.cursor = 0;
                         return Ok(true);
@@ -468,9 +495,14 @@ async fn handle_event(
                     app.scroll = app.scroll.saturating_add(5);
                     return Ok(true);
                 }
-                KeyCode::F(2) => {
-                    app.mouse_capture = !app.mouse_capture;
-                    set_mouse_capture(app.mouse_capture)?;
+                KeyCode::Up => {
+                    app.stick_to_bottom = false;
+                    app.scroll = app.scroll.saturating_sub(1);
+                    return Ok(true);
+                }
+                KeyCode::Down => {
+                    app.stick_to_bottom = false;
+                    app.scroll = app.scroll.saturating_add(1);
                     return Ok(true);
                 }
                 KeyCode::Char(ch) => {
@@ -517,6 +549,9 @@ async fn handle_agent_event(
         AgentEvent::AssistantMessage { content } => {
             app.finalize_stream();
             app.push_block(DotColor::White, &content);
+            if !content.trim().is_empty() {
+                app.last_copyable_output = Some(content);
+            }
         }
         AgentEvent::ToolCallStarted { name, input } => {
             app.finalize_stream();
@@ -679,12 +714,6 @@ fn build_status_bar(app: &App) -> String {
         format!("{} / {}", app.provider_id, app.model),
         format!("Tokens: {input}/{output}/{total}"),
     ];
-    let mouse_label = if app.mouse_capture {
-        "Mouse: on".to_string()
-    } else {
-        "Mouse: off (F2)".to_string()
-    };
-    parts.push(mouse_label);
     if !commands.is_empty() {
         parts.push(format!("Commands: {commands}"));
     }
@@ -699,14 +728,97 @@ fn user_input_line(text: &str) -> Line<'static> {
     ])
 }
 
-fn set_mouse_capture(enabled: bool) -> Result<()> {
-    let mut stdout = std::io::stdout();
-    if enabled {
-        execute!(stdout, EnableMouseCapture)?;
-    } else {
-        execute!(stdout, DisableMouseCapture)?;
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return copy_via_osc52(text);
     }
-    Ok(())
+
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => match clipboard.set_text(text.to_string()) {
+            Ok(()) => Ok(()),
+            Err(err) => copy_via_osc52(text).map_err(|_| format!("clipboard unavailable: {err}")),
+        },
+        Err(err) => copy_via_osc52(text).map_err(|_| format!("clipboard unavailable: {err}")),
+    }
+}
+
+fn copy_via_osc52(text: &str) -> Result<(), String> {
+    let sequence = osc52_sequence(text, std::env::var_os("TMUX").is_some());
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut tty = OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|e| format!("clipboard unavailable: failed to open /dev/tty: {e}"))?;
+        tty.write_all(sequence.as_bytes())
+            .map_err(|e| format!("clipboard unavailable: failed to write OSC 52: {e}"))?;
+        tty.flush()
+            .map_err(|e| format!("clipboard unavailable: failed to flush OSC 52: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        out.write_all(sequence.as_bytes())
+            .map_err(|e| format!("clipboard unavailable: failed to write OSC 52: {e}"))?;
+        out.flush()
+            .map_err(|e| format!("clipboard unavailable: failed to flush OSC 52: {e}"))?;
+        Ok(())
+    }
+}
+
+fn osc52_sequence(text: &str, tmux: bool) -> String {
+    let data = base64::engine::general_purpose::STANDARD.encode(text);
+    if tmux {
+        format!("\x1bPtmux;\x1b]52;c;{}\x07\x1b\\", data)
+    } else {
+        format!("\x1b]52;c;{}\x07", data)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableAlternateScroll;
+
+impl Command for EnableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(f, "\x1b[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> crossterm::Result<()> {
+        Err(std::io::Error::other(
+            "tried to execute EnableAlternateScroll using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableAlternateScroll;
+
+impl Command for DisableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        write!(f, "\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> crossterm::Result<()> {
+        Err(std::io::Error::other(
+            "tried to execute DisableAlternateScroll using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
 fn format_block_lines(color: DotColor, text: &str) -> Vec<Line<'static>> {

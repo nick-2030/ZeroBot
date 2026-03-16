@@ -30,6 +30,8 @@ struct Cli {
     model: Option<String>,
     #[arg(long)]
     cwd: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    no_alt_screen: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -93,7 +95,7 @@ async fn main() -> Result<()> {
             handle_provider_cmd(&settings, cmd)?;
         }
         None => {
-            run_repl(&settings, &cwd, cli.provider, cli.model).await?;
+            run_repl(&settings, &cwd, cli.provider, cli.model, !cli.no_alt_screen).await?;
         }
     }
 
@@ -240,6 +242,7 @@ async fn run_repl(
     cwd: &PathBuf,
     provider_override: Option<String>,
     model_override: Option<String>,
+    use_alt_screen: bool,
 ) -> Result<()> {
     let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
     store.init().await?;
@@ -286,6 +289,7 @@ async fn run_repl(
         model.clone(),
         provider_id,
         hooks.clone(),
+        use_alt_screen,
     )
     .await?;
 
