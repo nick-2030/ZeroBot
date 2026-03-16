@@ -54,12 +54,21 @@ pub struct ProviderResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub raw: JsonValue,
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub enum ProviderEvent {
     TextDelta(String),
     ToolCall(ToolCall),
+    Usage(TokenUsage),
     Done,
 }
 
@@ -80,6 +89,9 @@ pub trait Provider: Send + Sync {
                 }
                 for call in response.tool_calls {
                     events.push(Ok(ProviderEvent::ToolCall(call)));
+                }
+                if let Some(usage) = response.usage {
+                    events.push(Ok(ProviderEvent::Usage(usage)));
                 }
                 events.push(Ok(ProviderEvent::Done));
                 stream::iter(events)
@@ -254,10 +266,13 @@ impl Provider for OpenAIProvider {
             }
         }
 
+        let usage = raw.get("usage").and_then(parse_openai_usage);
+
         Ok(ProviderResponse {
             content,
             tool_calls,
             raw,
+            usage,
         })
     }
 }
@@ -387,12 +402,46 @@ impl Provider for AnthropicProvider {
             }
         }
 
+        let usage = raw.get("usage").and_then(parse_anthropic_usage);
+
         Ok(ProviderResponse {
             content,
             tool_calls,
             raw,
+            usage,
         })
     }
+}
+
+fn parse_openai_usage(raw: &JsonValue) -> Option<TokenUsage> {
+    let prompt_tokens = raw.get("prompt_tokens").and_then(|v| v.as_u64());
+    let completion_tokens = raw.get("completion_tokens").and_then(|v| v.as_u64());
+    let total_tokens = raw.get("total_tokens").and_then(|v| v.as_u64());
+    if prompt_tokens.is_none() && completion_tokens.is_none() && total_tokens.is_none() {
+        return None;
+    }
+    Some(TokenUsage {
+        input_tokens: prompt_tokens.map(|v| v as u32),
+        output_tokens: completion_tokens.map(|v| v as u32),
+        total_tokens: total_tokens.map(|v| v as u32),
+    })
+}
+
+fn parse_anthropic_usage(raw: &JsonValue) -> Option<TokenUsage> {
+    let input_tokens = raw.get("input_tokens").and_then(|v| v.as_u64());
+    let output_tokens = raw.get("output_tokens").and_then(|v| v.as_u64());
+    if input_tokens.is_none() && output_tokens.is_none() {
+        return None;
+    }
+    let total_tokens = match (input_tokens, output_tokens) {
+        (Some(i), Some(o)) => Some(i + o),
+        _ => None,
+    };
+    Some(TokenUsage {
+        input_tokens: input_tokens.map(|v| v as u32),
+        output_tokens: output_tokens.map(|v| v as u32),
+        total_tokens: total_tokens.map(|v| v as u32),
+    })
 }
 
 #[cfg(test)]

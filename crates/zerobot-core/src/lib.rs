@@ -21,7 +21,14 @@ pub use error::{ZeroBotError, ZeroBotResult};
 pub use events::AgentEvent;
 pub use hooks::{HookAction, HookDecision, HookDefinition, HookEvent, HookManager};
 pub use logging::{init_logging, LogGuard};
-pub use provider::{Provider, ProviderEvent, ProviderRequest, ProviderResponse, ToolSpec};
+pub use provider::{
+    Provider,
+    ProviderEvent,
+    ProviderRequest,
+    ProviderResponse,
+    ToolSpec,
+    TokenUsage,
+};
 pub use session::{
     create_session_with_hooks,
     end_session_with_hooks,

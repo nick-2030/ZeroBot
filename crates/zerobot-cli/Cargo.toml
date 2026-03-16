@@ -8,10 +8,14 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 console.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_yaml.workspace = true
 rustyline.workspace = true
+unicode-width.workspace = true
 
 zerobot-core = { path = "../zerobot-core" }

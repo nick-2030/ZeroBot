@@ -180,6 +180,9 @@ impl Agent {
                     ProviderEvent::ToolCall(call) => {
                         tool_calls.push(call);
                     }
+                    ProviderEvent::Usage(usage) => {
+                        self.emit(&events, AgentEvent::Usage { usage });
+                    }
                     ProviderEvent::Done => {}
                 }
             }

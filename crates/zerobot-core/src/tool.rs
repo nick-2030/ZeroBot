@@ -1178,6 +1178,7 @@ mod tests {
                     content: "子代理输出".to_string(),
                     tool_calls: Vec::new(),
                     raw: serde_json::json!({}),
+                    usage: None,
                 })
             }
         }

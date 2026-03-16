@@ -22,6 +22,7 @@ glob = "0.3"
 httpmock = "0.7"
 ignore = "0.4"
 pretty_assertions = "1.4"
+ratatui = "0.26"
 regex = "1.10"
 tempfile = "3.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -33,6 +34,8 @@ tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "process", 
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+crossterm = { version = "0.27", features = ["event-stream"] }
+unicode-width = "0.1"
 url = "2.5"
 uuid = { version = "1.8", features = ["v4"] }
 walkdir = "2.5"
