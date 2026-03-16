@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear};
 use ratatui::{Frame, Terminal};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
@@ -60,6 +61,9 @@ struct App {
     usage: Option<TokenUsage>,
     permission_prompt: Option<PermissionPrompt>,
     viewport_width: u16,
+    blink_on: bool,
+    last_blink: Instant,
+    mouse_capture: bool,
 }
 
 impl App {
@@ -82,6 +86,9 @@ impl App {
             usage: None,
             permission_prompt: None,
             viewport_width: 0,
+            blink_on: true,
+            last_blink: Instant::now(),
+            mouse_capture: false,
         }
     }
 
@@ -149,18 +156,18 @@ impl App {
         lines
     }
 
-    fn status_line(&self) -> String {
-        match &self.status {
-            Status::Idle => "空闲".to_string(),
-            Status::Thinking => "思考中".to_string(),
-            Status::Tool(name) => format!("工具执行中: {name}"),
-            Status::Error(message) => format!("错误: {message}"),
-        }
-    }
-
     fn info_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::raw(format!("状态: {}", self.status_line()))));
+        let status_line = match &self.status {
+            Status::Idle => Line::from(Span::raw("状态: 空闲")),
+            Status::Thinking => {
+                let dot = if self.blink_on { "●" } else { " " };
+                Line::from(Span::raw(format!("状态: {dot} 思考中")))
+            }
+            Status::Tool(name) => Line::from(Span::raw(format!("状态: 工具执行中: {name}"))),
+            Status::Error(message) => Line::from(Span::raw(format!("状态: 错误: {message}"))),
+        };
+        lines.push(status_line);
         if !self.todos.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Todo:",
@@ -213,7 +220,7 @@ pub async fn run_tui(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -262,6 +269,7 @@ async fn run_tui_inner(
     app.push_line(Line::from(Span::raw("输入 /exit 退出")));
 
     refresh_session_state(&mut app, &store).await;
+    set_mouse_capture(app.mouse_capture)?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let mut runner: Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>> =
@@ -279,6 +287,9 @@ async fn run_tui_inner(
         if let Some(handle) = &mut runner {
             tokio::select! {
                 _ = tick.tick() => {
+                    if update_blink(&mut app) {
+                        dirty = true;
+                    }
                     if dirty {
                         terminal.draw(|f| draw(f, &mut app))?;
                         dirty = false;
@@ -310,6 +321,9 @@ async fn run_tui_inner(
         } else {
             tokio::select! {
                 _ = tick.tick() => {
+                    if update_blink(&mut app) {
+                        dirty = true;
+                    }
                     if dirty {
                         terminal.draw(|f| draw(f, &mut app))?;
                         dirty = false;
@@ -363,6 +377,7 @@ async fn handle_event(
                         return Ok(false);
                     }
                     if input == "/exit" || input == "exit" {
+                        app.push_line(user_input_line(&input));
                         *should_quit = true;
                         return Ok(true);
                     }
@@ -376,6 +391,7 @@ async fn handle_event(
                         app.cursor = 0;
                         return Ok(true);
                     }
+                    app.push_line(user_input_line(&input));
                     if input == "/help" {
                         app.push_block(DotColor::White, "可用命令: /exit /help /clear");
                         app.input.clear();
@@ -386,6 +402,8 @@ async fn handle_event(
                     app.input.clear();
                     app.cursor = 0;
                     app.status = Status::Thinking;
+                    app.blink_on = true;
+                    app.last_blink = Instant::now();
 
                     let provider = (provider_factory)()?;
                     let agent = Agent::new(
@@ -442,14 +460,17 @@ async fn handle_event(
                 }
                 KeyCode::PageUp => {
                     app.stick_to_bottom = false;
-                    app.scroll = app.scroll.saturating_add(5);
+                    app.scroll = app.scroll.saturating_sub(5);
                     return Ok(true);
                 }
                 KeyCode::PageDown => {
-                    app.scroll = app.scroll.saturating_sub(5);
-                    if app.scroll == 0 {
-                        app.stick_to_bottom = true;
-                    }
+                    app.stick_to_bottom = false;
+                    app.scroll = app.scroll.saturating_add(5);
+                    return Ok(true);
+                }
+                KeyCode::F(2) => {
+                    app.mouse_capture = !app.mouse_capture;
+                    set_mouse_capture(app.mouse_capture)?;
                     return Ok(true);
                 }
                 KeyCode::Char(ch) => {
@@ -466,14 +487,12 @@ async fn handle_event(
         Event::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => {
                 app.stick_to_bottom = false;
-                app.scroll = app.scroll.saturating_add(1);
+                app.scroll = app.scroll.saturating_sub(1);
                 return Ok(true);
             }
             MouseEventKind::ScrollDown => {
-                app.scroll = app.scroll.saturating_sub(1);
-                if app.scroll == 0 {
-                    app.stick_to_bottom = true;
-                }
+                app.stick_to_bottom = false;
+                app.scroll = app.scroll.saturating_add(1);
                 return Ok(true);
             }
             _ => {}
@@ -512,6 +531,8 @@ async fn handle_agent_event(
             app.push_tool_output(color, label.as_deref(), output.trim());
             app.last_tool_label = None;
             app.status = Status::Thinking;
+            app.blink_on = true;
+            app.last_blink = Instant::now();
             refresh_session_state(app, store).await;
         }
         AgentEvent::Usage { usage } => {
@@ -538,6 +559,23 @@ async fn refresh_session_state(app: &mut App, store: &std::sync::Arc<dyn Session
     if let Ok(stack) = store.get_skill_stack(&app.session_id).await {
         app.skills = stack;
     }
+}
+
+fn update_blink(app: &mut App) -> bool {
+    if !matches!(app.status, Status::Thinking) {
+        if !app.blink_on {
+            app.blink_on = true;
+            return true;
+        }
+        return false;
+    }
+    let now = Instant::now();
+    if now.duration_since(app.last_blink) >= Duration::from_millis(500) {
+        app.blink_on = !app.blink_on;
+        app.last_blink = now;
+        return true;
+    }
+    false
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
@@ -568,8 +606,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let max_scroll = total_lines.saturating_sub(visible_height);
     if app.stick_to_bottom {
         app.scroll = max_scroll as u16;
-    } else if (app.scroll as usize) > max_scroll {
+    } else if (app.scroll as usize) >= max_scroll {
         app.scroll = max_scroll as u16;
+        app.stick_to_bottom = true;
     }
 
     let output_widget = Paragraph::new(Text::from(display_lines))
@@ -640,10 +679,34 @@ fn build_status_bar(app: &App) -> String {
         format!("{} / {}", app.provider_id, app.model),
         format!("Tokens: {input}/{output}/{total}"),
     ];
+    let mouse_label = if app.mouse_capture {
+        "Mouse: on".to_string()
+    } else {
+        "Mouse: off (F2)".to_string()
+    };
+    parts.push(mouse_label);
     if !commands.is_empty() {
         parts.push(format!("Commands: {commands}"));
     }
     parts.join(" | ")
+}
+
+fn user_input_line(text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(">", Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
+        Span::raw(text.to_string()),
+    ])
+}
+
+fn set_mouse_capture(enabled: bool) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    if enabled {
+        execute!(stdout, EnableMouseCapture)?;
+    } else {
+        execute!(stdout, DisableMouseCapture)?;
+    }
+    Ok(())
 }
 
 fn format_block_lines(color: DotColor, text: &str) -> Vec<Line<'static>> {

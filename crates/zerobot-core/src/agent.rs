@@ -543,7 +543,7 @@ impl Agent {
                     },
                 );
 
-                Err(err)
+                Ok(())
             }
         }
     }
