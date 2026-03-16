@@ -9,7 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear, BorderType};
 use ratatui::{Frame, Terminal};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -31,6 +31,9 @@ enum DotColor {
     Green,
     Red,
 }
+
+const BORDER_COLOR: Color = Color::DarkGray;
+const LOGO_COLOR: Color = Color::Cyan;
 
 #[derive(Clone)]
 enum Status {
@@ -96,33 +99,44 @@ impl App {
     }
 
     fn push_line(&mut self, line: Line<'static>) {
+        if !self.output.is_empty() {
+            self.output.push(Line::from(Span::raw("")));
+        }
         self.output.push(line);
     }
 
     fn push_block(&mut self, color: DotColor, text: &str) {
+        if !self.output.is_empty() {
+            self.output.push(Line::from(Span::raw("")));
+        }
         self.output.extend(format_block_lines(color, text));
     }
 
-    fn push_tool_output(&mut self, color: DotColor, label: Option<&str>, output: &str) {
+    fn push_tool_output(
+        &mut self,
+        color: DotColor,
+        label: Option<&str>,
+        output: &str,
+        width: u16,
+    ) {
         let (lines, omitted) = truncate_lines(output, 3);
-        if lines.is_empty() {
-            if let Some(label) = label {
-                self.push_block(color, label);
-            } else {
-                self.push_block(color, "");
-            }
-            return;
-        }
-        let mut joined = String::new();
         if let Some(label) = label {
-            joined.push_str(label);
-            joined.push('\n');
+            if !self.output.is_empty() {
+                self.output.push(Line::from(Span::raw("")));
+            }
+            let mut line = Vec::new();
+            line.push(tool_dot_span(color));
+            line.push(Span::raw(" "));
+            line.push(Span::raw(label.to_string()));
+            self.output.push(Line::from(line));
         }
-        joined.push_str(&lines.join("\n"));
+        let mut content_lines = Vec::new();
+        content_lines.extend(lines);
         if omitted > 0 {
-            joined.push_str(&format!("\n... 已省略 {} 行", omitted));
+            content_lines.push(format!("... 已省略 {} 行", omitted));
         }
-        self.push_block(color, &joined);
+        let box_lines = format_tool_box_lines(&content_lines, width);
+        self.output.extend(box_lines);
     }
 
     fn append_stream_delta(&mut self, text: &str) {
@@ -132,6 +146,13 @@ impl App {
         if !self.streaming {
             self.streaming = true;
             self.stream_buffer.clear();
+            if !self.output.is_empty() {
+                if let Some(last) = self.output.last() {
+                    if !line_is_blank(last) {
+                        self.output.push(Line::from(Span::raw("")));
+                    }
+                }
+            }
         }
         let chunk = if self.stream_buffer.is_empty() {
             text.trim_start_matches('\n')
@@ -272,16 +293,16 @@ async fn run_tui_inner(
     provider_id: String,
     hooks: HookManager,
 ) -> Result<()> {
-    let mut app = App::new(session_id.clone(), provider_id, model.clone());
-    app.push_line(Line::from(Span::styled(
-        "ZeroBot",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
-    app.push_line(Line::from(Span::styled(
-        format!("会话已启动: {}", session_id),
-        Style::default().fg(Color::Green),
-    )));
-    app.push_line(Line::from(Span::raw("输入 /exit 退出")));
+    let mut app = App::new(session_id.clone(), provider_id.clone(), model.clone());
+    let (cols, _rows) = crossterm::terminal::size().unwrap_or((120, 0));
+    let welcome = build_welcome_lines(
+        env!("CARGO_PKG_VERSION"),
+        &provider_id,
+        &model,
+        &cwd.display().to_string(),
+        cols as usize,
+    );
+    app.output.extend(welcome);
 
     refresh_session_state(&mut app, &store).await;
 
@@ -563,7 +584,7 @@ async fn handle_agent_event(
         AgentEvent::ToolCallFinished { output, ok, .. } => {
             let color = if ok { DotColor::Green } else { DotColor::Red };
             let label = app.last_tool_label.clone();
-            app.push_tool_output(color, label.as_deref(), output.trim());
+            app.push_tool_output(color, label.as_deref(), output.trim(), app.viewport_width);
             app.last_tool_label = None;
             app.status = Status::Thinking;
             app.blink_on = true;
@@ -616,12 +637,13 @@ fn update_blink(app: &mut App) -> bool {
 fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.size();
     let info_lines = app.info_lines();
-    let info_height = info_lines.len().max(1) as u16;
+    let info_height = info_lines.len().max(1) as u16 + 2;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(info_height),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -629,9 +651,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .split(size);
 
     let output_area = chunks[0];
-    let info_area = chunks[1];
-    let input_area = chunks[2];
-    let status_area = chunks[3];
+    let info_area = chunks[2];
+    let input_area = chunks[3];
+    let status_area = chunks[4];
 
     app.viewport_width = output_area.width;
 
@@ -651,7 +673,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .scroll((app.scroll, 0));
     frame.render_widget(output_widget, output_area);
 
-    let info_widget = Paragraph::new(Text::from(info_lines));
+    let info_widget = Paragraph::new(Text::from(info_lines))
+        .block(
+            Block::default()
+                .title("会话信息")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(BORDER_COLOR)),
+        )
+        .style(Style::default().fg(Color::White));
     frame.render_widget(info_widget, info_area);
 
     let input_block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
@@ -698,7 +728,9 @@ fn render_permission_prompt(frame: &mut Frame, prompt: &PermissionPrompt) {
         .collect::<Vec<_>>();
     let block = Block::default()
         .title(prompt.title.clone())
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER_COLOR));
     let widget = Paragraph::new(Text::from(lines)).block(block);
     frame.render_widget(widget, area);
 }
@@ -779,6 +811,94 @@ fn osc52_sequence(text: &str, tmux: bool) -> String {
     }
 }
 
+fn build_welcome_lines(
+    version: &str,
+    provider: &str,
+    model: &str,
+    cwd: &str,
+    term_width: usize,
+) -> Vec<Line<'static>> {
+    let logo = [
+        "███████╗███████╗██████╗  ██████╗ ██████╗  ██████╗ ████████╗",
+        "╚══███╔╝██╔════╝██╔══██╗██╔═══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
+        "  ███╔╝ █████╗  ██████╔╝██║   ██║██████╔╝██║   ██║   ██║   ",
+        " ███╔╝  ██╔══╝  ██╔══██╗██║   ██║██╔══██╗██║   ██║   ██║   ",
+        "███████╗███████╗██║  ██║╚██████╔╝██████╔╝╚██████╔╝   ██║   ",
+        "╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝  ╚═════╝    ╚═╝   ",
+    ];
+    let title = format!(">_ zerobot (v{version})");
+    let meta = format!("{provider} | {model}");
+    let help = "输入 /help 查看命令";
+    let box_lines = [title, meta, cwd.to_string(), help.to_string()];
+    let logo_width = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let box_width = box_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 4;
+    let min_width = logo_width + 2 + box_width;
+
+    let mut out = Vec::new();
+    if term_width >= min_width {
+        let inner = box_width.saturating_sub(2);
+        let top = format!("╭{}╮", "─".repeat(inner));
+        let bottom = format!("╰{}╯", "─".repeat(inner));
+        let mut box_rendered: Vec<(String, bool)> = Vec::new();
+        box_rendered.push((top, true));
+        for line in &box_lines {
+            let pad = inner.saturating_sub(UnicodeWidthStr::width(line.as_str()));
+            box_rendered.push((format!("│{}{}│", line, " ".repeat(pad)), false));
+        }
+        box_rendered.push((bottom, true));
+
+        let rows = logo.len().max(box_rendered.len());
+        for i in 0..rows {
+            let left = *logo.get(i).unwrap_or(&"");
+            let left_pad = logo_width.saturating_sub(left.chars().count());
+            let right = box_rendered.get(i).map(|(s, _)| s.as_str()).unwrap_or("");
+            let right_is_border = box_rendered.get(i).map(|(_, b)| *b).unwrap_or(false);
+            let mut spans = Vec::new();
+            spans.push(Span::styled(left.to_string(), Style::default().fg(LOGO_COLOR)));
+            spans.push(Span::raw(" ".repeat(left_pad)));
+            spans.push(Span::raw("  "));
+            if right_is_border {
+                spans.push(Span::styled(right.to_string(), Style::default().fg(BORDER_COLOR)));
+            } else {
+                // right line has borders; color only the borders to keep text bright.
+                let mut chars = right.chars();
+                let left_border = chars.next().unwrap_or('│').to_string();
+                let right_border = right.chars().last().unwrap_or('│').to_string();
+                let middle: String = right.chars().skip(1).take(right.chars().count().saturating_sub(2)).collect();
+                spans.push(Span::styled(left_border, Style::default().fg(BORDER_COLOR)));
+                spans.push(Span::raw(middle));
+                spans.push(Span::styled(right_border, Style::default().fg(BORDER_COLOR)));
+            }
+            out.push(Line::from(spans));
+        }
+    } else {
+        // Fallback: only render the info box when terminal is narrow.
+        let inner = box_width.saturating_sub(2).max(10);
+        out.push(Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(inner)),
+            Style::default().fg(BORDER_COLOR),
+        )));
+        for line in &box_lines {
+            let pad = inner.saturating_sub(line.chars().count());
+            let mut spans = Vec::new();
+            spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+            spans.push(Span::raw(format!("{}{}", line, " ".repeat(pad))));
+            spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+            out.push(Line::from(spans));
+        }
+        out.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(inner)),
+            Style::default().fg(BORDER_COLOR),
+        )));
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EnableAlternateScroll;
 
@@ -848,6 +968,64 @@ fn dot_span(color: DotColor) -> Span<'static> {
         DotColor::Red => Color::Red,
     };
     Span::styled("●", Style::default().fg(fg))
+}
+
+fn tool_dot_span(color: DotColor) -> Span<'static> {
+    let fg = match color {
+        DotColor::White => Color::White,
+        DotColor::Green => Color::Green,
+        DotColor::Red => Color::Red,
+    };
+    Span::styled("⏺", Style::default().fg(fg))
+}
+
+fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut box_width = width.saturating_sub(6) as usize;
+    if box_width < 10 {
+        box_width = 10;
+    }
+    let inner = box_width.saturating_sub(2);
+    let top = format!("  ╰╭{}╮", "─".repeat(inner));
+    out.push(Line::from(Span::styled(top, Style::default().fg(BORDER_COLOR))));
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = truncate_to_width(line, inner);
+        let pad = inner.saturating_sub(UnicodeWidthStr::width(trimmed.as_str()));
+        let prefix = if idx == 0 { "   │" } else { "   │" };
+        let mut spans = Vec::new();
+        spans.push(Span::styled(prefix.to_string(), Style::default().fg(BORDER_COLOR)));
+        spans.push(Span::raw(format!("{}{}", trimmed, " ".repeat(pad))));
+        spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+        out.push(Line::from(spans));
+    }
+    let bottom = format!("   ╰{}╯", "─".repeat(inner));
+    out.push(Line::from(Span::styled(bottom, Style::default().fg(BORDER_COLOR))));
+    out
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return text.chars().take(max_width).collect();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthStr::width(ch.to_string().as_str());
+        if used + w > max_width - 3 {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push_str("...");
+    out
+}
+
+fn line_is_blank(line: &Line<'static>) -> bool {
+    line.to_string().trim().is_empty()
 }
 
 fn truncate_lines(text: &str, max: usize) -> (Vec<String>, usize) {
