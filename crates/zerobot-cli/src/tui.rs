@@ -5,6 +5,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{execute, Command};
+use pulldown_cmark::{Alignment, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -112,6 +113,13 @@ impl App {
         self.output.extend(format_block_lines(color, text));
     }
 
+    fn push_markdown_block(&mut self, text: &str) {
+        if !self.output.is_empty() {
+            self.output.push(Line::from(Span::raw("")));
+        }
+        self.output.extend(format_markdown_lines(text));
+    }
+
     fn push_tool_output(
         &mut self,
         color: DotColor,
@@ -167,7 +175,7 @@ impl App {
             return;
         }
         let content = self.stream_buffer.clone();
-        self.output.extend(format_block_lines(DotColor::White, &content));
+        self.output.extend(format_markdown_lines(&content));
         if !content.trim().is_empty() {
             self.last_copyable_output = Some(content);
         }
@@ -569,7 +577,7 @@ async fn handle_agent_event(
         }
         AgentEvent::AssistantMessage { content } => {
             app.finalize_stream();
-            app.push_block(DotColor::White, &content);
+            app.push_markdown_block(&content);
             if !content.trim().is_empty() {
                 app.last_copyable_output = Some(content);
             }
@@ -959,6 +967,353 @@ fn format_block_lines(color: DotColor, text: &str) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+fn format_markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let mut lines = markdown_to_lines(text);
+    if lines.is_empty() {
+        return vec![Line::from(vec![dot_span(DotColor::White), Span::raw(" ")])];
+    }
+    let mut out = Vec::new();
+    for (idx, mut line) in lines.drain(..).enumerate() {
+        let mut spans = Vec::new();
+        if idx == 0 {
+            spans.push(dot_span(DotColor::White));
+            spans.push(Span::raw(" "));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+        spans.extend(line.spans.drain(..));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(text, opts);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![Style::default()];
+    let mut in_code_block = false;
+    let mut list_stack: Vec<(bool, usize, usize)> = Vec::new(); // (ordered, index, indent_len)
+    let mut pending_prefix: Option<String> = None;
+    let mut current_prefix: Option<String> = None;
+    let mut blockquote_depth = 0usize;
+    let mut table_align: Vec<Alignment> = Vec::new();
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+    let mut current_row: Vec<String> = Vec::new();
+    let mut current_cell = String::new();
+    let mut in_table_cell = false;
+    let mut table_header_rows = 0usize;
+
+    let flush_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
+        if !current.is_empty() {
+            lines.push(Line::from(std::mem::take(current)));
+        }
+    };
+
+    let ensure_prefix = |current: &mut Vec<Span<'static>>,
+                             pending_prefix: &mut Option<String>,
+                             current_prefix: &Option<String>,
+                             list_stack: &Vec<(bool, usize, usize)>,
+                             blockquote_depth: usize| {
+        if !current.is_empty() {
+            return;
+        }
+        if blockquote_depth > 0 {
+            let prefix = "│ ".repeat(blockquote_depth);
+            current.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+        }
+        let mut prefix = String::new();
+        if !list_stack.is_empty() {
+            if let Some(p) = pending_prefix.take() {
+                prefix.push_str(&p);
+            } else if let Some(indent) = current_prefix {
+                prefix.push_str(indent);
+            }
+        }
+        if !prefix.is_empty() {
+            current.push(Span::raw(prefix));
+        }
+    };
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::Emphasis => {
+                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::ITALIC);
+                    style_stack.push(style);
+                }
+                Tag::Strong => {
+                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::BOLD);
+                    style_stack.push(style);
+                }
+                Tag::Strikethrough => {
+                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::CROSSED_OUT);
+                    style_stack.push(style);
+                }
+                Tag::Heading { .. } => {
+                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::BOLD);
+                    style_stack.push(style);
+                }
+                Tag::CodeBlock(_) => {
+                    flush_line(&mut lines, &mut current);
+                    in_code_block = true;
+                }
+                Tag::BlockQuote(_) => {
+                    flush_line(&mut lines, &mut current);
+                    blockquote_depth = blockquote_depth.saturating_add(1);
+                }
+                Tag::List(start) => {
+                    let ordered = start.is_some();
+                    let index = start.unwrap_or(1);
+                    let indent = if ordered { index.to_string().len() + 2 } else { 2 };
+                    list_stack.push((ordered, index as usize, indent));
+                }
+                Tag::Item => {
+                    if let Some((ordered, index, indent)) = list_stack.last_mut() {
+                        let prefix = if *ordered {
+                            let p = format!("{}. ", *index);
+                            *index += 1;
+                            p
+                        } else {
+                            "• ".to_string()
+                        };
+                        pending_prefix = Some(prefix);
+                        current_prefix = Some(" ".repeat(*indent));
+                    }
+                }
+                Tag::Link { .. } => {
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::UNDERLINED);
+                    style_stack.push(style);
+                }
+                Tag::Table(align) => {
+                    flush_line(&mut lines, &mut current);
+                    table_align = align;
+                    table_rows.clear();
+                    current_row.clear();
+                    current_cell.clear();
+                    in_table_cell = false;
+                    table_header_rows = 0;
+                }
+                Tag::TableHead => {}
+                Tag::TableRow => {
+                    current_row.clear();
+                }
+                Tag::TableCell => {
+                    in_table_cell = true;
+                    current_cell.clear();
+                }
+                _ => {}
+            },
+            MdEvent::End(tag) => match tag {
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Heading(_) => {
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                    if matches!(tag, TagEnd::Heading(_)) {
+                        flush_line(&mut lines, &mut current);
+                        lines.push(Line::from(Span::raw("")));
+                    }
+                }
+                TagEnd::Paragraph => {
+                    flush_line(&mut lines, &mut current);
+                    lines.push(Line::from(Span::raw("")));
+                }
+                TagEnd::CodeBlock => {
+                    in_code_block = false;
+                    lines.push(Line::from(Span::raw("")));
+                }
+                TagEnd::BlockQuote => {
+                    flush_line(&mut lines, &mut current);
+                    blockquote_depth = blockquote_depth.saturating_sub(1);
+                    lines.push(Line::from(Span::raw("")));
+                }
+                TagEnd::List(_) => {
+                    list_stack.pop();
+                    pending_prefix = None;
+                    current_prefix = None;
+                    lines.push(Line::from(Span::raw("")));
+                }
+                TagEnd::Item => {
+                    flush_line(&mut lines, &mut current);
+                }
+                TagEnd::Link => {
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                }
+                TagEnd::TableCell => {
+                    current_row.push(current_cell.trim().to_string());
+                    current_cell.clear();
+                    in_table_cell = false;
+                }
+                TagEnd::TableRow => {
+                    if !current_row.is_empty() {
+                        table_rows.push(current_row.clone());
+                    }
+                    current_row.clear();
+                }
+                TagEnd::TableHead => {
+                    table_header_rows = table_rows.len();
+                }
+                TagEnd::Table => {
+                    if !table_rows.is_empty() {
+                        render_table_lines(&table_rows, &table_align, table_header_rows, &mut lines);
+                        lines.push(Line::from(Span::raw("")));
+                    }
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_code_block {
+                    let code_style = Style::default().fg(Color::LightYellow).bg(Color::DarkGray);
+                    for (i, line) in text.split('\n').enumerate() {
+                        if i > 0 {
+                            lines.push(Line::from(Span::styled("", code_style)));
+                        }
+                        lines.push(Line::from(Span::styled(line.to_string(), code_style)));
+                    }
+                } else if in_table_cell {
+                    current_cell.push_str(&text);
+                } else {
+                    ensure_prefix(
+                        &mut current,
+                        &mut pending_prefix,
+                        &current_prefix,
+                        &list_stack,
+                        blockquote_depth,
+                    );
+                    let style = *style_stack.last().unwrap_or(&Style::default());
+                    current.push(Span::styled(text.to_string(), style));
+                }
+            }
+            MdEvent::Code(code) => {
+                if in_table_cell {
+                    current_cell.push_str(&code);
+                    continue;
+                }
+                ensure_prefix(
+                    &mut current,
+                    &mut pending_prefix,
+                    &current_prefix,
+                    &list_stack,
+                    blockquote_depth,
+                );
+                let style = style_stack
+                    .last()
+                    .copied()
+                    .unwrap_or_default()
+                    .fg(Color::LightYellow)
+                    .bg(Color::DarkGray);
+                current.push(Span::styled(code.to_string(), style));
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                if in_table_cell {
+                    current_cell.push(' ');
+                } else {
+                    flush_line(&mut lines, &mut current);
+                }
+            }
+            MdEvent::Rule => {
+                flush_line(&mut lines, &mut current);
+                lines.push(Line::from(Span::raw("—".repeat(20))));
+                lines.push(Line::from(Span::raw("")));
+            }
+            _ => {}
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    // Trim trailing empty lines
+    while matches!(lines.last(), Some(line) if line.to_string().trim().is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+fn render_table_lines(
+    rows: &[Vec<String>],
+    align: &[Alignment],
+    header_rows: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let mut col_count = 0usize;
+    for row in rows {
+        col_count = col_count.max(row.len());
+    }
+    if col_count == 0 {
+        return;
+    }
+    let mut widths = vec![3usize; col_count];
+    for row in rows {
+        for (idx, cell) in row.iter().enumerate() {
+            let w = UnicodeWidthStr::width(cell.as_str());
+            widths[idx] = widths[idx].max(w);
+        }
+    }
+
+    let make_border = |left: char, mid: char, right: char| {
+        let mut line = String::new();
+        line.push(left);
+        for col in 0..col_count {
+            let segment = "─".repeat(widths[col] + 2);
+            line.push_str(&segment);
+            if col + 1 < col_count {
+                line.push(mid);
+            }
+        }
+        line.push(right);
+        line
+    };
+
+    let top = make_border('╭', '┬', '╮');
+    lines.push(Line::from(Span::raw(top)));
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        let mut line = String::new();
+        for col in 0..col_count {
+            let cell = row.get(col).map(|s| s.as_str()).unwrap_or("");
+            let width = widths[col];
+            let cell_width = UnicodeWidthStr::width(cell);
+            let pad = width.saturating_sub(cell_width);
+            let (pad_left, pad_right) = match align.get(col).copied().unwrap_or(Alignment::Left) {
+                Alignment::Right => (pad, 0),
+                Alignment::Center => (pad / 2, pad - pad / 2),
+                _ => (0, pad),
+            };
+            line.push('│');
+            line.push(' ');
+            line.push_str(&" ".repeat(pad_left));
+            line.push_str(cell);
+            line.push_str(&" ".repeat(pad_right));
+            line.push(' ');
+        }
+        line.push('│');
+        lines.push(Line::from(Span::raw(line)));
+
+        if row_idx + 1 == header_rows {
+            let sep = make_border('├', '┼', '┤');
+            lines.push(Line::from(Span::raw(sep)));
+        } else if row_idx + 1 < rows.len() {
+            let sep = make_border('├', '┼', '┤');
+            lines.push(Line::from(Span::raw(sep)));
+        }
+    }
+
+    let bottom = make_border('╰', '┴', '╯');
+    lines.push(Line::from(Span::raw(bottom)));
 }
 
 fn dot_span(color: DotColor) -> Span<'static> {

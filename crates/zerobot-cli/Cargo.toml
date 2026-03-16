@@ -11,6 +11,7 @@ base64.workspace = true
 clap.workspace = true
 console.workspace = true
 crossterm.workspace = true
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
