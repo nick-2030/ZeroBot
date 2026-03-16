@@ -1009,6 +1009,7 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
     let mut current_cell = String::new();
     let mut in_table_cell = false;
     let mut table_header_rows = 0usize;
+    let mut in_table_head = false;
 
     let flush_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
         if !current.is_empty() {
@@ -1104,8 +1105,11 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                     current_cell.clear();
                     in_table_cell = false;
                     table_header_rows = 0;
+                    in_table_head = false;
                 }
-                Tag::TableHead => {}
+                Tag::TableHead => {
+                    in_table_head = true;
+                }
                 Tag::TableRow => {
                     current_row.clear();
                 }
@@ -1160,11 +1164,19 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                 TagEnd::TableRow => {
                     if !current_row.is_empty() {
                         table_rows.push(current_row.clone());
+                        if in_table_head {
+                            table_header_rows += 1;
+                        }
                     }
                     current_row.clear();
                 }
                 TagEnd::TableHead => {
-                    table_header_rows = table_rows.len();
+                    if !current_row.is_empty() {
+                        table_rows.push(current_row.clone());
+                        table_header_rows += 1;
+                        current_row.clear();
+                    }
+                    in_table_head = false;
                 }
                 TagEnd::Table => {
                     if !table_rows.is_empty() {
@@ -1301,7 +1313,14 @@ fn render_table_lines(
             line.push(' ');
         }
         line.push('│');
-        lines.push(Line::from(Span::raw(line)));
+        if row_idx < header_rows {
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::raw(line)));
+        }
 
         if row_idx + 1 == header_rows {
             let sep = make_border('├', '┼', '┤');
