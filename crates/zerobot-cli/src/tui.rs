@@ -5,14 +5,18 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{execute, Command};
-use pulldown_cmark::{Alignment, Event as MdEvent, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear, BorderType};
 use ratatui::{Frame, Terminal};
+use std::sync::OnceLock;
 use std::time::Instant;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
@@ -117,7 +121,7 @@ impl App {
         if !self.output.is_empty() {
             self.output.push(Line::from(Span::raw("")));
         }
-        self.output.extend(format_markdown_lines(text));
+        self.output.extend(format_markdown_lines(text, self.viewport_width));
     }
 
     fn push_tool_output(
@@ -175,7 +179,8 @@ impl App {
             return;
         }
         let content = self.stream_buffer.clone();
-        self.output.extend(format_markdown_lines(&content));
+        self.output
+            .extend(format_markdown_lines(&content, self.viewport_width));
         if !content.trim().is_empty() {
             self.last_copyable_output = Some(content);
         }
@@ -969,8 +974,8 @@ fn format_block_lines(color: DotColor, text: &str) -> Vec<Line<'static>> {
     lines
 }
 
-fn format_markdown_lines(text: &str) -> Vec<Line<'static>> {
-    let mut lines = markdown_to_lines(text);
+fn format_markdown_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = markdown_to_lines(text, width);
     if lines.is_empty() {
         return vec![Line::from(vec![dot_span(DotColor::White), Span::raw(" ")])];
     }
@@ -989,7 +994,7 @@ fn format_markdown_lines(text: &str) -> Vec<Line<'static>> {
     out
 }
 
-fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
+fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
@@ -998,7 +1003,6 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default()];
-    let mut in_code_block = false;
     let mut list_stack: Vec<(bool, usize, usize)> = Vec::new(); // (ordered, index, indent_len)
     let mut pending_prefix: Option<String> = None;
     let mut current_prefix: Option<String> = None;
@@ -1010,6 +1014,9 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
     let mut in_table_cell = false;
     let mut table_header_rows = 0usize;
     let mut in_table_head = false;
+    let mut code_block_lines: Vec<String> = Vec::new();
+    let mut code_block_lang: Option<String> = None;
+    let mut in_code_block = false;
 
     let flush_line = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
         if !current.is_empty() {
@@ -1061,9 +1068,18 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                     let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::BOLD);
                     style_stack.push(style);
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     flush_line(&mut lines, &mut current);
                     in_code_block = true;
+                    code_block_lines.clear();
+                    code_block_lang = match kind {
+                        CodeBlockKind::Fenced(info) => info
+                            .split_whitespace()
+                            .next()
+                            .map(|s| s.to_string())
+                            .filter(|s| !s.is_empty()),
+                        _ => None,
+                    };
                 }
                 Tag::BlockQuote(_) => {
                     flush_line(&mut lines, &mut current);
@@ -1135,6 +1151,16 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
+                    if code_block_lines.is_empty() {
+                        code_block_lines.push(String::new());
+                    }
+                    lines.extend(render_code_block_lines(
+                        &code_block_lines,
+                        code_block_lang.as_deref(),
+                        width,
+                    ));
+                    code_block_lines.clear();
+                    code_block_lang = None;
                     lines.push(Line::from(Span::raw("")));
                 }
                 TagEnd::BlockQuote => {
@@ -1188,12 +1214,16 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
             },
             MdEvent::Text(text) => {
                 if in_code_block {
-                    let code_style = Style::default().fg(Color::LightYellow).bg(Color::DarkGray);
-                    for (i, line) in text.split('\n').enumerate() {
-                        if i > 0 {
-                            lines.push(Line::from(Span::styled("", code_style)));
+                    if code_block_lines.is_empty() {
+                        code_block_lines.push(String::new());
+                    }
+                    for (idx, chunk) in text.split('\n').enumerate() {
+                        if idx > 0 {
+                            code_block_lines.push(String::new());
                         }
-                        lines.push(Line::from(Span::styled(line.to_string(), code_style)));
+                        if let Some(last) = code_block_lines.last_mut() {
+                            last.push_str(chunk);
+                        }
                     }
                 } else if in_table_cell {
                     current_cell.push_str(&text);
@@ -1210,7 +1240,15 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                 }
             }
             MdEvent::Code(code) => {
-                if in_table_cell {
+                if in_code_block {
+                    if code_block_lines.is_empty() {
+                        code_block_lines.push(String::new());
+                    }
+                    if let Some(last) = code_block_lines.last_mut() {
+                        last.push_str(&code);
+                    }
+                    continue;
+                } else if in_table_cell {
                     current_cell.push_str(&code);
                     continue;
                 }
@@ -1230,7 +1268,9 @@ fn markdown_to_lines(text: &str) -> Vec<Line<'static>> {
                 current.push(Span::styled(code.to_string(), style));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
-                if in_table_cell {
+                if in_code_block {
+                    code_block_lines.push(String::new());
+                } else if in_table_cell {
                     current_cell.push(' ');
                 } else {
                     flush_line(&mut lines, &mut current);
@@ -1333,6 +1373,119 @@ fn render_table_lines(
 
     let bottom = make_border('╰', '┴', '╯');
     lines.push(Line::from(Span::raw(bottom)));
+}
+
+fn render_code_block_lines(
+    lines: &[String],
+    lang: Option<&str>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut content_width = 1usize;
+    for line in lines {
+        content_width = content_width.max(UnicodeWidthStr::width(line.as_str()));
+    }
+    let label = lang
+        .map(|l| format!(" {l} "))
+        .filter(|s| !s.trim().is_empty());
+    let available_width = width.saturating_sub(2) as usize;
+    let outer_width = if available_width > 0 {
+        available_width.max(6)
+    } else {
+        0
+    };
+    let inner_width = if outer_width > 2 {
+        outer_width - 2
+    } else {
+        content_width.saturating_add(2)
+    };
+    let content_width = if inner_width > 2 {
+        inner_width - 2
+    } else {
+        content_width
+    };
+
+    let border_style = Style::default().fg(Color::DarkGray);
+    let (syntax_set, theme) = syntect_assets();
+    let syntax = lang
+        .map(|l| l.to_lowercase())
+        .and_then(|l| syntax_set.find_syntax_by_token(&l))
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    if let Some(label_text) = label {
+        let mut label_text = label_text;
+        let mut label_width = UnicodeWidthStr::width(label_text.as_str());
+        if label_width > inner_width {
+            label_text = truncate_to_width(&label_text, inner_width);
+            label_width = UnicodeWidthStr::width(label_text.as_str());
+        }
+        let dash_count = inner_width.saturating_sub(label_width);
+        let mut spans = Vec::new();
+        spans.push(Span::styled("╭", border_style));
+        spans.push(Span::styled("─".repeat(dash_count), border_style));
+        spans.push(Span::raw(label_text));
+        spans.push(Span::styled("╮", border_style));
+        out.push(Line::from(spans));
+    } else {
+        out.push(Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(inner_width)),
+            border_style,
+        )));
+    }
+
+    for line in lines {
+        let trimmed = truncate_to_width(line, content_width);
+        let trimmed_width = UnicodeWidthStr::width(trimmed.as_str());
+        let pad = content_width.saturating_sub(trimmed_width);
+        let regions = highlighter
+            .highlight_line(&trimmed, syntax_set)
+            .unwrap_or_default();
+        let mut spans = Vec::new();
+        spans.push(Span::styled("│", border_style));
+        spans.push(Span::raw(" "));
+        if regions.is_empty() {
+            spans.push(Span::raw(trimmed.clone()));
+        } else {
+            for (style, text) in regions {
+                let mut span_style =
+                    Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
+                if style.font_style.contains(FontStyle::BOLD) {
+                    span_style = span_style.add_modifier(Modifier::BOLD);
+                }
+                if style.font_style.contains(FontStyle::ITALIC) {
+                    span_style = span_style.add_modifier(Modifier::ITALIC);
+                }
+                if style.font_style.contains(FontStyle::UNDERLINE) {
+                    span_style = span_style.add_modifier(Modifier::UNDERLINED);
+                }
+                spans.push(Span::styled(text.to_string(), span_style));
+            }
+        }
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("│", border_style));
+        out.push(Line::from(spans));
+    }
+
+    out.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner_width)),
+        border_style,
+    )));
+    out
+}
+
+fn syntect_assets() -> (&'static SyntaxSet, &'static Theme) {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+    static THEME_NAME: &str = "base16-ocean.dark";
+    let syntax_set = SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines);
+    let theme_set = THEME_SET.get_or_init(ThemeSet::load_defaults);
+    let theme = theme_set
+        .themes
+        .get(THEME_NAME)
+        .or_else(|| theme_set.themes.values().next())
+        .expect("syntect theme set is empty");
+    (syntax_set, theme)
 }
 
 fn dot_span(color: DotColor) -> Span<'static> {

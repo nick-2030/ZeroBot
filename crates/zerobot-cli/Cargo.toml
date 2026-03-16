@@ -20,5 +20,6 @@ tracing-subscriber.workspace = true
 serde_yaml.workspace = true
 rustyline.workspace = true
 unicode-width.workspace = true
+syntect.workspace = true
 
 zerobot-core = { path = "../zerobot-core" }
