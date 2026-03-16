@@ -6,7 +6,9 @@ use serde_json::Value as JsonValue;
 use futures::stream::{self, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_stream::Stream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +72,13 @@ pub enum ProviderEvent {
     ToolCall(ToolCall),
     Usage(TokenUsage),
     Done,
+}
+
+#[derive(Debug, Default, Clone)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 #[async_trait]
@@ -275,6 +284,221 @@ impl Provider for OpenAIProvider {
             usage,
         })
     }
+
+    fn stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Pin<Box<dyn Stream<Item = ZeroBotResult<ProviderEvent>> + Send + '_>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let base_url = self.base_url.clone();
+
+        tokio::spawn(async move {
+            let url = format!("{}/chat/completions", base_url);
+            let tools = request.tools.into_iter().map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            }).collect::<Vec<_>>();
+
+            let mut messages = Vec::new();
+            if let Some(system) = request.system {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": system
+                }));
+            }
+            for msg in request.messages {
+                match msg.role {
+                    ProviderMessageRole::Tool => {
+                        let Some(call_id) = msg.tool_call_id else {
+                            let _ = tx.send(Err(ZeroBotError::Provider(
+                                "工具消息缺少 tool_call_id".to_string(),
+                            )));
+                            return;
+                        };
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": msg.content
+                        }));
+                    }
+                    _ => {
+                        let mut message = serde_json::json!({
+                            "role": match msg.role {
+                                ProviderMessageRole::System => "system",
+                                ProviderMessageRole::User => "user",
+                                ProviderMessageRole::Assistant => "assistant",
+                                ProviderMessageRole::Tool => "tool",
+                            },
+                            "content": msg.content,
+                        });
+                        if let Some(name) = msg.name {
+                            if let Some(obj) = message.as_object_mut() {
+                                obj.insert("name".to_string(), serde_json::Value::String(name));
+                            }
+                        }
+                        if matches!(msg.role, ProviderMessageRole::Assistant) {
+                            if let Some(calls) = msg.tool_calls {
+                                let tool_calls = calls
+                                    .into_iter()
+                                    .map(|call| {
+                                        serde_json::json!({
+                                            "id": call.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": call.name,
+                                                "arguments": call.arguments.to_string()
+                                            }
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                if let Some(obj) = message.as_object_mut() {
+                                    obj.insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls));
+                                }
+                            }
+                        }
+                        messages.push(message);
+                    }
+                }
+            }
+
+            let payload = serde_json::json!({
+                "model": request.model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "stream": true,
+                "stream_options": { "include_usage": true }
+            });
+
+            let response = client
+                .post(url)
+                .bearer_auth(api_key)
+                .json(&payload)
+                .send()
+                .await;
+            let response = match response {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let _ = tx.send(Err(ZeroBotError::Provider(err.to_string())));
+                    return;
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                let _ = tx.send(Err(ZeroBotError::Provider(format!(
+                    "OpenAI 请求失败: {status} {text}"
+                ))));
+                return;
+            }
+
+            let mut tool_calls: Vec<PartialToolCall> = Vec::new();
+            let mut last_usage: Option<TokenUsage> = None;
+            let mut done = false;
+
+            let mut data_lines: Vec<String> = Vec::new();
+            let mut line_buf = String::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let _ = tx.send(Err(ZeroBotError::Provider(err.to_string())));
+                        return;
+                    }
+                };
+                let text = String::from_utf8_lossy(&chunk);
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        let line = line_buf.trim_end_matches('\r').to_string();
+                        line_buf.clear();
+                        if line.is_empty() {
+                            if !data_lines.is_empty() {
+                                let data = data_lines.join("\n");
+                                data_lines.clear();
+                                if data.trim() == "[DONE]" {
+                                    done = true;
+                                    break;
+                                }
+                                if let Ok(raw) = serde_json::from_str::<JsonValue>(&data) {
+                                    if raw.get("error").is_some() {
+                                        let _ = tx.send(Err(ZeroBotError::Provider(
+                                            raw.to_string(),
+                                        )));
+                                        return;
+                                    }
+                                    if let Some(choices) = raw.get("choices").and_then(|v| v.as_array()) {
+                                        for choice in choices {
+                                            if let Some(delta) = choice.get("delta") {
+                                                if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                                                    let _ = tx.send(Ok(ProviderEvent::TextDelta(text.to_string())));
+                                                }
+                                                if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                                    for call in calls {
+                                                        let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                        if tool_calls.len() <= index {
+                                                            tool_calls.resize_with(index + 1, PartialToolCall::default);
+                                                        }
+                                                        let entry = &mut tool_calls[index];
+                                                        if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                                                            entry.id = id.to_string();
+                                                        }
+                                                        if let Some(func) = call.get("function") {
+                                                            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                                entry.name = name.to_string();
+                                                            }
+                                                            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                                entry.arguments.push_str(args);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(usage) = raw.get("usage").and_then(parse_openai_usage) {
+                                        last_usage = Some(usage.clone());
+                                        let _ = tx.send(Ok(ProviderEvent::Usage(usage)));
+                                    }
+                                }
+                            }
+                        } else if let Some(rest) = line.strip_prefix("data:") {
+                            data_lines.push(rest.trim_start().to_string());
+                        }
+                    } else {
+                        line_buf.push(ch);
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+
+            for call in tool_calls.into_iter() {
+                if call.name.is_empty() {
+                    continue;
+                }
+                let arguments = serde_json::from_str(&call.arguments)
+                    .unwrap_or(JsonValue::String(call.arguments));
+                let id = if call.id.is_empty() { uuid::Uuid::new_v4().to_string() } else { call.id };
+                let _ = tx.send(Ok(ProviderEvent::ToolCall(ToolCall { id, name: call.name, arguments })));
+            }
+            if let Some(usage) = last_usage {
+                let _ = tx.send(Ok(ProviderEvent::Usage(usage)));
+            }
+            let _ = tx.send(Ok(ProviderEvent::Done));
+        });
+
+        Box::pin(UnboundedReceiverStream::new(rx))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +634,251 @@ impl Provider for AnthropicProvider {
             raw,
             usage,
         })
+    }
+
+    fn stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Pin<Box<dyn Stream<Item = ZeroBotResult<ProviderEvent>> + Send + '_>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let base_url = self.base_url.clone();
+
+        tokio::spawn(async move {
+            if api_key.is_empty() {
+                let _ = tx.send(Err(ZeroBotError::Provider("Anthropic API Key 为空".to_string())));
+                return;
+            }
+
+            let url = format!("{}/messages", base_url);
+            let tools = request
+                .tools
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let mut messages = Vec::new();
+            for msg in request.messages {
+                match msg.role {
+                    ProviderMessageRole::Tool => {
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": msg.tool_call_id,
+                                "content": msg.content,
+                            }]
+                        }));
+                    }
+                    ProviderMessageRole::System => {}
+                    _ => {
+                        messages.push(serde_json::json!({
+                            "role": match msg.role {
+                                ProviderMessageRole::User => "user",
+                                ProviderMessageRole::Assistant => "assistant",
+                                _ => "user",
+                            },
+                            "content": [{
+                                "type": "text",
+                                "text": msg.content
+                            }]
+                        }));
+                    }
+                }
+            }
+
+            let payload = serde_json::json!({
+                "model": request.model,
+                "max_tokens": request.max_tokens.unwrap_or(1024),
+                "system": request.system,
+                "messages": messages,
+                "tools": tools,
+                "stream": true,
+            });
+
+            let response = client
+                .post(url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&payload)
+                .send()
+                .await;
+            let response = match response {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let _ = tx.send(Err(ZeroBotError::Provider(err.to_string())));
+                    return;
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                let _ = tx.send(Err(ZeroBotError::Provider(format!(
+                    "Anthropic 请求失败: {status} {text}"
+                ))));
+                return;
+            }
+
+            let mut tool_calls: Vec<PartialToolCall> = Vec::new();
+            let mut last_usage: TokenUsage = TokenUsage::default();
+            let mut done = false;
+
+            let mut event_name: Option<String> = None;
+            let mut data_lines: Vec<String> = Vec::new();
+            let mut line_buf = String::new();
+
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let _ = tx.send(Err(ZeroBotError::Provider(err.to_string())));
+                        return;
+                    }
+                };
+                let text = String::from_utf8_lossy(&chunk);
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        let line = line_buf.trim_end_matches('\r').to_string();
+                        line_buf.clear();
+                        if line.is_empty() {
+                            if !data_lines.is_empty() {
+                                let data = data_lines.join("\n");
+                                data_lines.clear();
+                                let evt = event_name.take();
+                                if let Ok(raw) = serde_json::from_str::<JsonValue>(&data) {
+                                    if raw.get("error").is_some() {
+                                        let _ = tx.send(Err(ZeroBotError::Provider(
+                                            raw.to_string(),
+                                        )));
+                                        return;
+                                    }
+                                    let evt_type = evt
+                                        .as_deref()
+                                        .or_else(|| raw.get("type").and_then(|v| v.as_str()))
+                                        .unwrap_or("");
+
+                                    match evt_type {
+                                        "message_start" => {
+                                            if let Some(usage) = raw
+                                                .get("message")
+                                                .and_then(|v| v.get("usage"))
+                                                .and_then(parse_anthropic_usage)
+                                            {
+                                                last_usage.input_tokens = usage.input_tokens;
+                                                last_usage.output_tokens = usage.output_tokens;
+                                                last_usage.total_tokens = usage.total_tokens;
+                                                let _ = tx.send(Ok(ProviderEvent::Usage(last_usage.clone())));
+                                            }
+                                        }
+                                        "message_delta" => {
+                                            if let Some(usage) = raw.get("usage").and_then(parse_anthropic_usage) {
+                                                if usage.input_tokens.is_some() {
+                                                    last_usage.input_tokens = usage.input_tokens;
+                                                }
+                                                if usage.output_tokens.is_some() {
+                                                    last_usage.output_tokens = usage.output_tokens;
+                                                }
+                                                if usage.total_tokens.is_some() {
+                                                    last_usage.total_tokens = usage.total_tokens;
+                                                }
+                                                let _ = tx.send(Ok(ProviderEvent::Usage(last_usage.clone())));
+                                            }
+                                        }
+                                        "content_block_start" => {
+                                            if let Some(block) = raw.get("content_block") {
+                                                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                                if block_type == "text" {
+                                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                                        if !text.is_empty() {
+                                                            let _ = tx.send(Ok(ProviderEvent::TextDelta(text.to_string())));
+                                                        }
+                                                    }
+                                                } else if block_type == "tool_use" {
+                                                    let index = raw.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                    if tool_calls.len() <= index {
+                                                        tool_calls.resize_with(index + 1, PartialToolCall::default);
+                                                    }
+                                                    let entry = &mut tool_calls[index];
+                                                    if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                                                        entry.id = id.to_string();
+                                                    }
+                                                    if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                                                        entry.name = name.to_string();
+                                                    }
+                                                    if let Some(input) = block.get("input") {
+                                                        if let Ok(text) = serde_json::to_string(input) {
+                                                            entry.arguments = text;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "content_block_delta" => {
+                                            if let Some(delta) = raw.get("delta") {
+                                                let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                                if delta_type == "text_delta" {
+                                                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                                        let _ = tx.send(Ok(ProviderEvent::TextDelta(text.to_string())));
+                                                    }
+                                                } else if delta_type == "input_json_delta" {
+                                                    let index = raw.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                    if tool_calls.len() <= index {
+                                                        tool_calls.resize_with(index + 1, PartialToolCall::default);
+                                                    }
+                                                    if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                                        tool_calls[index].arguments.push_str(partial);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "message_stop" => {
+                                            done = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        } else if let Some(rest) = line.strip_prefix("event:") {
+                            event_name = Some(rest.trim().to_string());
+                        } else if let Some(rest) = line.strip_prefix("data:") {
+                            data_lines.push(rest.trim_start().to_string());
+                        }
+                    } else {
+                        line_buf.push(ch);
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+
+            for call in tool_calls.into_iter() {
+                if call.name.is_empty() {
+                    continue;
+                }
+                let arguments = serde_json::from_str(&call.arguments)
+                    .unwrap_or(JsonValue::String(call.arguments));
+                let id = if call.id.is_empty() { uuid::Uuid::new_v4().to_string() } else { call.id };
+                let _ = tx.send(Ok(ProviderEvent::ToolCall(ToolCall { id, name: call.name, arguments })));
+            }
+            if last_usage.input_tokens.is_some()
+                || last_usage.output_tokens.is_some()
+                || last_usage.total_tokens.is_some()
+            {
+                let _ = tx.send(Ok(ProviderEvent::Usage(last_usage)));
+            }
+            let _ = tx.send(Ok(ProviderEvent::Done));
+        });
+
+        Box::pin(UnboundedReceiverStream::new(rx))
     }
 }
 

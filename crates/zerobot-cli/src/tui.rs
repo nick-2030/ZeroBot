@@ -202,7 +202,7 @@ impl App {
             Status::Idle => Line::from(Span::raw("状态: 空闲")),
             Status::Thinking => {
                 let dot = if self.blink_on { "●" } else { " " };
-                Line::from(Span::raw(format!("状态: {dot} 思考中")))
+                Line::from(Span::raw(format!("状态: {dot} 努力工作中")))
             }
             Status::Tool(name) => Line::from(Span::raw(format!("状态: 工具执行中: {name}"))),
             Status::Error(message) => Line::from(Span::raw(format!("状态: 错误: {message}"))),
