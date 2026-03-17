@@ -14,6 +14,14 @@ pub struct LogGuard {
 }
 
 pub fn init_logging(settings: &Settings, session_id: Option<&str>) -> ZeroBotResult<LogGuard> {
+    init_logging_with_stdout(settings, session_id, true)
+}
+
+pub fn init_logging_with_stdout(
+    settings: &Settings,
+    session_id: Option<&str>,
+    enable_stdout: bool,
+) -> ZeroBotResult<LogGuard> {
     let level = settings.logging.level.clone();
     let filter = EnvFilter::new(level);
     let session = session_id.unwrap_or("system");
@@ -34,8 +42,7 @@ pub fn init_logging(settings: &Settings, session_id: Option<&str>) -> ZeroBotRes
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(writer);
-    let stdout_layer = tracing_subscriber::fmt::layer().with_ansi(true);
-
+    let stdout_layer = enable_stdout.then(|| tracing_subscriber::fmt::layer().with_ansi(true));
     let _ = Registry::default()
         .with(filter)
         .with(file_layer)

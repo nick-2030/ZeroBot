@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
-use zerobot_core::logging::init_logging;
+use zerobot_core::logging::{init_logging, init_logging_with_stdout};
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
 use zerobot_core::session::{
     create_session_with_hooks,
@@ -255,7 +255,7 @@ async fn run_repl(
         zerobot_core::session::SessionKind::Main,
     )
     .await?;
-    let _log_guard = init_logging(settings, Some(&session.id))?;
+    let _log_guard = init_logging_with_stdout(settings, Some(&session.id), false)?;
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let store = Arc::new(store);

@@ -21,7 +21,7 @@ pub use config::{ConfigLayer, ConfigLoader, ConfigScope, LoadedConfig, Settings}
 pub use error::{ZeroBotError, ZeroBotResult};
 pub use events::AgentEvent;
 pub use hooks::{HookAction, HookDecision, HookDefinition, HookEvent, HookManager};
-pub use logging::{init_logging, LogGuard};
+pub use logging::{init_logging, init_logging_with_stdout, LogGuard};
 pub use provider::{
     Provider,
     ProviderEvent,
