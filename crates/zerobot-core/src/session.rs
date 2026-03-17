@@ -34,6 +34,8 @@ pub struct Message {
     pub session_id: String,
     pub role: MessageRole,
     pub content: String,
+    #[serde(default)]
+    pub summary: bool,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<Vec<StoredToolCall>>,
     pub created_at: i64,
@@ -177,6 +179,7 @@ impl SessionStore for SqliteSessionStore {
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                summary INTEGER NOT NULL DEFAULT 0,
                 tool_call_id TEXT,
                 tool_calls_json TEXT,
                 created_at INTEGER NOT NULL,
@@ -188,6 +191,9 @@ impl SessionStore for SqliteSessionStore {
         .await?;
 
         let _ = sqlx::query("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT;")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE messages ADD COLUMN summary INTEGER DEFAULT 0;")
             .execute(&self.pool)
             .await;
 
@@ -340,12 +346,13 @@ impl SessionStore for SqliteSessionStore {
             None => None,
         };
         sqlx::query(
-            "INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_calls_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, session_id, role, content, summary, tool_call_id, tool_calls_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&message.session_id)
         .bind(message.role.to_string())
         .bind(&message.content)
+        .bind(if message.summary { 1 } else { 0 })
         .bind(&message.tool_call_id)
         .bind(&tool_calls_json)
         .bind(message.created_at)
@@ -362,8 +369,8 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn list_messages(&self, session_id: &str) -> ZeroBotResult<Vec<Message>> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, i64)>(
-            "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        let rows = sqlx::query_as::<_, (String, String, String, String, i64, Option<String>, Option<String>, i64)>(
+            "SELECT id, session_id, role, content, summary, tool_call_id, tool_calls_json, created_at FROM messages WHERE session_id = ? ORDER BY created_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -376,9 +383,10 @@ impl SessionStore for SqliteSessionStore {
                 session_id: row.1,
                 role: MessageRole::from_str(&row.2),
                 content: row.3,
-                tool_call_id: row.4,
-                tool_calls: row.5.and_then(|raw| serde_json::from_str(&raw).ok()),
-                created_at: row.6,
+                summary: row.4 != 0,
+                tool_call_id: row.5,
+                tool_calls: row.6.and_then(|raw| serde_json::from_str(&raw).ok()),
+                created_at: row.7,
             })
             .collect())
     }

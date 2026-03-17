@@ -44,8 +44,20 @@ context:
   max_messages: 200
   # 最大字符数（0 表示不限制）
   max_chars: 120000
+  # 最大上下文 token（可选，未配置则自动压缩失效）
+  # max_tokens: 128000
+  # 不同模型的上下文上限（可选，优先于 max_tokens）
+  # model_limits:
+  #   gpt-4o-mini: 128000
   # 是否注入环境信息（工作目录/日期/平台等）
   include_environment: true
+  # 自动上下文压缩
+  compaction:
+    enabled: true
+    auto: true
+    reserved_tokens: 2048
+    # 可选，摘要使用的模型（不填则使用对话模型）
+    # summary_model: "gpt-4o-mini"
 
 # 工具开关
 # enabled 列表决定可用工具

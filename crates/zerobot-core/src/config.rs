@@ -142,6 +142,12 @@ pub struct ContextSettings {
     pub max_chars: usize,
     #[serde(default = "default_context_include_environment")]
     pub include_environment: bool,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub model_limits: HashMap<String, u32>,
+    #[serde(default)]
+    pub compaction: CompactionSettings,
 }
 
 fn default_context_max_messages() -> usize {
@@ -154,6 +160,30 @@ fn default_context_max_chars() -> usize {
 
 fn default_context_include_environment() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionSettings {
+    #[serde(default = "default_compaction_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_compaction_auto")]
+    pub auto: bool,
+    #[serde(default = "default_compaction_reserved_tokens")]
+    pub reserved_tokens: u32,
+    #[serde(default)]
+    pub summary_model: Option<String>,
+}
+
+fn default_compaction_enabled() -> bool {
+    true
+}
+
+fn default_compaction_auto() -> bool {
+    true
+}
+
+fn default_compaction_reserved_tokens() -> u32 {
+    2048
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +330,20 @@ impl Default for ContextSettings {
             max_messages: default_context_max_messages(),
             max_chars: default_context_max_chars(),
             include_environment: default_context_include_environment(),
+            max_tokens: None,
+            model_limits: HashMap::new(),
+            compaction: CompactionSettings::default(),
+        }
+    }
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_compaction_enabled(),
+            auto: default_compaction_auto(),
+            reserved_tokens: default_compaction_reserved_tokens(),
+            summary_model: None,
         }
     }
 }

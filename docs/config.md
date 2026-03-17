@@ -32,7 +32,13 @@
 - `session.max_history`：历史消息最大数量。
 - `context.max_messages`：上下文保留的最大消息条数（0 表示不限制）。
 - `context.max_chars`：上下文保留的最大字符数（0 表示不限制）。
+- `context.max_tokens`：上下文最大 token 预算（可选）。未配置时自动压缩不生效。
+- `context.model_limits`：按模型设置上下文上限（可选，优先于 `max_tokens`）。
 - `context.include_environment`：是否在系统提示词中注入环境信息。
+- `context.compaction.enabled`：是否启用上下文压缩（默认 true）。
+- `context.compaction.auto`：是否自动触发压缩（默认 true）。
+- `context.compaction.reserved_tokens`：压缩预留 token（默认 2048）。
+- `context.compaction.summary_model`：摘要使用的模型（可选，默认跟随对话模型）。
 - `tools.enabled`：启用的工具列表。
 - `tools.allow_paths`：允许访问的路径（为空表示不限制）。
 - `tools.output.max_lines`：工具输出最大行数，超出会被截断。

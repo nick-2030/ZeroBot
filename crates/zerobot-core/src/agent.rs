@@ -13,6 +13,22 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
+use tracing::warn;
+
+const COMPACTION_PROMPT: &str = r#"请根据以下对话内容生成一份“可继续执行任务”的摘要。
+
+摘要需尽量保留：
+- 目标与范围
+- 关键指令/约束/偏好
+- 已完成的工作与当前状态
+- 重要的技术决策与原因
+- 涉及的关键文件/路径/接口
+- 下一步计划
+
+输出要求：
+- 使用清晰的条目或分段
+- 不要回答对话中的问题
+- 只输出摘要内容"#;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -81,6 +97,7 @@ impl Agent {
                 session_id: session_id.to_string(),
                 role: MessageRole::User,
                 content: input_text.clone(),
+                summary: false,
                 tool_call_id: None,
                 tool_calls: None,
                 created_at: Utc::now().timestamp(),
@@ -89,6 +106,8 @@ impl Agent {
 
         let mut steps = 0usize;
         let mut last_response = String::new();
+        let mut warned_missing_limit = false;
+        let mut overflow_compaction_attempted = false;
 
         loop {
             steps += 1;
@@ -115,6 +134,22 @@ impl Agent {
                     system.push_str("\n\n");
                 }
                 system.push_str(&format_skill_stack(&skill_stack));
+            }
+
+            if self.settings.context.compaction.enabled && self.settings.context.compaction.auto {
+                if let Some(limit) = context.context_limit {
+                    let reserved = self.settings.context.compaction.reserved_tokens as usize;
+                    if context.estimated_tokens >= limit.saturating_sub(reserved as u32) as usize {
+                        self.compact_session(session_id, &history).await?;
+                        overflow_compaction_attempted = false;
+                        continue;
+                    }
+                } else if !warned_missing_limit {
+                    warn!(
+                        "context.max_tokens 或 context.model_limits 未配置，自动 compaction 已跳过"
+                    );
+                    warned_missing_limit = true;
+                }
             }
 
             let mut enabled = self.settings.tools.enabled.clone();
@@ -165,8 +200,10 @@ impl Agent {
             let mut had_delta = false;
             let mut content = String::new();
             let mut stream = self.provider.stream(request);
+            let mut stream_error: Option<ZeroBotError> = None;
             while let Some(event) = stream.next().await {
-                match event? {
+                match event {
+                    Ok(event) => match event {
                     ProviderEvent::TextDelta(text) => {
                         content.push_str(&text);
                         had_delta = true;
@@ -184,8 +221,25 @@ impl Agent {
                         self.emit(&events, AgentEvent::Usage { usage });
                     }
                     ProviderEvent::Done => {}
+                },
+                    Err(err) => {
+                        stream_error = Some(err);
+                        break;
+                    }
                 }
             }
+            if let Some(err) = stream_error {
+                if Self::is_context_overflow(&err)
+                    && self.settings.context.compaction.enabled
+                    && !overflow_compaction_attempted
+                {
+                    self.compact_session(session_id, &history).await?;
+                    overflow_compaction_attempted = true;
+                    continue;
+                }
+                return Err(err);
+            }
+            overflow_compaction_attempted = false;
 
             let post_payload = serde_json::json!({
                 "content": content.clone(),
@@ -220,6 +274,7 @@ impl Agent {
                             session_id: session_id.to_string(),
                             role: MessageRole::Assistant,
                             content: content.clone(),
+                            summary: false,
                             tool_call_id: None,
                             tool_calls: None,
                             created_at: Utc::now().timestamp(),
@@ -246,6 +301,7 @@ impl Agent {
                             content: format!(
                                 "Skill 仍在执行中，请继续完成并调用 skill end。\n\n{notice}"
                             ),
+                            summary: false,
                             tool_call_id: None,
                             tool_calls: None,
                             created_at: Utc::now().timestamp(),
@@ -268,6 +324,7 @@ impl Agent {
                     session_id: session_id.to_string(),
                     role: MessageRole::Assistant,
                     content: content.clone(),
+                    summary: false,
                     tool_call_id: None,
                     tool_calls: Some(stored_calls),
                     created_at: Utc::now().timestamp(),
@@ -313,11 +370,95 @@ impl Agent {
         Ok(last_response)
     }
 
+    async fn compact_session(&self, session_id: &str, history: &[Message]) -> ZeroBotResult<()> {
+        let messages = Self::build_compaction_messages(history);
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let model = self
+            .settings
+            .context
+            .compaction
+            .summary_model
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.model.clone());
+        let request = ProviderRequest {
+            model,
+            system: Some(COMPACTION_PROMPT.to_string()),
+            messages,
+            tools: Vec::new(),
+            max_tokens: None,
+        };
+        let mut content = String::new();
+        let mut stream = self.provider.stream(request);
+        while let Some(event) = stream.next().await {
+            match event? {
+                ProviderEvent::TextDelta(text) => content.push_str(&text),
+                ProviderEvent::ToolCall(_) => {}
+                ProviderEvent::Usage(_) => {}
+                ProviderEvent::Done => {}
+            }
+        }
+        let summary = content.trim().to_string();
+        if summary.is_empty() {
+            return Err(ZeroBotError::Agent("上下文压缩失败：摘要为空".to_string()));
+        }
+        let _ = self
+            .append_message_with_hooks(Message {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                role: MessageRole::Assistant,
+                content: summary,
+                summary: true,
+                tool_call_id: None,
+                tool_calls: None,
+                created_at: Utc::now().timestamp(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    fn build_compaction_messages(history: &[Message]) -> Vec<crate::provider::ProviderMessage> {
+        let start = history
+            .iter()
+            .rposition(|msg| msg.summary && matches!(msg.role, MessageRole::Assistant))
+            .unwrap_or(0);
+        history[start..]
+            .iter()
+            .map(|message| crate::provider::ProviderMessage {
+                role: match message.role {
+                    MessageRole::System => crate::provider::ProviderMessageRole::System,
+                    MessageRole::User => crate::provider::ProviderMessageRole::User,
+                    MessageRole::Assistant => crate::provider::ProviderMessageRole::Assistant,
+                    MessageRole::Tool => crate::provider::ProviderMessageRole::Tool,
+                },
+                content: message.content.clone(),
+                tool_call_id: message.tool_call_id.clone(),
+                name: None,
+                tool_calls: message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| calls.iter().map(StoredToolCall::to_provider_call).collect()),
+            })
+            .collect()
+    }
+
+    fn is_context_overflow(err: &ZeroBotError) -> bool {
+        let text = err.to_string().to_lowercase();
+        text.contains("context length")
+            || text.contains("maximum context")
+            || text.contains("context window")
+            || text.contains("exceeds the context")
+            || text.contains("context limit")
+    }
+
     async fn append_message_with_hooks(&self, mut message: Message) -> ZeroBotResult<Message> {
         let skill_hooks = self.load_skill_hooks(&message.session_id).await?;
         let payload = serde_json::json!({
             "role": message.role.to_string(),
             "content": message.content.clone(),
+            "summary": message.summary,
             "tool_call_id": message.tool_call_id.clone(),
         });
         let decision = self
@@ -376,6 +517,7 @@ impl Agent {
                     session_id: session_id.to_string(),
                     role: MessageRole::Tool,
                     content: message.clone(),
+                    summary: false,
                     tool_call_id: Some(tool_call_id),
                     tool_calls: None,
                     created_at: Utc::now().timestamp(),
@@ -472,6 +614,7 @@ impl Agent {
                         session_id: session_id.to_string(),
                         role: MessageRole::Tool,
                         content: output_content.clone(),
+                        summary: false,
                         tool_call_id: Some(tool_call_id.clone()),
                         tool_calls: None,
                         created_at: Utc::now().timestamp(),
@@ -528,6 +671,7 @@ impl Agent {
                         session_id: session_id.to_string(),
                         role: MessageRole::Tool,
                         content: output_content.clone(),
+                        summary: false,
                         tool_call_id: Some(tool_call_id),
                         tool_calls: None,
                         created_at: Utc::now().timestamp(),
