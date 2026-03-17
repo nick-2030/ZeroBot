@@ -3,6 +3,7 @@ use crate::agents::AgentManager;
 use crate::config::{Settings, ToolOutputDirection, ToolOutputSettings};
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookManager;
+use crate::instruction;
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::provider::ProviderFactory;
 use crate::session::{SessionKind, SessionStore, TodoItem};
@@ -608,14 +609,38 @@ impl Tool for ReadTool {
         let offset = args.offset.unwrap_or(0);
         let limit = args.limit.unwrap_or(usize::MAX);
         if offset == 0 && limit == usize::MAX {
-            return Ok(ToolOutput::new(content));
+            let mut output = content;
+            let reminders = instruction::resolve_nearby_instructions(&ctx.session_id, &path);
+            if !reminders.is_empty() {
+                let reminder_text = reminders
+                    .iter()
+                    .map(|item| item.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                output.push_str("\n\n<system-reminder>\n");
+                output.push_str(&reminder_text);
+                output.push_str("\n</system-reminder>");
+            }
+            return Ok(ToolOutput::new(output));
         }
         let lines: Vec<&str> = content.lines().collect();
         if offset >= lines.len() {
             return Ok(ToolOutput::new(""));
         }
         let end = offset.saturating_add(limit).min(lines.len());
-        Ok(ToolOutput::new(lines[offset..end].join("\n")))
+        let mut output = lines[offset..end].join("\n");
+        let reminders = instruction::resolve_nearby_instructions(&ctx.session_id, &path);
+        if !reminders.is_empty() {
+            let reminder_text = reminders
+                .iter()
+                .map(|item| item.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            output.push_str("\n\n<system-reminder>\n");
+            output.push_str(&reminder_text);
+            output.push_str("\n</system-reminder>");
+        }
+        Ok(ToolOutput::new(output))
     }
 }
 

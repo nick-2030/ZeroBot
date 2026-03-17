@@ -5,6 +5,8 @@ ZeroBot 内置了一份中文系统提示词，用于约束行为、工具使用
 当调用 `skill` 工具后，系统提示词会追加当前 Skill 栈提示，直到调用 `skill` 的 `end` 操作清空栈为止。
 Skill 加载输出包含路径，执行流程需使用 `read/glob/grep` 按需读取 Skill 目录内的文件内容。
 当启用 `todoread/todowrite` 时，系统提示词会包含 Todo 规则，用于指导多步骤任务的待办管理。
+系统提示词会自动注入指令文件内容：优先读取项目目录向上查找的 `AGENTS.md` / `CLAUDE.md` / `CONTEXT.md`，并可通过 `instructions` 配置追加本地路径、glob 或 URL。
+读取文件时会就近查找指令文件，并在 read 输出末尾追加 `<system-reminder>`，以提醒当前上下文约束。
 
 默认提示词（节选）：
 

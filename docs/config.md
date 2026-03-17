@@ -39,6 +39,7 @@
 - `context.compaction.auto`：是否自动触发压缩（默认 true）。
 - `context.compaction.reserved_tokens`：压缩预留 token（默认 2048）。
 - `context.compaction.summary_model`：摘要使用的模型（可选，默认跟随对话模型）。
+- `instructions`：额外指令来源列表，支持绝对/相对路径、glob 与 URL。
 - `tools.enabled`：启用的工具列表。
 - `tools.allow_paths`：允许访问的路径（为空表示不限制）。
 - `tools.output.max_lines`：工具输出最大行数，超出会被截断。

@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod hooks;
+pub mod instruction;
 pub mod logging;
 pub mod mcp;
 pub mod prompt;

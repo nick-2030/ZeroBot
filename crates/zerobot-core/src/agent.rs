@@ -104,6 +104,13 @@ impl Agent {
             })
             .await?;
 
+        let instruction_sources = crate::instruction::system_sources(&self.settings, &self.cwd);
+        let url_instructions = crate::instruction::fetch_url_instructions(&instruction_sources.urls).await;
+        let url_instruction_text = url_instructions
+            .into_iter()
+            .map(|item| item.content)
+            .collect::<Vec<_>>();
+
         let mut steps = 0usize;
         let mut last_response = String::new();
         let mut warned_missing_limit = false;
@@ -126,6 +133,7 @@ impl Agent {
                 &self.model,
                 &history,
                 skill_list.as_deref(),
+                Some(&url_instruction_text),
             );
             let skill_stack = self.store.get_skill_stack(session_id).await?;
             let mut system = context.system.unwrap_or_default();

@@ -59,6 +59,12 @@ context:
     # 可选，摘要使用的模型（不填则使用对话模型）
     # summary_model: "gpt-4o-mini"
 
+# 额外指令来源（支持路径/glob/URL）
+instructions:
+  # - "./AGENTS.md"
+  # - "./.zerobot/instructions/*.md"
+  # - "https://example.com/zerobot-instructions.md"
+
 # 工具开关
 # enabled 列表决定可用工具
 # allow_paths 为空表示不限制路径

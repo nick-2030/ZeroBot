@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::instruction;
 use crate::provider::{ProviderMessage, ProviderMessageRole};
 use crate::session::{Message, MessageRole, StoredToolCall};
 use crate::agents::{format_agent_index, AgentManager};
@@ -29,7 +30,7 @@ impl ContextManager {
     }
 
     pub fn build(&self, model: &str, history: &[Message]) -> ContextBuild {
-        self.build_with_skills(model, history, None)
+        self.build_with_skills(model, history, None, None)
     }
 
     pub fn build_with_skills(
@@ -37,6 +38,7 @@ impl ContextManager {
         model: &str,
         history: &[Message],
         skills: Option<&[SkillInfo]>,
+        extra_instructions: Option<&[String]>,
     ) -> ContextBuild {
         let max_messages = if self.settings.context.max_messages == 0 {
             self.settings.session.max_history
@@ -146,6 +148,22 @@ impl ContextManager {
             .collect::<Vec<_>>();
 
         let mut system = self.build_system_prompt(model, dropped_messages, skills);
+        let sources = instruction::system_sources(&self.settings, &self.cwd);
+        let file_instructions = instruction::load_file_instructions(&sources.files);
+        let mut instruction_parts: Vec<String> = file_instructions
+            .into_iter()
+            .map(|item| item.content)
+            .collect();
+        if let Some(extra) = extra_instructions {
+            instruction_parts.extend(extra.iter().cloned());
+        }
+        if !instruction_parts.is_empty() {
+            let extra = instruction_parts.join("\n\n");
+            system = Some(match system {
+                Some(base) if !base.trim().is_empty() => format!("{base}\n\n{extra}"),
+                _ => extra,
+            });
+        }
         if !extra_system.is_empty() {
             let extra = extra_system.join("\n\n");
             system = Some(match system {

@@ -25,6 +25,8 @@ pub struct Settings {
     #[serde(default)]
     pub context: ContextSettings,
     #[serde(default)]
+    pub instructions: Vec<String>,
+    #[serde(default)]
     pub logging: LoggingSettings,
     #[serde(default)]
     pub mcp: McpSettings,
@@ -279,6 +281,7 @@ impl Default for Settings {
             tools: ToolSettings::default(),
             agent: AgentSettings::default(),
             context: ContextSettings::default(),
+            instructions: Vec::new(),
             logging: LoggingSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
