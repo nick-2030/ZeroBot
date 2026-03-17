@@ -1,6 +1,7 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookDefinition;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -32,6 +33,7 @@ impl AgentManager {
 
     pub fn discover(&self) -> ZeroBotResult<Vec<AgentDefinition>> {
         let mut out = Vec::new();
+        let mut seen = HashSet::new();
         for root in &self.roots {
             if !root.exists() {
                 continue;
@@ -47,6 +49,7 @@ impl AgentManager {
                 }
                 let content = std::fs::read_to_string(&path)?;
                 if let Ok((meta, body)) = parse_agent_file(&content) {
+                    seen.insert(meta.name.clone());
                     out.push(AgentDefinition {
                         name: meta.name,
                         description: meta.description,
@@ -57,6 +60,11 @@ impl AgentManager {
                         body,
                     });
                 }
+            }
+        }
+        for builtin in builtin_agents() {
+            if !seen.contains(&builtin.name) {
+                out.push(builtin);
             }
         }
         Ok(out)
@@ -91,6 +99,10 @@ impl AgentManager {
                     }
                 }
             }
+        }
+
+        if let Some(builtin) = builtin_agent(name) {
+            return Ok(builtin);
         }
 
         Err(ZeroBotError::Agent(format!("未找到子代理定义: {name}")))
@@ -170,7 +182,12 @@ pub fn format_agent_index(agents: &[AgentDefinition]) -> String {
     let mut lines = Vec::new();
     lines.push("可用子代理列表：".to_string());
     for agent in agents {
-        lines.push(format!("- {}：{}", agent.name, agent.description));
+        let name = if is_builtin_path(&agent.path) {
+            format!("{} (built-in)", agent.name)
+        } else {
+            agent.name.clone()
+        };
+        lines.push(format!("- {}：{}", name, agent.description));
     }
     lines.push("需要时调用 subagent 工具，传入 name 和 prompt。".to_string());
     lines.join("\n")
@@ -194,6 +211,58 @@ fn home_dir() -> PathBuf {
         return PathBuf::from(home);
     }
     PathBuf::from(".")
+}
+
+fn is_builtin_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with("<builtin:")
+}
+
+fn builtin_agents() -> Vec<AgentDefinition> {
+    vec![
+        AgentDefinition {
+            name: "plan".to_string(),
+            description: "规划模式：只读探索并输出结构化实现计划".to_string(),
+            model: None,
+            tools: Some(vec![
+                "read".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "shell".to_string(),
+            ]),
+            hooks: Vec::new(),
+            path: PathBuf::from("<builtin:plan>"),
+            body: include_str!("../prompts/modes/plan.md").trim().to_string(),
+        },
+        AgentDefinition {
+            name: "review".to_string(),
+            description: "审查模式：验证实现并找出风险与缺口".to_string(),
+            model: None,
+            tools: Some(vec![
+                "read".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "shell".to_string(),
+            ]),
+            hooks: Vec::new(),
+            path: PathBuf::from("<builtin:review>"),
+            body: include_str!("../prompts/modes/review.md").trim().to_string(),
+        },
+        AgentDefinition {
+            name: "execute".to_string(),
+            description: "执行模式：按系统提示词实现需求并交付改动".to_string(),
+            model: None,
+            tools: None,
+            hooks: Vec::new(),
+            path: PathBuf::from("<builtin:execute>"),
+            body: include_str!("../prompts/modes/execute.md").trim().to_string(),
+        },
+    ]
+}
+
+fn builtin_agent(name: &str) -> Option<AgentDefinition> {
+    builtin_agents()
+        .into_iter()
+        .find(|agent| agent.name == name)
 }
 
 #[cfg(test)]
@@ -237,10 +306,45 @@ description: 示例
 
         let manager = AgentManager::new(dir.path());
         let agents = manager.discover().unwrap();
-        assert_eq!(agents.len(), 1);
+        assert!(agents.iter().any(|agent| agent.name == "demo"));
+        assert!(agents.iter().any(|agent| agent.name == "plan"));
         let loaded = manager.load("demo").unwrap();
         assert_eq!(loaded.name, "demo");
         assert_eq!(loaded.description, "示例");
         assert_eq!(loaded.body, "内容");
+    }
+
+    #[test]
+    fn builtin_agents_available_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let manager = AgentManager::new(dir.path());
+        let loaded = manager.load("plan").unwrap();
+        assert_eq!(loaded.name, "plan");
+        assert!(is_builtin_path(&loaded.path));
+    }
+
+    #[test]
+    fn user_agents_override_builtin() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(".zerobot/agents");
+        std::fs::create_dir_all(&root).unwrap();
+        let plan_path = root.join("plan.md");
+        std::fs::write(
+            &plan_path,
+            r#"---
+name: plan
+description: 自定义计划
+---
+
+用户定义
+"#,
+        )
+        .unwrap();
+
+        let manager = AgentManager::new(dir.path());
+        let agents = manager.discover().unwrap();
+        let plan = agents.iter().find(|agent| agent.name == "plan").unwrap();
+        assert_eq!(plan.description, "自定义计划");
+        assert_eq!(plan.path, plan_path);
     }
 }

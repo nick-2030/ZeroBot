@@ -47,7 +47,7 @@
 - `tools.output.direction`：截断方向，`head` 表示保留前部，`tail` 表示保留尾部。
 - `tools.output.max_lines` / `tools.output.max_bytes` 会同时生效，任一超过即截断。
 - `todoread` / `todowrite`：读取与更新会话内 Todo 列表（当 `tools.enabled` 包含时可用）。
-- `agent.system_prompt`：系统提示词。
+- `agent.system_prompt`：系统提示词。默认由内置模块自动拼接生成，如需完全覆盖可直接设置此字段。
 - `agent.max_steps`：单次回合最大步骤数。
 - `logging.level`：日志级别。
 - `mcp.enabled`：是否启用 MCP。
@@ -68,8 +68,11 @@
 
 ### 子代理目录
 
+- 内置子代理：`plan` / `review` / `execute`（工作模式模板，默认无需文件）。
 - 项目级：`./.zerobot/agents/*.md`
 - 用户级：`~/.zerobot/agents/*.md`
+
+当用户目录存在同名子代理时，用户定义优先，内置子代理会退让。
 
 子代理文件必须包含 frontmatter，最小格式如下：
 

@@ -1,5 +1,5 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
-use crate::prompt::DEFAULT_SYSTEM_PROMPT;
+use crate::prompt::default_system_prompt;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
@@ -321,7 +321,7 @@ impl Default for ToolOutputSettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
-            system_prompt: Some(DEFAULT_SYSTEM_PROMPT.to_string()),
+            system_prompt: Some(default_system_prompt()),
             max_steps: default_max_steps(),
         }
     }
