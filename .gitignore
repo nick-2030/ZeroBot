@@ -5,3 +5,5 @@
 .zerobot/settings.local.yaml
 .zerobot/state/
 .zerobot/skills/
+
+/tmp
