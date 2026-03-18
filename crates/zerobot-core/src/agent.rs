@@ -8,7 +8,7 @@ use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
 use crate::tool::{ToolContext, ToolRegistry};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
-use crate::skills::format_skill_stack;
+use crate::skills::{format_skill_stack, SkillInfo};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -160,12 +160,10 @@ impl Agent {
                 }
             }
 
-            self.emit(
+            self.emit_context_usage_values(
                 &events,
-                AgentEvent::ContextUsage {
-                    used: context.estimated_tokens,
-                    limit: context.context_limit,
-                },
+                context.estimated_tokens,
+                context.context_limit,
             );
 
             let mut enabled = self.settings.tools.enabled.clone();
@@ -306,6 +304,8 @@ impl Agent {
                         );
                     }
                 }
+                self.emit_context_usage(session_id, &events, skill_list.as_deref(), Some(&url_instruction_text))
+                    .await;
                 let skill_stack = self.store.get_skill_stack(session_id).await?;
                 if !skill_stack.is_empty() {
                     let notice = format_skill_stack(&skill_stack);
@@ -360,6 +360,8 @@ impl Agent {
 
             for call in tool_calls {
                 self.handle_tool_call(session_id, call, &events).await?;
+                self.emit_context_usage(session_id, &events, skill_list.as_deref(), Some(&url_instruction_text))
+                    .await;
             }
         }
 
@@ -712,6 +714,38 @@ impl Agent {
         if let Some(tx) = events {
             let _ = tx.send(event);
         }
+    }
+
+    fn emit_context_usage_values(
+        &self,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        used: usize,
+        limit: Option<u32>,
+    ) {
+        self.emit(events, AgentEvent::ContextUsage { used, limit });
+    }
+
+    async fn emit_context_usage(
+        &self,
+        session_id: &str,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        skill_list: Option<&[SkillInfo]>,
+        extra_instructions: Option<&[String]>,
+    ) {
+        let history = match self.store.list_messages(session_id).await {
+            Ok(history) => history,
+            Err(err) => {
+                warn!("failed to refresh context usage: {err}");
+                return;
+            }
+        };
+        let context = ContextManager::new(&self.settings, self.cwd.clone()).build_with_skills(
+            &self.model,
+            &history,
+            skill_list,
+            extra_instructions,
+        );
+        self.emit_context_usage_values(events, context.estimated_tokens, context.context_limit);
     }
 
     async fn load_skill_hooks(
