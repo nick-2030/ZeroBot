@@ -160,6 +160,14 @@ impl Agent {
                 }
             }
 
+            self.emit(
+                &events,
+                AgentEvent::ContextUsage {
+                    used: context.estimated_tokens,
+                    limit: context.context_limit,
+                },
+            );
+
             let mut enabled = self.settings.tools.enabled.clone();
             if self.settings.skills.enabled && !enabled.iter().any(|t| t == "skill") {
                 enabled.push("skill".to_string());

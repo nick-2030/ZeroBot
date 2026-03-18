@@ -70,6 +70,8 @@ struct App {
     todos: Vec<TodoItem>,
     skills: Vec<SkillStackEntry>,
     usage: Option<TokenUsage>,
+    context_used: Option<usize>,
+    context_limit: Option<u32>,
     permission_prompt: Option<PermissionPrompt>,
     viewport_width: u16,
     blink_on: bool,
@@ -95,6 +97,8 @@ impl App {
             todos: Vec::new(),
             skills: Vec::new(),
             usage: None,
+            context_used: None,
+            context_limit: None,
             permission_prompt: None,
             viewport_width: 0,
             blink_on: true,
@@ -607,6 +611,10 @@ async fn handle_agent_event(
         AgentEvent::Usage { usage } => {
             app.usage = Some(usage);
         }
+        AgentEvent::ContextUsage { used, limit } => {
+            app.context_used = Some(used);
+            app.context_limit = limit;
+        }
         AgentEvent::Error { message } => {
             app.finalize_stream();
             app.status = Status::Error(message.clone());
@@ -749,15 +757,23 @@ fn render_permission_prompt(frame: &mut Frame, prompt: &PermissionPrompt) {
 }
 
 fn build_status_bar(app: &App) -> String {
-    let usage = app.usage.as_ref();
-    let input = usage.and_then(|u| u.input_tokens).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
-    let output = usage.and_then(|u| u.output_tokens).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
-    let total = usage.and_then(|u| u.total_tokens).map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
+    let used = app
+        .context_used
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let limit = app
+        .context_limit
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let percent = match (app.context_used, app.context_limit) {
+        (Some(used), Some(limit)) if limit > 0 => format!("{:.1}%", (used as f64 / limit as f64) * 100.0),
+        _ => "-".to_string(),
+    };
     let commands = app.command_hint();
     let mut parts = vec![
         format!("Session: {}", app.session_id),
         format!("{} / {}", app.provider_id, app.model),
-        format!("Tokens: {input}/{output}/{total}"),
+        format!("Tokens: {used}/{limit}/{percent}"),
     ];
     if !commands.is_empty() {
         parts.push(format!("Commands: {commands}"));
