@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use console::style;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::logging::{init_logging, init_logging_with_stdout};
@@ -209,6 +211,7 @@ async fn run_exec(
         })
     };
     let provider = (provider_factory)()?;
+    let tool_approvals = Arc::new(RwLock::new(HashSet::new()));
     let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
@@ -219,6 +222,8 @@ async fn run_exec(
         provider_factory.clone(),
         model.clone(),
         hooks.clone(),
+        None,
+        tool_approvals.clone(),
     ));
     let agent = Agent::new(
         provider,
@@ -228,6 +233,8 @@ async fn run_exec(
         tools,
         cwd.clone(),
         hooks.clone(),
+        None,
+        tool_approvals.clone(),
     );
 
     let result = agent.run_turn(&session.id, prompt, None).await;
@@ -267,6 +274,7 @@ async fn run_repl(
                 .map_err(|err| ZeroBotError::Provider(err.to_string()))
         })
     };
+    let tool_approvals = Arc::new(RwLock::new(HashSet::new()));
     let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
@@ -277,6 +285,8 @@ async fn run_repl(
         provider_factory.clone(),
         model.clone(),
         hooks.clone(),
+        None,
+        tool_approvals.clone(),
     ));
     let provider_id = resolve_provider_id(settings, provider_override.as_deref());
     tui::run_tui(
@@ -290,6 +300,7 @@ async fn run_repl(
         provider_id,
         hooks.clone(),
         use_alt_screen,
+        tool_approvals.clone(),
     )
     .await?;
 

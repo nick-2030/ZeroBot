@@ -12,12 +12,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear, BorderType};
 use ratatui::{Frame, Terminal};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
 use unicode_width::UnicodeWidthStr;
@@ -25,10 +29,20 @@ use zerobot_core::agent::Agent;
 use zerobot_core::config::Settings;
 use zerobot_core::events::AgentEvent;
 use zerobot_core::hooks::HookManager;
+use zerobot_core::interaction::{
+    InteractionHandler,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+    ToolApprovalResponse,
+    UserInputAnswer,
+    UserInputRequest,
+    UserInputResponse,
+};
 use zerobot_core::provider::{ProviderFactory, TokenUsage};
 use zerobot_core::session::{SessionStore, TodoItem, TodoStatus};
 use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
+use zerobot_core::ZeroBotError;
 
 #[derive(Copy, Clone)]
 enum DotColor {
@@ -46,12 +60,88 @@ enum Status {
     Thinking,
     Tool(String),
     Error(String),
+    WaitingUserInput,
+    WaitingApproval,
 }
 
 struct PermissionPrompt {
     title: String,
     options: Vec<String>,
     selected: usize,
+}
+
+enum InfoOverlay {
+    UserInput(UserInputOverlay),
+    ToolApproval(ToolApprovalOverlay),
+}
+
+struct UserInputOverlay {
+    request: UserInputRequest,
+    current: usize,
+    selected: usize,
+    notes: HashMap<(String, Option<String>), String>,
+    answers: HashMap<String, UserInputAnswer>,
+    respond_to: Option<oneshot::Sender<UserInputResponse>>,
+}
+
+struct ToolApprovalOverlay {
+    request: ToolApprovalRequest,
+    selected: usize,
+    respond_to: Option<oneshot::Sender<ToolApprovalResponse>>,
+}
+
+enum OverlayAction<T> {
+    None,
+    Updated,
+    Complete(T),
+}
+
+enum UiRequest {
+    UserInput {
+        request: UserInputRequest,
+        respond_to: oneshot::Sender<UserInputResponse>,
+    },
+    ToolApproval {
+        request: ToolApprovalRequest,
+        respond_to: oneshot::Sender<ToolApprovalResponse>,
+    },
+}
+
+struct UiInteractionHandler {
+    tx: mpsc::UnboundedSender<UiRequest>,
+}
+
+#[async_trait::async_trait]
+impl InteractionHandler for UiInteractionHandler {
+    async fn request_user_input(
+        &self,
+        request: UserInputRequest,
+    ) -> Result<UserInputResponse, ZeroBotError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(UiRequest::UserInput {
+                request,
+                respond_to: tx,
+            })
+            .map_err(|_| ZeroBotError::Tool("无法发送用户输入请求".to_string()))?;
+        rx.await
+            .map_err(|_| ZeroBotError::Tool("等待用户输入失败".to_string()))
+    }
+
+    async fn request_tool_approval(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> Result<ToolApprovalResponse, ZeroBotError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(UiRequest::ToolApproval {
+                request,
+                respond_to: tx,
+            })
+            .map_err(|_| ZeroBotError::Tool("无法发送授权请求".to_string()))?;
+        rx.await
+            .map_err(|_| ZeroBotError::Tool("等待授权失败".to_string()))
+    }
 }
 
 struct App {
@@ -73,6 +163,9 @@ struct App {
     context_used: Option<usize>,
     context_limit: Option<u32>,
     permission_prompt: Option<PermissionPrompt>,
+    info_overlay: Option<InfoOverlay>,
+    overlay_queue: VecDeque<InfoOverlay>,
+    overlay_prev_status: Option<Status>,
     viewport_width: u16,
     blink_on: bool,
     last_blink: Instant,
@@ -100,6 +193,9 @@ impl App {
             context_used: None,
             context_limit: None,
             permission_prompt: None,
+            info_overlay: None,
+            overlay_queue: VecDeque::new(),
+            overlay_prev_status: None,
             viewport_width: 0,
             blink_on: true,
             last_blink: Instant::now(),
@@ -200,7 +296,37 @@ impl App {
         lines
     }
 
+    fn enqueue_overlay(&mut self, overlay: InfoOverlay) {
+        if self.info_overlay.is_some() {
+            self.overlay_queue.push_back(overlay);
+        } else {
+            self.activate_overlay(overlay);
+        }
+    }
+
+    fn activate_overlay(&mut self, overlay: InfoOverlay) {
+        if self.overlay_prev_status.is_none() {
+            self.overlay_prev_status = Some(self.status.clone());
+        }
+        self.status = overlay.status();
+        self.info_overlay = Some(overlay);
+    }
+
+    fn dismiss_overlay(&mut self) {
+        if let Some(next) = self.overlay_queue.pop_front() {
+            self.activate_overlay(next);
+            return;
+        }
+        self.info_overlay = None;
+        if let Some(prev) = self.overlay_prev_status.take() {
+            self.status = prev;
+        }
+    }
+
     fn info_lines(&self) -> Vec<Line<'static>> {
+        if let Some(overlay) = &self.info_overlay {
+            return overlay.lines();
+        }
         let mut lines = Vec::new();
         let status_line = match &self.status {
             Status::Idle => Line::from(Span::raw("状态: 空闲")),
@@ -210,6 +336,8 @@ impl App {
             }
             Status::Tool(name) => Line::from(Span::raw(format!("状态: 工具执行中: {name}"))),
             Status::Error(message) => Line::from(Span::raw(format!("状态: 错误: {message}"))),
+            Status::WaitingUserInput => Line::from(Span::raw("状态: 等待用户输入")),
+            Status::WaitingApproval => Line::from(Span::raw("状态: 等待授权")),
         };
         lines.push(status_line);
         if !self.todos.is_empty() {
@@ -251,6 +379,262 @@ impl App {
     }
 }
 
+impl InfoOverlay {
+    fn status(&self) -> Status {
+        match self {
+            InfoOverlay::UserInput(_) => Status::WaitingUserInput,
+            InfoOverlay::ToolApproval(_) => Status::WaitingApproval,
+        }
+    }
+
+    fn lines(&self) -> Vec<Line<'static>> {
+        match self {
+            InfoOverlay::UserInput(overlay) => overlay.lines(),
+            InfoOverlay::ToolApproval(overlay) => overlay.lines(),
+        }
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> OverlayAction<()> {
+        match self {
+            InfoOverlay::UserInput(overlay) => overlay.handle_key(key),
+            InfoOverlay::ToolApproval(overlay) => overlay.handle_key(key),
+        }
+    }
+}
+
+impl UserInputOverlay {
+    fn new(request: UserInputRequest, respond_to: oneshot::Sender<UserInputResponse>) -> Self {
+        Self {
+            request,
+            current: 0,
+            selected: 0,
+            notes: HashMap::new(),
+            answers: HashMap::new(),
+            respond_to: Some(respond_to),
+        }
+    }
+
+    fn current_question(&self) -> Option<&zerobot_core::interaction::UserInputQuestion> {
+        self.request.questions.get(self.current)
+    }
+
+    fn current_option_id(&self) -> Option<String> {
+        let question = self.current_question()?;
+        let options = question.options.as_ref()?;
+        options.get(self.selected).map(|opt| opt.id.clone())
+    }
+
+    fn note_key(&self) -> Option<(String, Option<String>)> {
+        let question = self.current_question()?;
+        Some((question.id.clone(), self.current_option_id()))
+    }
+
+    fn current_note_mut(&mut self) -> Option<&mut String> {
+        let key = self.note_key()?;
+        Some(self.notes.entry(key).or_default())
+    }
+
+    fn current_note(&self) -> String {
+        let key = match self.note_key() {
+            Some(key) => key,
+            None => return String::new(),
+        };
+        self.notes.get(&key).cloned().unwrap_or_default()
+    }
+
+    fn commit_current_answer(&mut self) {
+        let Some(question) = self.current_question() else {
+            return;
+        };
+        let note = self.current_note();
+        let note = if note.trim().is_empty() { None } else { Some(note) };
+        let answer = UserInputAnswer {
+            option_id: self.current_option_id(),
+            note,
+        };
+        self.answers.insert(question.id.clone(), answer);
+    }
+
+    fn finish(&mut self, cancelled: bool) -> Option<UserInputResponse> {
+        let respond_to = self.respond_to.take()?;
+        let response = UserInputResponse {
+            answers: self.answers.clone(),
+            cancelled,
+        };
+        let _ = respond_to.send(response);
+        None
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> OverlayAction<()> {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(question) = self.current_question() {
+                    if question.options.is_some() {
+                        if self.selected > 0 {
+                            self.selected -= 1;
+                            return OverlayAction::Updated;
+                        }
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(question) = self.current_question() {
+                    if let Some(options) = &question.options {
+                        if self.selected + 1 < options.len() {
+                            self.selected += 1;
+                            return OverlayAction::Updated;
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(note) = self.current_note_mut() {
+                    note.pop();
+                    return OverlayAction::Updated;
+                }
+            }
+            KeyCode::Enter => {
+                self.commit_current_answer();
+                if self.current + 1 >= self.request.questions.len() {
+                    self.finish(false);
+                    return OverlayAction::Complete(());
+                }
+                self.current += 1;
+                self.selected = 0;
+                return OverlayAction::Updated;
+            }
+            KeyCode::Esc => {
+                self.finish(true);
+                return OverlayAction::Complete(());
+            }
+            KeyCode::Char(ch) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let Some(note) = self.current_note_mut() {
+                        note.push(ch);
+                        return OverlayAction::Updated;
+                    }
+                }
+            }
+            _ => {}
+        }
+        OverlayAction::None
+    }
+
+    fn lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let title = self
+            .request
+            .title
+            .clone()
+            .unwrap_or_else(|| "需要用户输入".to_string());
+        lines.push(Line::from(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        if let Some(question) = self.current_question() {
+            lines.push(Line::from(Span::raw(format!(
+                "问题 {}/{}: {}",
+                self.current + 1,
+                self.request.questions.len(),
+                question.prompt
+            ))));
+            if let Some(options) = &question.options {
+                for (idx, opt) in options.iter().enumerate() {
+                    let prefix = if idx == self.selected { "> " } else { "  " };
+                    lines.push(Line::from(Span::raw(format!("{prefix}{}", opt.label))));
+                }
+            }
+            let note = self.current_note();
+            if !note.is_empty() {
+                lines.push(Line::from(Span::raw(format!("备注: {note}"))));
+            } else {
+                lines.push(Line::from(Span::raw("备注:".to_string())));
+            }
+        }
+        lines.push(Line::from(Span::raw("↑/↓ 选择  Enter 下一项/提交  Esc 取消")));
+        lines
+    }
+}
+
+impl ToolApprovalOverlay {
+    fn new(request: ToolApprovalRequest, respond_to: oneshot::Sender<ToolApprovalResponse>) -> Self {
+        Self {
+            request,
+            selected: 0,
+            respond_to: Some(respond_to),
+        }
+    }
+
+    fn finish(&mut self, decision: ToolApprovalDecision) -> Option<ToolApprovalResponse> {
+        let respond_to = self.respond_to.take()?;
+        let response = ToolApprovalResponse { decision };
+        let _ = respond_to.send(response);
+        None
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> OverlayAction<()> {
+        match key.code {
+            KeyCode::Up => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                    return OverlayAction::Updated;
+                }
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < 3 {
+                    self.selected += 1;
+                    return OverlayAction::Updated;
+                }
+            }
+            KeyCode::Enter => {
+                let decision = match self.selected {
+                    0 => ToolApprovalDecision::AllowOnce,
+                    1 => ToolApprovalDecision::AllowSession,
+                    _ => ToolApprovalDecision::Deny,
+                };
+                self.finish(decision);
+                return OverlayAction::Complete(());
+            }
+            KeyCode::Esc => {
+                self.finish(ToolApprovalDecision::Deny);
+                return OverlayAction::Complete(());
+            }
+            _ => {}
+        }
+        OverlayAction::None
+    }
+
+    fn lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "需要工具授权".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::raw(format!(
+            "工具: {}",
+            self.request.tool_name
+        ))));
+        if let Some(reason) = &self.request.reason {
+            if !reason.trim().is_empty() {
+                lines.push(Line::from(Span::raw(format!("原因: {reason}"))));
+            }
+        }
+        if let Ok(args) = serde_json::to_string(&self.request.arguments) {
+            let args = one_line(&args);
+            if !args.is_empty() {
+                lines.push(Line::from(Span::raw(format!("参数: {args}"))));
+            }
+        }
+        let options = ["仅本次允许", "本会话允许", "拒绝"];
+        for (idx, opt) in options.iter().enumerate() {
+            let prefix = if idx == self.selected { "> " } else { "  " };
+            lines.push(Line::from(Span::raw(format!("{prefix}{opt}"))));
+        }
+        lines.push(Line::from(Span::raw("↑/↓ 选择  Enter 确认  Esc 取消")));
+        lines
+    }
+}
+
 pub async fn run_tui(
     settings: Settings,
     cwd: std::path::PathBuf,
@@ -262,6 +646,7 @@ pub async fn run_tui(
     provider_id: String,
     hooks: HookManager,
     use_alt_screen: bool,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -282,6 +667,7 @@ pub async fn run_tui(
         model,
         provider_id,
         hooks,
+        tool_approvals,
     )
     .await;
 
@@ -309,6 +695,7 @@ async fn run_tui_inner(
     model: String,
     provider_id: String,
     hooks: HookManager,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
 ) -> Result<()> {
     let mut app = App::new(session_id.clone(), provider_id.clone(), model.clone());
     let (cols, _rows) = crossterm::terminal::size().unwrap_or((120, 0));
@@ -324,6 +711,8 @@ async fn run_tui_inner(
     refresh_session_state(&mut app, &store).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiRequest>();
+    let interaction: Arc<dyn InteractionHandler> = Arc::new(UiInteractionHandler { tx: ui_tx });
     let mut runner: Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>> =
         None;
     let mut reader = EventStream::new();
@@ -349,13 +738,34 @@ async fn run_tui_inner(
                 }
                 maybe_event = reader.next() => {
                     if let Some(Ok(event)) = maybe_event {
-                        if handle_event(event, &mut app, &mut runner, &settings, &cwd, &store, &tools, &provider_factory, &model, &hooks, &tx, &mut should_quit).await? {
+                        if handle_event(
+                            event,
+                            &mut app,
+                            &mut runner,
+                            &settings,
+                            &cwd,
+                            &store,
+                            &tools,
+                            &provider_factory,
+                            &model,
+                            &hooks,
+                            &interaction,
+                            &tool_approvals,
+                            &tx,
+                            &mut should_quit,
+                        )
+                        .await?
+                        {
                             dirty = true;
                         }
                     }
                 }
                 Some(event) = rx.recv() => {
                     handle_agent_event(event, &mut app, &store).await;
+                    dirty = true;
+                }
+                Some(req) = ui_rx.recv() => {
+                    handle_ui_request(req, &mut app);
                     dirty = true;
                 }
                 result = handle => {
@@ -383,13 +793,34 @@ async fn run_tui_inner(
                 }
                 maybe_event = reader.next() => {
                     if let Some(Ok(event)) = maybe_event {
-                        if handle_event(event, &mut app, &mut runner, &settings, &cwd, &store, &tools, &provider_factory, &model, &hooks, &tx, &mut should_quit).await? {
+                        if handle_event(
+                            event,
+                            &mut app,
+                            &mut runner,
+                            &settings,
+                            &cwd,
+                            &store,
+                            &tools,
+                            &provider_factory,
+                            &model,
+                            &hooks,
+                            &interaction,
+                            &tool_approvals,
+                            &tx,
+                            &mut should_quit,
+                        )
+                        .await?
+                        {
                             dirty = true;
                         }
                     }
                 }
                 Some(event) = rx.recv() => {
                     handle_agent_event(event, &mut app, &store).await;
+                    dirty = true;
+                }
+                Some(req) = ui_rx.recv() => {
+                    handle_ui_request(req, &mut app);
                     dirty = true;
                 }
             }
@@ -410,6 +841,8 @@ async fn handle_event(
     provider_factory: &ProviderFactory,
     model: &str,
     hooks: &HookManager,
+    interaction: &Arc<dyn InteractionHandler>,
+    tool_approvals: &Arc<RwLock<HashSet<String>>>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     should_quit: &mut bool,
 ) -> Result<bool> {
@@ -418,6 +851,12 @@ async fn handle_event(
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 *should_quit = true;
                 return Ok(true);
+            }
+            if app.info_overlay.is_some() {
+                if handle_overlay_key(key, app) {
+                    return Ok(true);
+                }
+                return Ok(false);
             }
             match key.code {
                 KeyCode::Enter => {
@@ -479,6 +918,8 @@ async fn handle_event(
                         tools.clone(),
                         cwd.clone(),
                         hooks.clone(),
+                        Some(interaction.clone()),
+                        tool_approvals.clone(),
                     );
                     let session_id = app.session_id.clone();
                     let input_clone = input.clone();
@@ -573,6 +1014,35 @@ async fn handle_event(
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_ui_request(req: UiRequest, app: &mut App) {
+    match req {
+        UiRequest::UserInput { request, respond_to } => {
+            app.enqueue_overlay(InfoOverlay::UserInput(UserInputOverlay::new(
+                request, respond_to,
+            )));
+        }
+        UiRequest::ToolApproval { request, respond_to } => {
+            app.enqueue_overlay(InfoOverlay::ToolApproval(ToolApprovalOverlay::new(
+                request, respond_to,
+            )));
+        }
+    }
+}
+
+fn handle_overlay_key(key: crossterm::event::KeyEvent, app: &mut App) -> bool {
+    let Some(overlay) = app.info_overlay.as_mut() else {
+        return false;
+    };
+    match overlay.handle_key(key) {
+        OverlayAction::None => false,
+        OverlayAction::Updated => true,
+        OverlayAction::Complete(_) => {
+            app.dismiss_overlay();
+            true
+        }
+    }
 }
 
 async fn handle_agent_event(

@@ -3,6 +3,7 @@ use crate::agents::AgentManager;
 use crate::config::{Settings, ToolOutputDirection, ToolOutputSettings};
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookManager;
+use crate::interaction::{InteractionHandler, UserInputRequest, UserInputResponse};
 use crate::instruction;
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::provider::ProviderFactory;
@@ -13,11 +14,12 @@ use diffy::Patch;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::RwLock;
 use walkdir::WalkDir;
 
 #[derive(Clone)]
@@ -26,6 +28,7 @@ pub struct ToolContext {
     pub allow_paths: Vec<PathBuf>,
     pub session_id: String,
     pub store: Option<Arc<dyn SessionStore>>,
+    pub interaction: Option<Arc<dyn InteractionHandler>>,
 }
 
 impl ToolContext {
@@ -34,12 +37,14 @@ impl ToolContext {
         allow_paths: Vec<PathBuf>,
         session_id: impl Into<String>,
         store: Option<Arc<dyn SessionStore>>,
+        interaction: Option<Arc<dyn InteractionHandler>>,
     ) -> Self {
         Self {
             cwd,
             allow_paths,
             session_id: session_id.into(),
             store,
+            interaction,
         }
     }
 
@@ -69,6 +74,10 @@ impl ToolContext {
 
     pub fn store(&self) -> Option<Arc<dyn SessionStore>> {
         self.store.clone()
+    }
+
+    pub fn interaction(&self) -> Option<Arc<dyn InteractionHandler>> {
+        self.interaction.clone()
     }
 }
 
@@ -192,6 +201,7 @@ impl ToolRegistry {
         registry.register(ShellTool);
         registry.register(TodoReadTool);
         registry.register(TodoWriteTool);
+        registry.register(RequestUserInputTool);
         registry
     }
 
@@ -235,6 +245,8 @@ pub struct SubagentTool {
     provider_factory: ProviderFactory,
     fallback_model: String,
     parent_hooks: HookManager,
+    interaction: Option<Arc<dyn InteractionHandler>>,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
 }
 
 impl SubagentTool {
@@ -246,6 +258,8 @@ impl SubagentTool {
         provider_factory: ProviderFactory,
         fallback_model: String,
         parent_hooks: HookManager,
+        interaction: Option<Arc<dyn InteractionHandler>>,
+        tool_approvals: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
         Self {
             settings,
@@ -255,6 +269,8 @@ impl SubagentTool {
             provider_factory,
             fallback_model,
             parent_hooks,
+            interaction,
+            tool_approvals,
         }
     }
 }
@@ -364,6 +380,8 @@ impl Tool for SubagentTool {
             self.tools.clone(),
             self.cwd.clone(),
             hooks.clone(),
+            self.interaction.clone(),
+            self.tool_approvals.clone(),
         );
 
         let result = agent.run_turn(&session.id, &args.prompt, None).await;
@@ -1052,6 +1070,108 @@ impl Tool for TodoWriteTool {
     }
 }
 
+struct RequestUserInputTool;
+
+#[derive(Deserialize)]
+struct RequestUserInputArgs {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    questions: Vec<RequestUserInputQuestionArgs>,
+}
+
+#[derive(Deserialize)]
+struct RequestUserInputQuestionArgs {
+    id: String,
+    prompt: String,
+    #[serde(default)]
+    options: Option<Vec<RequestUserInputOptionArgs>>,
+}
+
+#[derive(Deserialize)]
+struct RequestUserInputOptionArgs {
+    id: String,
+    label: String,
+}
+
+#[async_trait]
+impl Tool for RequestUserInputTool {
+    fn name(&self) -> &str {
+        "request_user_input"
+    }
+
+    fn description(&self) -> &str {
+        "询问用户并收集结构化输入（支持多问题与选项）"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "请求 ID"},
+                "title": {"type": "string", "description": "可选标题"},
+                "questions": {
+                    "type": "array",
+                    "description": "问题列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "问题 ID"},
+                            "prompt": {"type": "string", "description": "问题内容"},
+                            "options": {
+                                "type": "array",
+                                "description": "可选项",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "label": {"type": "string"}
+                                    },
+                                    "required": ["id", "label"]
+                                }
+                            }
+                        },
+                        "required": ["id", "prompt"]
+                    }
+                }
+            },
+            "required": ["id", "questions"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: RequestUserInputArgs = serde_json::from_value(args)
+            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let interaction = ctx
+            .interaction()
+            .ok_or_else(|| ZeroBotError::Tool("需要用户输入，但当前无交互处理器".to_string()))?;
+        let request = UserInputRequest {
+            id: args.id,
+            title: args.title,
+            questions: args
+                .questions
+                .into_iter()
+                .map(|q| crate::interaction::UserInputQuestion {
+                    id: q.id,
+                    prompt: q.prompt,
+                    options: q.options.map(|opts| {
+                        opts.into_iter()
+                            .map(|opt| crate::interaction::UserInputOption {
+                                id: opt.id,
+                                label: opt.label,
+                            })
+                            .collect()
+                    }),
+                })
+                .collect(),
+        };
+        let response: UserInputResponse = interaction.request_user_input(request).await?;
+        let content =
+            serde_json::to_string(&response).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        Ok(ToolOutput::new(content))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,16 +1179,17 @@ mod tests {
     use tempfile::TempDir;
     use httpmock::Method::POST;
     use httpmock::MockServer;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use crate::provider::{Provider, ProviderFactory, ProviderRequest, ProviderResponse};
     use crate::session::{SessionKind, SqliteSessionStore};
     use async_trait::async_trait;
+    use crate::interaction::{InteractionHandler, UserInputAnswer};
 
     #[tokio::test]
     async fn registry_runs_builtin_tool() {
         let dir = TempDir::new().unwrap();
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None);
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
         let registry = ToolRegistry::with_builtin();
         let args = serde_json::json!({"path": "test.txt", "content": "hi"});
         let output = registry.run(&ctx, "write", args).await.unwrap();
@@ -1137,7 +1258,7 @@ mod tests {
         let tool_name = "mcp__remote-one__echo";
         assert!(registry.get(tool_name).is_some());
 
-        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![], "s1", None);
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), vec![], "s1", None, None);
         let output = registry
             .run(&ctx, tool_name, serde_json::json!({"text":"hi"}))
             .await
@@ -1153,7 +1274,13 @@ mod tests {
         let session = store.create_session("test".to_string()).await.unwrap();
         let store = Arc::new(store);
 
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], session.id.clone(), Some(store));
+        let ctx = ToolContext::new(
+            dir.path().to_path_buf(),
+            vec![],
+            session.id.clone(),
+            Some(store),
+            None,
+        );
         let registry = ToolRegistry::with_builtin();
 
         let write_args = serde_json::json!({
@@ -1177,7 +1304,13 @@ mod tests {
         let session = store.create_session("test".to_string()).await.unwrap();
         let store = Arc::new(store);
 
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], session.id.clone(), Some(store));
+        let ctx = ToolContext::new(
+            dir.path().to_path_buf(),
+            vec![],
+            session.id.clone(),
+            Some(store),
+            None,
+        );
         let registry = ToolRegistry::with_builtin();
         let write_args = serde_json::json!({
             "todos": [
@@ -1186,6 +1319,71 @@ mod tests {
         });
         let result = registry.run(&ctx, "todowrite", write_args).await;
         assert!(result.is_err());
+    }
+
+    struct MockInteraction {
+        response: UserInputResponse,
+    }
+
+    #[async_trait]
+    impl InteractionHandler for MockInteraction {
+        async fn request_user_input(
+            &self,
+            _request: UserInputRequest,
+        ) -> ZeroBotResult<UserInputResponse> {
+            Ok(self.response.clone())
+        }
+
+        async fn request_tool_approval(
+            &self,
+            _request: crate::interaction::ToolApprovalRequest,
+        ) -> ZeroBotResult<crate::interaction::ToolApprovalResponse> {
+            Ok(crate::interaction::ToolApprovalResponse {
+                decision: crate::interaction::ToolApprovalDecision::AllowOnce,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_user_input_tool_returns_json() {
+        let dir = TempDir::new().unwrap();
+        let response = UserInputResponse {
+            answers: HashMap::from([(
+                "q1".to_string(),
+                UserInputAnswer {
+                    option_id: Some("a".to_string()),
+                    note: Some("note".to_string()),
+                },
+            )]),
+            cancelled: false,
+        };
+        let interaction = Arc::new(MockInteraction { response: response.clone() });
+        let ctx = ToolContext::new(
+            dir.path().to_path_buf(),
+            vec![],
+            "s1",
+            None,
+            Some(interaction),
+        );
+        let registry = ToolRegistry::with_builtin();
+        let args = serde_json::json!({
+            "id": "req1",
+            "questions": [
+                {
+                    "id": "q1",
+                    "prompt": "question",
+                    "options": [
+                        {"id": "a", "label": "A"}
+                    ]
+                }
+            ]
+        });
+        let output = registry
+            .run(&ctx, "request_user_input", args)
+            .await
+            .unwrap();
+        let parsed: UserInputResponse = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed, response);
     }
 
     #[tokio::test]
@@ -1243,9 +1441,11 @@ description: 示例
             provider_factory,
             "dummy-model".to_string(),
             hooks,
+            None,
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], parent.id.clone(), None);
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], parent.id.clone(), None, None);
         let output = registry
             .run(&ctx, "subagent", serde_json::json!({"name":"demo","prompt":"hi"}))
             .await

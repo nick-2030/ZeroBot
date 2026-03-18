@@ -77,6 +77,8 @@ pub struct ToolSettings {
     pub allow_paths: Vec<String>,
     #[serde(default)]
     pub output: ToolOutputSettings,
+    #[serde(default)]
+    pub approval: ToolApprovalSettings,
 }
 
 fn default_tool_list() -> Vec<String> {
@@ -90,8 +92,46 @@ fn default_tool_list() -> Vec<String> {
         "shell".to_string(),
         "todoread".to_string(),
         "todowrite".to_string(),
+        "request_user_input".to_string(),
         "subagent".to_string(),
     ]
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalMode {
+    Auto,
+    Prompt,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolApprovalSettings {
+    #[serde(default = "default_tool_approval_mode")]
+    pub default: ToolApprovalMode,
+    #[serde(default = "default_tool_approval_overrides")]
+    pub per_tool: HashMap<String, ToolApprovalMode>,
+}
+
+fn default_tool_approval_mode() -> ToolApprovalMode {
+    ToolApprovalMode::Prompt
+}
+
+fn default_tool_approval_overrides() -> HashMap<String, ToolApprovalMode> {
+    let mut map = HashMap::new();
+    for name in ["read", "glob", "grep", "todoread", "request_user_input"] {
+        map.insert(name.to_string(), ToolApprovalMode::Auto);
+    }
+    map
+}
+
+impl ToolApprovalSettings {
+    pub fn mode_for(&self, tool_name: &str) -> ToolApprovalMode {
+        self.per_tool
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.default)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +344,16 @@ impl Default for ToolSettings {
             enabled: default_tool_list(),
             allow_paths: Vec::new(),
             output: ToolOutputSettings::default(),
+            approval: ToolApprovalSettings::default(),
+        }
+    }
+}
+
+impl Default for ToolApprovalSettings {
+    fn default() -> Self {
+        Self {
+            default: default_tool_approval_mode(),
+            per_tool: default_tool_approval_overrides(),
         }
     }
 }
@@ -356,6 +406,18 @@ impl Default for LoggingSettings {
         Self {
             level: default_log_level(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_approval_mode_for_respects_overrides() {
+        let settings = ToolApprovalSettings::default();
+        assert_eq!(settings.mode_for("read"), ToolApprovalMode::Auto);
+        assert_eq!(settings.mode_for("write"), ToolApprovalMode::Prompt);
     }
 }
 

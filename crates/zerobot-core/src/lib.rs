@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod hooks;
+pub mod interaction;
 pub mod instruction;
 pub mod logging;
 pub mod mcp;
@@ -21,6 +22,17 @@ pub use config::{ConfigLayer, ConfigLoader, ConfigScope, LoadedConfig, Settings}
 pub use error::{ZeroBotError, ZeroBotResult};
 pub use events::AgentEvent;
 pub use hooks::{HookAction, HookDecision, HookDefinition, HookEvent, HookManager};
+pub use interaction::{
+    InteractionHandler,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+    ToolApprovalResponse,
+    UserInputAnswer,
+    UserInputOption,
+    UserInputQuestion,
+    UserInputRequest,
+    UserInputResponse,
+};
 pub use logging::{init_logging, init_logging_with_stdout, LogGuard};
 pub use provider::{
     Provider,

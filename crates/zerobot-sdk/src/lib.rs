@@ -1,7 +1,9 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::events::AgentEvent;
@@ -22,6 +24,7 @@ pub struct ZeroBot {
     hooks: zerobot_core::hooks::HookManager,
     cwd: PathBuf,
     model: String,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
 }
 
 impl ZeroBot {
@@ -34,13 +37,15 @@ impl ZeroBot {
         let store = Arc::new(store);
         let model = resolve_model(&settings, None, None)?;
         let hooks = zerobot_core::hooks::HookManager::load(&settings, &cwd, None)?;
+        let tools = ToolRegistry::with_builtin_async(&settings, &cwd, Some(store.clone())).await?;
         Ok(Self {
-            settings,
+            settings: settings.clone(),
             store: store.clone(),
-            tools: ToolRegistry::with_builtin_async(&settings, &cwd, Some(store.clone())).await?,
+            tools,
             hooks,
             cwd,
             model,
+            tool_approvals: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -61,6 +66,7 @@ impl ZeroBot {
             hooks: self.hooks.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
+            tool_approvals: self.tool_approvals.clone(),
         })
     }
 
@@ -78,6 +84,7 @@ impl ZeroBot {
             hooks: self.hooks.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
+            tool_approvals: self.tool_approvals.clone(),
         })
     }
 }
@@ -91,6 +98,7 @@ pub struct SessionHandle {
     hooks: zerobot_core::hooks::HookManager,
     cwd: PathBuf,
     model: String,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
 }
 
 impl SessionHandle {
@@ -113,6 +121,8 @@ impl SessionHandle {
             provider_factory.clone(),
             self.model.clone(),
             self.hooks.clone(),
+            None,
+            self.tool_approvals.clone(),
         ));
         let agent = Agent::new(
             provider,
@@ -122,6 +132,8 @@ impl SessionHandle {
             tools,
             self.cwd.clone(),
             self.hooks.clone(),
+            None,
+            self.tool_approvals.clone(),
         );
         let output = agent.run_turn(&self.session.id, input, None).await?;
         Ok(output)
@@ -146,6 +158,8 @@ impl SessionHandle {
             provider_factory.clone(),
             self.model.clone(),
             self.hooks.clone(),
+            None,
+            self.tool_approvals.clone(),
         ));
         let agent = Agent::new(
             provider,
@@ -155,6 +169,8 @@ impl SessionHandle {
             tools,
             self.cwd.clone(),
             self.hooks.clone(),
+            None,
+            self.tool_approvals.clone(),
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let session_id = self.session.id.clone();

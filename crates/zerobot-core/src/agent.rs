@@ -1,15 +1,18 @@
-use crate::config::Settings;
+use crate::config::{Settings, ToolApprovalMode};
 use crate::context::ContextManager;
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::events::AgentEvent;
 use crate::hooks::{HookAction, HookEvent, HookManager};
+use crate::interaction::{InteractionHandler, ToolApprovalDecision, ToolApprovalRequest};
 use crate::provider::{Provider, ProviderEvent, ProviderRequest, ToolCall};
 use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
 use crate::tool::{ToolContext, ToolRegistry};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
 use crate::skills::{format_skill_stack, SkillInfo};
+use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -38,6 +41,8 @@ pub struct Agent {
     tools: ToolRegistry,
     cwd: std::path::PathBuf,
     hooks: HookManager,
+    interaction: Option<Arc<dyn InteractionHandler>>,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Agent {
@@ -49,6 +54,8 @@ impl Agent {
         tools: ToolRegistry,
         cwd: std::path::PathBuf,
         hooks: HookManager,
+        interaction: Option<Arc<dyn InteractionHandler>>,
+        tool_approvals: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
         Self {
             provider,
@@ -58,6 +65,8 @@ impl Agent {
             tools,
             cwd,
             hooks,
+            interaction,
+            tool_approvals,
         }
     }
 
@@ -570,6 +579,40 @@ impl Agent {
         if let Some(updated_args) = decision.payload.get("tool_input") {
             args = updated_args.clone();
         }
+        let mut approval_mode = self.settings.tools.approval.mode_for(&call.name);
+        if self.tool_approvals.read().await.contains(&call.name) {
+            approval_mode = ToolApprovalMode::Auto;
+        }
+
+        let mut approved = true;
+        let mut deny_message: Option<String> = None;
+        if approval_mode == ToolApprovalMode::Prompt {
+            if let Some(handler) = self.interaction.clone() {
+                let response = handler
+                    .request_tool_approval(ToolApprovalRequest {
+                        tool_name: call.name.clone(),
+                        arguments: args.clone(),
+                        reason: None,
+                    })
+                    .await?;
+                match response.decision {
+                    ToolApprovalDecision::AllowOnce => {}
+                    ToolApprovalDecision::AllowSession => {
+                        self.tool_approvals.write().await.insert(call.name.clone());
+                    }
+                    ToolApprovalDecision::Deny => {
+                        approved = false;
+                        deny_message = Some("工具调用被拒绝".to_string());
+                    }
+                }
+            } else {
+                approved = false;
+                deny_message = Some("需要用户授权，但当前无交互处理器".to_string());
+            }
+        } else if approval_mode == ToolApprovalMode::Deny {
+            approved = false;
+            deny_message = Some("工具调用被策略拒绝".to_string());
+        }
 
         self.emit(
             events,
@@ -584,11 +627,53 @@ impl Agent {
             .record_tool_call(&call.id, session_id, &call.name, &args.to_string())
             .await?;
 
+        if !approved {
+            let message = deny_message.unwrap_or_else(|| "工具调用被拒绝".to_string());
+            let _ = self.store.record_tool_output(&tool_call_id, &message).await;
+            let _ = self
+                .append_message_with_hooks(Message {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    role: MessageRole::Tool,
+                    content: message.clone(),
+                    summary: false,
+                    tool_call_id: Some(tool_call_id),
+                    tool_calls: None,
+                    created_at: Utc::now().timestamp(),
+                })
+                .await;
+            let skill_hooks = self.load_skill_hooks(session_id).await?;
+            let _ = self
+                .hooks
+                .apply_event(
+                    HookEvent::PostToolUseFailure,
+                    session_id,
+                    serde_json::json!({
+                        "tool_name": call.name,
+                        "tool_input": args,
+                        "tool_output": message,
+                        "ok": false,
+                    }),
+                    &skill_hooks,
+                )
+                .await;
+            self.emit(
+                events,
+                AgentEvent::ToolCallFinished {
+                    name: call.name,
+                    output: message,
+                    ok: false,
+                },
+            );
+            return Ok(());
+        }
+
         let ctx = ToolContext::new(
             self.cwd.clone(),
             self.settings.tools.allow_paths.iter().map(std::path::PathBuf::from).collect(),
             session_id,
             Some(self.store.clone()),
+            self.interaction.clone(),
         );
 
         match self

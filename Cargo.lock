@@ -4523,6 +4523,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "async-trait",
  "base64 0.22.1",
  "clap",
  "console",
@@ -4530,6 +4531,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "rustyline",
+ "serde_json",
  "serde_yaml",
  "syntect",
  "tokio",
