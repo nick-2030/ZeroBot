@@ -7,7 +7,25 @@ zerobot
 ```
 
 - 输入 `/exit` 或 `exit` 退出。
+- 当输入以 `/` 开头且未进入参数段，会在信息面板显示命令建议列表。
+- 使用 `↑/↓` 选择命令，`Tab` 补全。
+- 未知命令会提示错误并保留输入。
 - 会话自动写入 SQLite。
+
+## 斜杠命令
+
+```
+/help [command]
+/clear
+/exit
+/copy
+/tools
+/model [list|name]
+/provider [list|id]
+/config show
+/session list|new [title]|show <id>
+/compact
+```
 
 ## 一次性执行
 

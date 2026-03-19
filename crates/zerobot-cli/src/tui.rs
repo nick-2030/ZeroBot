@@ -13,15 +13,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear, BorderType};
 use ratatui::{Frame, Terminal};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::Instant;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
 use unicode_width::UnicodeWidthStr;
@@ -39,10 +38,11 @@ use zerobot_core::interaction::{
     UserInputResponse,
 };
 use zerobot_core::provider::{ProviderFactory, TokenUsage};
-use zerobot_core::session::{SessionStore, TodoItem, TodoStatus};
+use zerobot_core::session::{create_session_with_hooks, SessionKind, SessionStore, TodoItem, TodoStatus};
 use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
+use crate::slash::{SlashMatch, SlashRegistry};
 
 #[derive(Copy, Clone)]
 enum DotColor {
@@ -177,6 +177,10 @@ struct App {
     blink_on: bool,
     last_blink: Instant,
     last_copyable_output: Option<String>,
+    slash_query: Option<String>,
+    slash_matches: Vec<SlashMatch>,
+    slash_selected: usize,
+    slash_hint: String,
 }
 
 impl App {
@@ -207,6 +211,10 @@ impl App {
             blink_on: true,
             last_blink: Instant::now(),
             last_copyable_output: None,
+            slash_query: None,
+            slash_matches: Vec::new(),
+            slash_selected: 0,
+            slash_hint: String::new(),
         }
     }
 
@@ -303,6 +311,27 @@ impl App {
         lines
     }
 
+    fn refresh_slash(&mut self, registry: &SlashRegistry) {
+        let next_query = slash_query(&self.input);
+        if next_query != self.slash_query {
+            self.slash_selected = 0;
+        }
+        self.slash_query = next_query;
+        if let Some(query) = &self.slash_query {
+            self.slash_matches = registry.matches(query);
+            if self.slash_selected >= self.slash_matches.len() {
+                self.slash_selected = 0;
+            }
+        } else {
+            self.slash_matches.clear();
+            self.slash_selected = 0;
+        }
+    }
+
+    fn slash_active(&self) -> bool {
+        self.slash_query.is_some()
+    }
+
     fn enqueue_overlay(&mut self, overlay: InfoOverlay) {
         if self.info_overlay.is_some() {
             self.overlay_queue.push_back(overlay);
@@ -374,12 +403,28 @@ impl App {
                 ))));
             }
         }
+        if self.slash_active() {
+            lines.push(Line::from(Span::styled(
+                "Commands:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            if self.slash_matches.is_empty() {
+                lines.push(Line::from(Span::raw("  （无匹配）")));
+            } else {
+                for (idx, cmd) in self.slash_matches.iter().take(6).enumerate() {
+                    let prefix = if idx == self.slash_selected { "> " } else { "  " };
+                    let line = format!("{prefix}/{} - {}", cmd.name, cmd.description);
+                    lines.push(Line::from(Span::raw(line)));
+                }
+            }
+            lines.push(Line::from(Span::raw("↑/↓ 选择  Tab 补全")));
+        }
         lines
     }
 
     fn command_hint(&self) -> String {
         if self.input.trim_start().starts_with('/') {
-            "/exit /help /clear /copy".to_string()
+            self.slash_hint.clone()
         } else {
             String::new()
         }
@@ -728,7 +773,8 @@ pub async fn run_tui(
     provider_id: String,
     hooks: HookManager,
     use_alt_screen: bool,
-    tool_approvals: Arc<RwLock<HashSet<String>>>,
+    provider_state: Arc<StdRwLock<String>>,
+    tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -749,6 +795,7 @@ pub async fn run_tui(
         model,
         provider_id,
         hooks,
+        provider_state,
         tool_approvals,
     )
     .await;
@@ -777,9 +824,13 @@ async fn run_tui_inner(
     model: String,
     provider_id: String,
     hooks: HookManager,
-    tool_approvals: Arc<RwLock<HashSet<String>>>,
+    provider_state: Arc<StdRwLock<String>>,
+    tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
 ) -> Result<()> {
+    let slash = SlashRegistry::extended();
     let mut app = App::new(session_id.clone(), provider_id.clone(), model.clone());
+    app.slash_hint = slash.hint(6);
+    app.refresh_slash(&slash);
     let (cols, _rows) = crossterm::terminal::size().unwrap_or((120, 0));
     let welcome = build_welcome_lines(
         env!("CARGO_PKG_VERSION"),
@@ -829,9 +880,10 @@ async fn run_tui_inner(
                             &store,
                             &tools,
                             &provider_factory,
-                            &model,
+                            &slash,
                             &hooks,
                             &interaction,
+                            &provider_state,
                             &tool_approvals,
                             &tx,
                             &mut should_quit,
@@ -884,9 +936,10 @@ async fn run_tui_inner(
                             &store,
                             &tools,
                             &provider_factory,
-                            &model,
+                            &slash,
                             &hooks,
                             &interaction,
+                            &provider_state,
                             &tool_approvals,
                             &tx,
                             &mut should_quit,
@@ -921,10 +974,11 @@ async fn handle_event(
     store: &std::sync::Arc<dyn SessionStore>,
     tools: &ToolRegistry,
     provider_factory: &ProviderFactory,
-    model: &str,
+    slash: &SlashRegistry,
     hooks: &HookManager,
     interaction: &Arc<dyn InteractionHandler>,
-    tool_approvals: &Arc<RwLock<HashSet<String>>>,
+    provider_state: &Arc<StdRwLock<String>>,
+    tool_approvals: &Arc<TokioRwLock<HashSet<String>>>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     should_quit: &mut bool,
 ) -> Result<bool> {
@@ -945,48 +999,334 @@ async fn handle_event(
                     if runner.is_some() {
                         return Ok(false);
                     }
-                    let input = app.input.trim().to_string();
-                    if input.is_empty() {
+                    let raw_input = app.input.trim().to_string();
+                    if raw_input.is_empty() {
                         return Ok(false);
                     }
-                    if input == "/exit" || input == "exit" {
-                        app.push_line(user_input_line(&input));
-                        *should_quit = true;
-                        return Ok(true);
-                    }
-                    if input == "/clear" {
-                        app.output.clear();
-                        app.stream_buffer.clear();
-                        app.streaming = false;
-                        app.scroll = 0;
-                        app.stick_to_bottom = true;
-                        app.input.clear();
-                        app.cursor = 0;
-                        return Ok(true);
-                    }
-                    app.push_line(user_input_line(&input));
-                    if input == "/help" {
-                        app.push_block(DotColor::White, "可用命令: /exit /help /clear /copy");
-                        app.input.clear();
-                        app.cursor = 0;
-                        return Ok(true);
-                    }
-                    if input == "/copy" {
-                        let message = match app.last_copyable_output.as_deref() {
-                            Some(text) => match copy_text_to_clipboard(text) {
-                                Ok(()) => "已复制最新回复到剪贴板".to_string(),
-                                Err(err) => format!("复制失败: {err}"),
-                            },
-                            None => "暂无可复制内容".to_string(),
+                    let slash_input = if raw_input == "exit" {
+                        "/exit".to_string()
+                    } else {
+                        raw_input.clone()
+                    };
+                    if slash_input.starts_with('/') {
+                        let (command, args) = parse_slash_command(&slash_input);
+                        if command.is_empty() {
+                            app.push_block(DotColor::Red, "请输入命令，使用 /help 查看可用命令");
+                            return Ok(true);
+                        }
+                        let Some(spec) = slash.find(&command) else {
+                            app.push_block(
+                                DotColor::Red,
+                                &format!("未知命令: /{command}（输入 /help 查看）"),
+                            );
+                            return Ok(true);
                         };
-                        app.push_block(DotColor::White, &message);
+                        match spec.name {
+                            "clear" => {
+                                app.output.clear();
+                                app.stream_buffer.clear();
+                                app.streaming = false;
+                                app.scroll = 0;
+                                app.stick_to_bottom = true;
+                                app.input.clear();
+                                app.cursor = 0;
+                                app.refresh_slash(slash);
+                                return Ok(true);
+                            }
+                            "exit" => {
+                                app.push_line(user_input_line(&raw_input));
+                                *should_quit = true;
+                                return Ok(true);
+                            }
+                            _ => {
+                                app.push_line(user_input_line(&raw_input));
+                            }
+                        }
+
+                        match spec.name {
+                            "help" => {
+                                let target = args.split_whitespace().next().unwrap_or("");
+                                let message = if target.is_empty() {
+                                    let mut lines = Vec::new();
+                                    lines.push("可用命令:".to_string());
+                                    for cmd in slash.commands() {
+                                        lines.push(format!("  {} - {}", cmd.usage, cmd.description));
+                                    }
+                                    lines.push("输入 /help <命令> 查看用法".to_string());
+                                    lines.join("\n")
+                                } else if let Some(cmd) = slash.find(target) {
+                                    format!("{} - {}", cmd.usage, cmd.description)
+                                } else {
+                                    format!("未知命令: /{target}（输入 /help 查看）")
+                                };
+                                let color = if slash.find(target).is_some() || target.is_empty() {
+                                    DotColor::White
+                                } else {
+                                    DotColor::Red
+                                };
+                                app.push_block(color, &message);
+                            }
+                            "copy" => {
+                                let message = match app.last_copyable_output.as_deref() {
+                                    Some(text) => match copy_text_to_clipboard(text) {
+                                        Ok(()) => "已复制最新回复到剪贴板".to_string(),
+                                        Err(err) => format!("复制失败: {err}"),
+                                    },
+                                    None => "暂无可复制内容".to_string(),
+                                };
+                                app.push_block(DotColor::White, &message);
+                            }
+                            "tools" => {
+                                let mut names = tools.names();
+                                names.sort();
+                                let enabled = if settings.tools.enabled.is_empty() {
+                                    "（无）".to_string()
+                                } else {
+                                    settings.tools.enabled.join(", ")
+                                };
+                                let registered = if names.is_empty() {
+                                    "（无）".to_string()
+                                } else {
+                                    names.join(", ")
+                                };
+                                let message = format!("启用工具: {enabled}\n已注册工具: {registered}");
+                                app.push_block(DotColor::White, &message);
+                            }
+                            "model" => {
+                                let args_lower = args.to_lowercase();
+                                if args.is_empty() || args_lower == "list" {
+                                    let mut lines = Vec::new();
+                                    lines.push(format!("当前模型: {}", app.model));
+                                    if let Some(info) = settings.providers.get(&app.provider_id) {
+                                        if let Some(model) = &info.model {
+                                            lines.push(format!("提供商默认模型: {model}"));
+                                        }
+                                    }
+                                    if let Some(model) = &settings.default_model {
+                                        lines.push(format!("全局默认模型: {model}"));
+                                    }
+                                    lines.push("使用 /model <name> 设置模型".to_string());
+                                    app.push_block(DotColor::White, &lines.join("\n"));
+                                } else {
+                                    app.model = args.clone();
+                                    app.push_block(
+                                        DotColor::White,
+                                        &format!("已切换模型: {}", app.model),
+                                    );
+                                }
+                            }
+                            "provider" => {
+                                let args_lower = args.to_lowercase();
+                                if args.is_empty() || args_lower == "list" {
+                                    let mut lines = Vec::new();
+                                    lines.push(format!("当前提供商: {}", app.provider_id));
+                                    if settings.providers.is_empty() {
+                                        lines.push("未配置 providers".to_string());
+                                    } else {
+                                        let mut items = settings
+                                            .providers
+                                            .iter()
+                                            .map(|(id, info)| (id.clone(), info.kind.clone(), info.model.clone()))
+                                            .collect::<Vec<_>>();
+                                        items.sort_by(|a, b| a.0.cmp(&b.0));
+                                        for (id, kind, model) in items {
+                                            let suffix = if id == app.provider_id { " *" } else { "" };
+                                            let model = model.map(|m| format!(", model={m}")).unwrap_or_default();
+                                            lines.push(format!("  {id} ({kind}{model}){suffix}"));
+                                        }
+                                    }
+                                    app.push_block(DotColor::White, &lines.join("\n"));
+                                } else {
+                                    let target = args_lower;
+                                    let exists = settings.providers.contains_key(&target)
+                                        || matches!(target.as_str(), "openai" | "anthropic");
+                                    if !exists {
+                                        app.push_block(DotColor::Red, "未知提供商（输入 /provider list 查看）");
+                                    } else {
+                                        app.provider_id = target.clone();
+                                        if let Ok(mut guard) = provider_state.write() {
+                                            *guard = target.clone();
+                                        }
+                                        if let Some(info) = settings.providers.get(&app.provider_id) {
+                                            if let Some(model) = &info.model {
+                                                app.model = model.clone();
+                                            }
+                                        }
+                                        app.push_block(
+                                            DotColor::White,
+                                            &format!("已切换提供商: {}", app.provider_id),
+                                        );
+                                    }
+                                }
+                            }
+                            "config" => {
+                                let args_lower = args.to_lowercase();
+                                if args_lower == "show" || args.is_empty() {
+                                    let yaml = masked_settings_yaml(settings);
+                                    app.push_block(DotColor::White, &yaml);
+                                } else {
+                                    app.push_block(DotColor::Red, "用法: /config show");
+                                }
+                            }
+                            "session" => {
+                                let mut parts = args.split_whitespace();
+                                let action = parts.next().unwrap_or("").to_lowercase();
+                                match action.as_str() {
+                                    "list" => {
+                                        match store.list_sessions().await {
+                                            Ok(sessions) => {
+                                                let mut lines = Vec::new();
+                                                lines.push("会话列表:".to_string());
+                                                for session in sessions {
+                                                    lines.push(format!("  {}\t{}", session.id, session.title));
+                                                }
+                                                app.push_block(DotColor::White, &lines.join("\n"));
+                                            }
+                                            Err(err) => {
+                                                app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
+                                            }
+                                        }
+                                    }
+                                    "new" => {
+                                        let title = parts.collect::<Vec<_>>().join(" ");
+                                        let title = if title.trim().is_empty() {
+                                            "新会话".to_string()
+                                        } else {
+                                            title
+                                        };
+                                        match create_session_with_hooks(
+                                            store.as_ref(),
+                                            hooks,
+                                            title,
+                                            None,
+                                            SessionKind::Main,
+                                        )
+                                        .await
+                                        {
+                                            Ok(session) => {
+                                                app.session_id = session.id;
+                                                app.output.clear();
+                                                app.stream_buffer.clear();
+                                                app.streaming = false;
+                                                app.scroll = 0;
+                                                app.stick_to_bottom = true;
+                                                app.status = Status::Idle;
+                                                app.context_used = None;
+                                                app.context_limit = None;
+                                                refresh_session_state(app, store).await;
+                                                app.push_block(DotColor::White, "已创建并切换到新会话");
+                                            }
+                                            Err(err) => {
+                                                app.push_block(DotColor::Red, &format!("创建会话失败: {err}"));
+                                            }
+                                        }
+                                    }
+                                    "show" => {
+                                        let id = parts.next().unwrap_or("");
+                                        if id.is_empty() {
+                                            app.push_block(DotColor::Red, "用法: /session show <id>");
+                                        } else {
+                                            match store.list_messages(id).await {
+                                                Ok(messages) => {
+                                                    app.output.clear();
+                                                    app.stream_buffer.clear();
+                                                    app.streaming = false;
+                                                    app.scroll = 0;
+                                                    app.stick_to_bottom = true;
+                                                    let mut lines = Vec::new();
+                                                    if id == app.session_id {
+                                                        lines.push(format!("会话 {id} 内容:"));
+                                                    } else {
+                                                        lines.push(format!(
+                                                            "会话 {id} 内容（当前会话: {}）:",
+                                                            app.session_id
+                                                        ));
+                                                    }
+                                                    for message in messages {
+                                                        let content = one_line(&message.content);
+                                                        lines.push(format!(
+                                                            "  [{}] {}",
+                                                            message.role.to_string(),
+                                                            content
+                                                        ));
+                                                    }
+                                                    app.push_block(DotColor::White, &lines.join("\n"));
+                                                }
+                                                Err(err) => {
+                                                    app.push_block(DotColor::Red, &format!("读取消息失败: {err}"));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        app.push_block(
+                                            DotColor::Red,
+                                            "用法: /session list|new [title]|show <id>",
+                                        );
+                                    }
+                                }
+                            }
+                            "compact" => {
+                                app.push_block(DotColor::White, "开始压缩上下文...");
+                                app.status = Status::Thinking;
+                                app.blink_on = true;
+                                app.last_blink = Instant::now();
+                                let provider_factory = provider_factory.clone();
+                                let settings = settings.clone();
+                                let store = store.clone();
+                                let tools = tools.clone();
+                                let cwd = cwd.clone();
+                                let hooks = hooks.clone();
+                                let model = app.model.clone();
+                                let session_id = app.session_id.clone();
+                                let interaction = interaction.clone();
+                                let tool_approvals = tool_approvals.clone();
+                                let tx_clone = tx.clone();
+                                tokio::spawn(async move {
+                                    let result = (|| async {
+                                        let provider = (provider_factory)()?;
+                                        let agent = Agent::new(
+                                            provider,
+                                            model,
+                                            settings,
+                                            store,
+                                            tools,
+                                            cwd,
+                                            hooks,
+                                            Some(interaction),
+                                            tool_approvals,
+                                        );
+                                        agent.compact_now(&session_id).await
+                                    })()
+                                    .await;
+                                    match result {
+                                        Ok(()) => {
+                                            let _ = tx_clone.send(AgentEvent::AssistantMessage {
+                                                content: "上下文压缩完成".to_string(),
+                                            });
+                                            let _ = tx_clone.send(AgentEvent::Done);
+                                        }
+                                        Err(err) => {
+                                            let _ = tx_clone.send(AgentEvent::Error {
+                                                message: format!("压缩失败: {err}"),
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+
                         app.input.clear();
                         app.cursor = 0;
+                        app.refresh_slash(slash);
                         return Ok(true);
                     }
 
+                    app.push_line(user_input_line(&raw_input));
                     app.input.clear();
                     app.cursor = 0;
+                    app.refresh_slash(slash);
                     app.status = Status::Thinking;
                     app.blink_on = true;
                     app.last_blink = Instant::now();
@@ -994,7 +1334,7 @@ async fn handle_event(
                     let provider = (provider_factory)()?;
                     let agent = Agent::new(
                         provider,
-                        model.to_string(),
+                        app.model.clone(),
                         settings.clone(),
                         store.clone(),
                         tools.clone(),
@@ -1004,7 +1344,7 @@ async fn handle_event(
                         tool_approvals.clone(),
                     );
                     let session_id = app.session_id.clone();
-                    let input_clone = input.clone();
+                    let input_clone = raw_input.clone();
                     let tx_clone = tx.clone();
                     *runner = Some(tokio::spawn(async move {
                         agent.run_turn(&session_id, &input_clone, Some(tx_clone)).await
@@ -1016,6 +1356,7 @@ async fn handle_event(
                         let idx = char_to_byte_idx(&app.input, app.cursor - 1);
                         app.input.remove(idx);
                         app.cursor -= 1;
+                        app.refresh_slash(slash);
                         return Ok(true);
                     }
                 }
@@ -1023,6 +1364,7 @@ async fn handle_event(
                     if app.cursor < app.input.chars().count() {
                         let idx = char_to_byte_idx(&app.input, app.cursor);
                         app.input.remove(idx);
+                        app.refresh_slash(slash);
                         return Ok(true);
                     }
                 }
@@ -1057,20 +1399,46 @@ async fn handle_event(
                     return Ok(true);
                 }
                 KeyCode::Up => {
+                    if app.slash_active() {
+                        if !app.slash_matches.is_empty() && app.slash_selected > 0 {
+                            app.slash_selected -= 1;
+                            return Ok(true);
+                        }
+                        return Ok(false);
+                    }
                     app.stick_to_bottom = false;
                     app.scroll = app.scroll.saturating_sub(1);
                     return Ok(true);
                 }
                 KeyCode::Down => {
+                    if app.slash_active() {
+                        if !app.slash_matches.is_empty()
+                            && app.slash_selected + 1 < app.slash_matches.len()
+                        {
+                            app.slash_selected += 1;
+                            return Ok(true);
+                        }
+                        return Ok(false);
+                    }
                     app.stick_to_bottom = false;
                     app.scroll = app.scroll.saturating_add(1);
                     return Ok(true);
+                }
+                KeyCode::Tab => {
+                    if app.slash_active() && !app.slash_matches.is_empty() {
+                        let chosen = app.slash_matches[app.slash_selected].name.clone();
+                        app.input = format!("/{chosen} ");
+                        app.cursor = app.input.chars().count();
+                        app.refresh_slash(slash);
+                        return Ok(true);
+                    }
                 }
                 KeyCode::Char(ch) => {
                     if !key.modifiers.contains(KeyModifiers::CONTROL) {
                         let idx = char_to_byte_idx(&app.input, app.cursor);
                         app.input.insert(idx, ch);
                         app.cursor += 1;
+                        app.refresh_slash(slash);
                         return Ok(true);
                     }
                 }
@@ -1331,6 +1699,40 @@ fn build_status_bar(app: &App) -> String {
         parts.push(format!("Commands: {commands}"));
     }
     parts.join(" | ")
+}
+
+fn parse_slash_command(input: &str) -> (String, String) {
+    let trimmed = input.trim();
+    let without = trimmed.trim_start_matches('/');
+    let mut parts = without.splitn(2, |c: char| c.is_whitespace());
+    let command = parts.next().unwrap_or("").trim().to_lowercase();
+    let args = parts.next().unwrap_or("").trim().to_string();
+    (command, args)
+}
+
+fn slash_query(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let rest = &trimmed[1..];
+    if rest.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn masked_settings_yaml(settings: &Settings) -> String {
+    let mut safe = settings.clone();
+    for info in safe.providers.values_mut() {
+        if info.api_key.is_some() {
+            info.api_key = Some("*****".to_string());
+        }
+        if info.api_key_env.is_some() {
+            info.api_key_env = Some("*****".to_string());
+        }
+    }
+    serde_yaml::to_string(&safe).unwrap_or_else(|_| "配置序列化失败".to_string())
 }
 
 fn user_input_line(text: &str) -> Line<'static> {

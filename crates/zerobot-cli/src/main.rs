@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use console::style;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock as StdRwLock};
+use tokio::sync::RwLock as TokioRwLock;
 use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::logging::{init_logging, init_logging_with_stdout};
@@ -19,6 +19,7 @@ use zerobot_core::tool::{SubagentTool, ToolRegistry};
 use zerobot_core::ZeroBotError;
 
 mod tui;
+mod slash;
 
 #[derive(Parser)]
 #[command(name = "zerobot")]
@@ -211,7 +212,7 @@ async fn run_exec(
         })
     };
     let provider = (provider_factory)()?;
-    let tool_approvals = Arc::new(RwLock::new(HashSet::new()));
+    let tool_approvals = Arc::new(TokioRwLock::new(HashSet::new()));
     let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
@@ -266,15 +267,22 @@ async fn run_repl(
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let store = Arc::new(store);
+    let provider_state = Arc::new(StdRwLock::new(resolve_provider_id(
+        settings,
+        provider_override.as_deref(),
+    )));
     let provider_factory = {
         let settings = settings.clone();
-        let provider_override = provider_override.clone();
+        let provider_state = provider_state.clone();
         Arc::new(move || {
-            build_provider(&settings, provider_override.as_deref())
-                .map_err(|err| ZeroBotError::Provider(err.to_string()))
+            let current = provider_state
+                .read()
+                .map_err(|_| ZeroBotError::Provider("provider 状态锁已损坏".to_string()))?
+                .clone();
+            build_provider(&settings, Some(&current)).map_err(|err| ZeroBotError::Provider(err.to_string()))
         })
     };
-    let tool_approvals = Arc::new(RwLock::new(HashSet::new()));
+    let tool_approvals = Arc::new(TokioRwLock::new(HashSet::new()));
     let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
@@ -300,6 +308,7 @@ async fn run_repl(
         provider_id,
         hooks.clone(),
         use_alt_screen,
+        provider_state.clone(),
         tool_approvals.clone(),
     )
     .await?;

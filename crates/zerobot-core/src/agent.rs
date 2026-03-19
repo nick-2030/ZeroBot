@@ -397,6 +397,14 @@ impl Agent {
         Ok(last_response)
     }
 
+    pub async fn compact_now(&self, session_id: &str) -> ZeroBotResult<()> {
+        if !self.settings.context.compaction.enabled {
+            return Err(ZeroBotError::Agent("上下文压缩未启用".to_string()));
+        }
+        let history = self.store.list_messages(session_id).await?;
+        self.compact_session(session_id, &history).await
+    }
+
     async fn compact_session(&self, session_id: &str, history: &[Message]) -> ZeroBotResult<()> {
         let messages = Self::build_compaction_messages(history);
         if messages.is_empty() {
