@@ -42,6 +42,7 @@ use zerobot_core::session::{create_session_with_hooks, SessionKind, SessionStore
 use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
+use zerobot_core::init_prompt;
 use crate::slash::{SlashMatch, SlashRegistry};
 
 #[derive(Copy, Clone)]
@@ -180,6 +181,7 @@ struct App {
     slash_query: Option<String>,
     slash_matches: Vec<SlashMatch>,
     slash_selected: usize,
+    slash_page: usize,
     slash_hint: String,
 }
 
@@ -214,6 +216,7 @@ impl App {
             slash_query: None,
             slash_matches: Vec::new(),
             slash_selected: 0,
+            slash_page: 0,
             slash_hint: String::new(),
         }
     }
@@ -315,16 +318,16 @@ impl App {
         let next_query = slash_query(&self.input);
         if next_query != self.slash_query {
             self.slash_selected = 0;
+            self.slash_page = 0;
         }
         self.slash_query = next_query;
         if let Some(query) = &self.slash_query {
             self.slash_matches = registry.matches(query);
-            if self.slash_selected >= self.slash_matches.len() {
-                self.slash_selected = 0;
-            }
+            clamp_slash_selection(self);
         } else {
             self.slash_matches.clear();
             self.slash_selected = 0;
+            self.slash_page = 0;
         }
     }
 
@@ -411,13 +414,29 @@ impl App {
             if self.slash_matches.is_empty() {
                 lines.push(Line::from(Span::raw("  （无匹配）")));
             } else {
-                for (idx, cmd) in self.slash_matches.iter().take(6).enumerate() {
-                    let prefix = if idx == self.slash_selected { "> " } else { "  " };
+                let page_size = slash_page_size();
+                let (page, pages) = slash_page_info(self.slash_matches.len(), self.slash_page);
+                let start = page * page_size;
+                let end = (start + page_size).min(self.slash_matches.len());
+                for (idx, cmd) in self.slash_matches[start..end].iter().enumerate() {
+                    let absolute_idx = start + idx;
+                    let prefix = if absolute_idx == self.slash_selected {
+                        "> "
+                    } else {
+                        "  "
+                    };
                     let line = format!("{prefix}/{} - {}", cmd.name, cmd.description);
                     lines.push(Line::from(Span::raw(line)));
                 }
+                if pages > 1 {
+                    lines.push(Line::from(Span::raw(format!(
+                        "  Page {}/{}",
+                        page + 1,
+                        pages
+                    ))));
+                }
             }
-            lines.push(Line::from(Span::raw("↑/↓ 选择  Tab 补全")));
+            lines.push(Line::from(Span::raw("↑/↓ 选择  ←/→ 翻页  Enter/Tab 补全")));
         }
         lines
     }
@@ -1003,6 +1022,17 @@ async fn handle_event(
                     if raw_input.is_empty() {
                         return Ok(false);
                     }
+                    if app.slash_active() && !app.slash_matches.is_empty() {
+                        let trimmed = raw_input.trim_start();
+                        let after_slash = trimmed.strip_prefix('/').unwrap_or("");
+                        if !after_slash.chars().any(|c| c.is_whitespace()) {
+                            let chosen = app.slash_matches[app.slash_selected].name.clone();
+                            app.input = format!("/{chosen} ");
+                            app.cursor = app.input.chars().count();
+                            app.refresh_slash(slash);
+                            return Ok(true);
+                        }
+                    }
                     let slash_input = if raw_input == "exit" {
                         "/exit".to_string()
                     } else {
@@ -1091,6 +1121,34 @@ async fn handle_event(
                                 };
                                 let message = format!("启用工具: {enabled}\n已注册工具: {registered}");
                                 app.push_block(DotColor::White, &message);
+                            }
+                            "init" => {
+                                let prompt = init_prompt(cwd, &args);
+                                app.input.clear();
+                                app.cursor = 0;
+                                app.refresh_slash(slash);
+                                app.status = Status::Thinking;
+                                app.blink_on = true;
+                                app.last_blink = Instant::now();
+
+                                let provider = (provider_factory)()?;
+                                let agent = Agent::new(
+                                    provider,
+                                    app.model.clone(),
+                                    settings.clone(),
+                                    store.clone(),
+                                    tools.clone(),
+                                    cwd.clone(),
+                                    hooks.clone(),
+                                    Some(interaction.clone()),
+                                    tool_approvals.clone(),
+                                );
+                                let session_id = app.session_id.clone();
+                                let tx_clone = tx.clone();
+                                *runner = Some(tokio::spawn(async move {
+                                    agent.run_turn(&session_id, &prompt, Some(tx_clone)).await
+                                }));
+                                return Ok(true);
                             }
                             "model" => {
                                 let args_lower = args.to_lowercase();
@@ -1369,12 +1427,18 @@ async fn handle_event(
                     }
                 }
                 KeyCode::Left => {
+                    if app.slash_active() && slash_page_prev(app) {
+                        return Ok(true);
+                    }
                     if app.cursor > 0 {
                         app.cursor -= 1;
                         return Ok(true);
                     }
                 }
                 KeyCode::Right => {
+                    if app.slash_active() && slash_page_next(app) {
+                        return Ok(true);
+                    }
                     if app.cursor < app.input.chars().count() {
                         app.cursor += 1;
                         return Ok(true);
@@ -1400,8 +1464,7 @@ async fn handle_event(
                 }
                 KeyCode::Up => {
                     if app.slash_active() {
-                        if !app.slash_matches.is_empty() && app.slash_selected > 0 {
-                            app.slash_selected -= 1;
+                        if slash_move_selection(app, -1) {
                             return Ok(true);
                         }
                         return Ok(false);
@@ -1412,10 +1475,7 @@ async fn handle_event(
                 }
                 KeyCode::Down => {
                     if app.slash_active() {
-                        if !app.slash_matches.is_empty()
-                            && app.slash_selected + 1 < app.slash_matches.len()
-                        {
-                            app.slash_selected += 1;
+                        if slash_move_selection(app, 1) {
                             return Ok(true);
                         }
                         return Ok(false);
@@ -1733,6 +1793,83 @@ fn masked_settings_yaml(settings: &Settings) -> String {
         }
     }
     serde_yaml::to_string(&safe).unwrap_or_else(|_| "配置序列化失败".to_string())
+}
+
+
+fn slash_page_size() -> usize {
+    6
+}
+
+fn slash_page_info(total: usize, page: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let page_size = slash_page_size();
+    let pages = (total + page_size - 1) / page_size;
+    let page = page.min(pages.saturating_sub(1));
+    (page, pages)
+}
+
+fn clamp_slash_selection(app: &mut App) {
+    if app.slash_matches.is_empty() {
+        app.slash_selected = 0;
+        app.slash_page = 0;
+        return;
+    }
+    if app.slash_selected >= app.slash_matches.len() {
+        app.slash_selected = 0;
+    }
+    let page_size = slash_page_size();
+    app.slash_page = app.slash_selected / page_size;
+}
+
+fn slash_move_selection(app: &mut App, delta: isize) -> bool {
+    if app.slash_matches.is_empty() {
+        return false;
+    }
+    let page_size = slash_page_size();
+    let (page, _pages) = slash_page_info(app.slash_matches.len(), app.slash_page);
+    let start = page * page_size;
+    let end = (start + page_size).min(app.slash_matches.len());
+    let mut idx = app.slash_selected;
+    if idx < start || idx >= end {
+        idx = start;
+    }
+    if delta < 0 && idx > start {
+        app.slash_selected = idx - 1;
+        return true;
+    }
+    if delta > 0 && idx + 1 < end {
+        app.slash_selected = idx + 1;
+        return true;
+    }
+    false
+}
+
+fn slash_page_prev(app: &mut App) -> bool {
+    if app.slash_matches.is_empty() {
+        return false;
+    }
+    let (_page, pages) = slash_page_info(app.slash_matches.len(), app.slash_page);
+    if pages <= 1 || app.slash_page == 0 {
+        return false;
+    }
+    app.slash_page -= 1;
+    app.slash_selected = app.slash_page * slash_page_size();
+    true
+}
+
+fn slash_page_next(app: &mut App) -> bool {
+    if app.slash_matches.is_empty() {
+        return false;
+    }
+    let (page, pages) = slash_page_info(app.slash_matches.len(), app.slash_page);
+    if pages <= 1 || page + 1 >= pages {
+        return false;
+    }
+    app.slash_page = page + 1;
+    app.slash_selected = app.slash_page * slash_page_size();
+    true
 }
 
 fn user_input_line(text: &str) -> Line<'static> {

@@ -53,6 +53,12 @@ impl SlashRegistry {
                     usage: "/tools",
                 },
                 SlashCommandSpec {
+                    name: "init",
+                    aliases: &[],
+                    description: "分析项目并创建/更新 AGENTS.md",
+                    usage: "/init [extra requirements]",
+                },
+                SlashCommandSpec {
                     name: "model",
                     aliases: &[],
                     description: "查看或设置模型",

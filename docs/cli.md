@@ -20,6 +20,7 @@ zerobot
 /exit
 /copy
 /tools
+/init [extra requirements]
 /model [list|name]
 /provider [list|id]
 /config show
