@@ -579,8 +579,18 @@ impl Agent {
         if let Some(updated_args) = decision.payload.get("tool_input") {
             args = updated_args.clone();
         }
+        let approval_key = approval_key(&call.name, &args);
         let mut approval_mode = self.settings.tools.approval.mode_for(&call.name);
-        if self.tool_approvals.read().await.contains(&call.name) {
+        if is_bash_tool(&call.name) {
+            if let Some(command) = bash_command_from_args(&args) {
+                if let Some(mode) = self.settings.tools.approval.bash_mode_for(command) {
+                    approval_mode = mode;
+                }
+            }
+        }
+        if approval_mode != ToolApprovalMode::Deny
+            && self.tool_approvals.read().await.contains(&approval_key)
+        {
             approval_mode = ToolApprovalMode::Auto;
         }
 
@@ -588,17 +598,23 @@ impl Agent {
         let mut deny_message: Option<String> = None;
         if approval_mode == ToolApprovalMode::Prompt {
             if let Some(handler) = self.interaction.clone() {
+                let reason = if is_bash_tool(&call.name) {
+                    bash_command_from_args(&args)
+                        .map(|cmd| format!("bash 命令: {cmd}"))
+                } else {
+                    None
+                };
                 let response = handler
                     .request_tool_approval(ToolApprovalRequest {
                         tool_name: call.name.clone(),
                         arguments: args.clone(),
-                        reason: None,
+                        reason,
                     })
                     .await?;
                 match response.decision {
                     ToolApprovalDecision::AllowOnce => {}
                     ToolApprovalDecision::AllowSession => {
-                        self.tool_approvals.write().await.insert(call.name.clone());
+                        self.tool_approvals.write().await.insert(approval_key.clone());
                     }
                     ToolApprovalDecision::Deny => {
                         approved = false;
@@ -844,4 +860,21 @@ impl Agent {
         }
         Ok(hooks)
     }
+}
+
+fn is_bash_tool(name: &str) -> bool {
+    matches!(name, "bash" | "shell")
+}
+
+fn bash_command_from_args(args: &JsonValue) -> Option<&str> {
+    args.get("command").and_then(|v| v.as_str())
+}
+
+fn approval_key(tool_name: &str, args: &JsonValue) -> String {
+    if is_bash_tool(tool_name) {
+        if let Some(command) = bash_command_from_args(args) {
+            return format!("{tool_name}:{command}");
+        }
+    }
+    tool_name.to_string()
 }

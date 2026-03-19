@@ -46,6 +46,9 @@
 - `tools.output.max_bytes`：工具输出最大字节数。
 - `tools.output.direction`：截断方向，`head` 表示保留前部，`tail` 表示保留尾部。
 - `tools.output.max_lines` / `tools.output.max_bytes` 会同时生效，任一超过即截断。
+- `tools.approval.default`：工具授权默认策略（`prompt` / `auto` / `deny`）。
+- `tools.approval.per_tool`：按工具覆盖授权策略。
+- `tools.approval.bash.allow/ask/deny`：bash 命令级权限规则（支持 glob 模式，优先级 `deny > ask > allow`）。
 - `todoread` / `todowrite`：读取与更新会话内 Todo 列表（当 `tools.enabled` 包含时可用）。
 - `agent.system_prompt`：系统提示词。默认由内置模块自动拼接生成，如需完全覆盖可直接设置此字段。
 - `agent.max_steps`：单次回合最大步骤数。
@@ -99,7 +102,7 @@ Hook 文件格式：
 hooks:
   - name: "guard"
     command: ["bash", "-lc", "echo '{\"action\":\"allow\"}'"]
-    matcher: "shell"
+    matcher: "bash"
     timeout_ms: 3000
     enabled: true
     events: ["pre_tool_use", "post_tool_use"]

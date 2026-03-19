@@ -111,6 +111,8 @@ pub struct ToolApprovalSettings {
     pub default: ToolApprovalMode,
     #[serde(default = "default_tool_approval_overrides")]
     pub per_tool: HashMap<String, ToolApprovalMode>,
+    #[serde(default)]
+    pub bash: CommandApprovalSettings,
 }
 
 fn default_tool_approval_mode() -> ToolApprovalMode {
@@ -132,6 +134,43 @@ impl ToolApprovalSettings {
             .copied()
             .unwrap_or(self.default)
     }
+
+    pub fn bash_mode_for(&self, command: &str) -> Option<ToolApprovalMode> {
+        self.bash.mode_for(command)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommandApprovalSettings {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl CommandApprovalSettings {
+    pub fn mode_for(&self, command: &str) -> Option<ToolApprovalMode> {
+        if matches_any(&self.deny, command) {
+            return Some(ToolApprovalMode::Deny);
+        }
+        if matches_any(&self.ask, command) {
+            return Some(ToolApprovalMode::Prompt);
+        }
+        if matches_any(&self.allow, command) {
+            return Some(ToolApprovalMode::Auto);
+        }
+        None
+    }
+}
+
+fn matches_any(patterns: &[String], value: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        glob::Pattern::new(pattern)
+            .map(|p| p.matches(value))
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +393,7 @@ impl Default for ToolApprovalSettings {
         Self {
             default: default_tool_approval_mode(),
             per_tool: default_tool_approval_overrides(),
+            bash: CommandApprovalSettings::default(),
         }
     }
 }

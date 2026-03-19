@@ -81,6 +81,7 @@ tools:
     # 待办列表
     - todoread
     - todowrite
+    - request_user_input
     - subagent
   allow_paths: []
   output:
@@ -90,6 +91,21 @@ tools:
     max_bytes: 51200
     # 截断方向：head 或 tail
     direction: "head"
+  approval:
+    # 默认策略：prompt / auto / deny
+    default: "prompt"
+    # 按工具覆盖（示例）
+    per_tool:
+      read: "auto"
+      glob: "auto"
+      grep: "auto"
+      todoread: "auto"
+      request_user_input: "auto"
+    # bash 命令级权限（支持 glob 模式）
+    bash:
+      allow: []
+      ask: []
+      deny: []
 
 # Agent 设置
 agent:
@@ -126,11 +142,11 @@ agent:
 
     ## 工具使用
     - 读代码：优先使用 read/grep/glob 获取上下文。
-    - 读取文件优先使用 read 工具，不要用 shell 代替。
+    - 读取文件优先使用 read 工具，不要用 bash 代替。
     - 查找文件优先使用 glob，搜索内容优先使用 grep。
     - 写代码：使用 write/edit/patch，避免手工描述改动。
-    - 执行命令：使用 shell 并关注输出与错误；shell 仅用于确需终端执行的系统命令。
-    - 有专用工具时优先使用专用工具，不要用 shell 代替。
+    - 执行命令：使用 bash 并关注输出与错误；bash 仅用于确需终端执行的系统命令。
+    - 有专用工具时优先使用专用工具，不要用 bash 代替。
     - 输出过长时会被截断；可用 read 的 offset/limit 获取局部内容。
     - 工具被用户拒绝后不要重复同一调用。
     - 不理解拒绝原因时先向用户询问，不要绕过限制；可尝试合规替代方案。

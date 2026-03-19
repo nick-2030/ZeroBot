@@ -79,9 +79,16 @@ struct UserInputOverlay {
     request: UserInputRequest,
     current: usize,
     selected: usize,
+    focus: UserInputFocus,
     notes: HashMap<(String, Option<String>), String>,
     answers: HashMap<String, UserInputAnswer>,
     respond_to: Option<oneshot::Sender<UserInputResponse>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserInputFocus {
+    Options,
+    Input,
 }
 
 struct ToolApprovalOverlay {
@@ -404,10 +411,21 @@ impl InfoOverlay {
 
 impl UserInputOverlay {
     fn new(request: UserInputRequest, respond_to: oneshot::Sender<UserInputResponse>) -> Self {
+        let focus = if request
+            .questions
+            .get(0)
+            .and_then(|q| q.options.as_ref())
+            .is_some()
+        {
+            UserInputFocus::Options
+        } else {
+            UserInputFocus::Input
+        };
         Self {
             request,
             current: 0,
             selected: 0,
+            focus,
             notes: HashMap::new(),
             answers: HashMap::new(),
             respond_to: Some(respond_to),
@@ -422,6 +440,18 @@ impl UserInputOverlay {
         let question = self.current_question()?;
         let options = question.options.as_ref()?;
         options.get(self.selected).map(|opt| opt.id.clone())
+    }
+
+    fn reset_focus_for_current(&mut self) {
+        let has_options = self
+            .current_question()
+            .and_then(|q| q.options.as_ref())
+            .is_some();
+        self.focus = if has_options {
+            UserInputFocus::Options
+        } else {
+            UserInputFocus::Input
+        };
     }
 
     fn note_key(&self) -> Option<(String, Option<String>)> {
@@ -468,28 +498,56 @@ impl UserInputOverlay {
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> OverlayAction<()> {
         match key.code {
             KeyCode::Up => {
-                if let Some(question) = self.current_question() {
-                    if question.options.is_some() {
-                        if self.selected > 0 {
-                            self.selected -= 1;
-                            return OverlayAction::Updated;
-                        }
+                if self.focus == UserInputFocus::Options {
+                    if self.selected > 0 {
+                        self.selected -= 1;
+                        return OverlayAction::Updated;
                     }
                 }
             }
             KeyCode::Down => {
-                if let Some(question) = self.current_question() {
-                    if let Some(options) = &question.options {
-                        if self.selected + 1 < options.len() {
-                            self.selected += 1;
-                            return OverlayAction::Updated;
+                if self.focus == UserInputFocus::Options {
+                    if let Some(question) = self.current_question() {
+                        if let Some(options) = &question.options {
+                            if self.selected + 1 < options.len() {
+                                self.selected += 1;
+                                return OverlayAction::Updated;
+                            }
                         }
                     }
                 }
             }
             KeyCode::Backspace => {
-                if let Some(note) = self.current_note_mut() {
-                    note.pop();
+                if self.focus == UserInputFocus::Input {
+                    if let Some(note) = self.current_note_mut() {
+                        note.pop();
+                        return OverlayAction::Updated;
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                self.focus = if self.focus == UserInputFocus::Options {
+                    UserInputFocus::Input
+                } else {
+                    UserInputFocus::Options
+                };
+                return OverlayAction::Updated;
+            }
+            KeyCode::Left => {
+                if self.current > 0 {
+                    self.commit_current_answer();
+                    self.current -= 1;
+                    self.selected = 0;
+                    self.reset_focus_for_current();
+                    return OverlayAction::Updated;
+                }
+            }
+            KeyCode::Right => {
+                if self.current + 1 < self.request.questions.len() {
+                    self.commit_current_answer();
+                    self.current += 1;
+                    self.selected = 0;
+                    self.reset_focus_for_current();
                     return OverlayAction::Updated;
                 }
             }
@@ -501,6 +559,7 @@ impl UserInputOverlay {
                 }
                 self.current += 1;
                 self.selected = 0;
+                self.reset_focus_for_current();
                 return OverlayAction::Updated;
             }
             KeyCode::Esc => {
@@ -509,6 +568,7 @@ impl UserInputOverlay {
             }
             KeyCode::Char(ch) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.focus = UserInputFocus::Input;
                     if let Some(note) = self.current_note_mut() {
                         note.push(ch);
                         return OverlayAction::Updated;
@@ -531,6 +591,23 @@ impl UserInputOverlay {
             title,
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        if self.request.questions.len() > 1 {
+            let mut spans = Vec::new();
+            spans.push(Span::raw("问题: "));
+            for (idx, q) in self.request.questions.iter().enumerate() {
+                let label = truncate_chars(&q.prompt, 12);
+                let text = format!("{}{} ", idx + 1, label);
+                if idx == self.current {
+                    spans.push(Span::styled(
+                        text,
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::raw(text));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
         if let Some(question) = self.current_question() {
             lines.push(Line::from(Span::raw(format!(
                 "问题 {}/{}: {}",
@@ -540,18 +617,23 @@ impl UserInputOverlay {
             ))));
             if let Some(options) = &question.options {
                 for (idx, opt) in options.iter().enumerate() {
-                    let prefix = if idx == self.selected { "> " } else { "  " };
+                    let prefix = if idx == self.selected && self.focus == UserInputFocus::Options {
+                        "> "
+                    } else {
+                        "  "
+                    };
                     lines.push(Line::from(Span::raw(format!("{prefix}{}", opt.label))));
                 }
+            } else {
+                lines.push(Line::from(Span::raw("（无选项，直接输入）")));
             }
             let note = self.current_note();
-            if !note.is_empty() {
-                lines.push(Line::from(Span::raw(format!("备注: {note}"))));
-            } else {
-                lines.push(Line::from(Span::raw("备注:".to_string())));
-            }
+            let prefix = if self.focus == UserInputFocus::Input { "> " } else { "  " };
+            lines.push(Line::from(Span::raw(format!("{prefix}输入内容: {note}"))));
         }
-        lines.push(Line::from(Span::raw("↑/↓ 选择  Enter 下一项/提交  Esc 取消")));
+        lines.push(Line::from(Span::raw(
+            "↑/↓ 选择  ←/→ 切换  Tab 切换输入  Enter 下一项/提交  Esc 取消",
+        )));
         lines
     }
 }

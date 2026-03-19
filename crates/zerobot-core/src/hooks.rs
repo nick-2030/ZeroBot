@@ -407,7 +407,7 @@ mod tests {
             .apply_event(
                 HookEvent::PreToolUse,
                 "s1",
-                serde_json::json!({"tool_name":"shell","tool_input":{}}),
+                serde_json::json!({"tool_name":"bash","tool_input":{}}),
                 &[],
             )
             .await
@@ -435,7 +435,7 @@ mod tests {
             .apply_event(
                 HookEvent::PreToolUse,
                 "s1",
-                serde_json::json!({"tool_name":"shell","tool_input":{}}),
+                serde_json::json!({"tool_name":"bash","tool_input":{}}),
                 &[],
             )
             .await

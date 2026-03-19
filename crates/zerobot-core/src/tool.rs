@@ -1949,7 +1949,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "执行 shell 命令（支持 workdir/timeoutMs/description）"
+        "执行 bash 命令（支持 workdir/timeoutMs/description）"
     }
 
     fn parameters(&self) -> JsonValue {
