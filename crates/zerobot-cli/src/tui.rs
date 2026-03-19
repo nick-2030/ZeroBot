@@ -1119,12 +1119,6 @@ async fn handle_event(
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
                 app.show_full_tool_output = !app.show_full_tool_output;
-                let state = if app.show_full_tool_output {
-                    "已展开工具输出"
-                } else {
-                    "已折叠工具输出"
-                };
-                app.push_block(DotColor::White, state);
                 return Ok(true);
             }
             if app.info_overlay.is_some() {
