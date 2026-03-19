@@ -52,7 +52,6 @@ enum DotColor {
     Red,
 }
 
-const COLOR_BG: Color = Color::Rgb(26, 29, 36);
 const COLOR_PANEL_BG: Color = Color::Rgb(32, 36, 44);
 const COLOR_PANEL_BORDER: Color = Color::Rgb(70, 76, 88);
 const COLOR_TEXT: Color = Color::Rgb(220, 224, 232);
@@ -168,7 +167,7 @@ struct App {
     provider_id: String,
     model: String,
     status: Status,
-    output: Vec<Line<'static>>,
+    output: Vec<OutputItem>,
     stream_buffer: String,
     streaming: bool,
     last_tool_label: Option<String>,
@@ -194,6 +193,18 @@ struct App {
     slash_selected: usize,
     slash_page: usize,
     slash_hint: String,
+}
+
+#[derive(Clone)]
+enum OutputItem {
+    Lines(Vec<Line<'static>>),
+    Block { color: DotColor, text: String },
+    Markdown(String),
+    ToolOutput {
+        color: DotColor,
+        label: Option<String>,
+        output: String,
+    },
 }
 
 impl App {
@@ -233,51 +244,33 @@ impl App {
     }
 
     fn push_line(&mut self, line: Line<'static>) {
-        if !self.output.is_empty() {
-            self.output.push(Line::from(Span::raw("")));
+        self.output.push(OutputItem::Lines(vec![line]));
+    }
+
+    fn push_lines(&mut self, lines: Vec<Line<'static>>) {
+        if lines.is_empty() {
+            return;
         }
-        self.output.push(line);
+        self.output.push(OutputItem::Lines(lines));
     }
 
     fn push_block(&mut self, color: DotColor, text: &str) {
-        if !self.output.is_empty() {
-            self.output.push(Line::from(Span::raw("")));
-        }
-        self.output.extend(format_block_lines(color, text));
+        self.output.push(OutputItem::Block {
+            color,
+            text: text.to_string(),
+        });
     }
 
     fn push_markdown_block(&mut self, text: &str) {
-        if !self.output.is_empty() {
-            self.output.push(Line::from(Span::raw("")));
-        }
-        self.output.extend(format_markdown_lines(text, self.viewport_width));
+        self.output.push(OutputItem::Markdown(text.to_string()));
     }
 
-    fn push_tool_output(
-        &mut self,
-        color: DotColor,
-        label: Option<&str>,
-        output: &str,
-        width: u16,
-    ) {
-        let (lines, omitted) = truncate_lines(output, 3);
-        if let Some(label) = label {
-            if !self.output.is_empty() {
-                self.output.push(Line::from(Span::raw("")));
-            }
-            let mut line = Vec::new();
-            line.push(tool_dot_span(color));
-            line.push(Span::raw(" "));
-            line.push(Span::raw(label.to_string()));
-            self.output.push(Line::from(line));
-        }
-        let mut content_lines = Vec::new();
-        content_lines.extend(lines);
-        if omitted > 0 {
-            content_lines.push(format!("... 已省略 {} 行", omitted));
-        }
-        let box_lines = format_tool_box_lines(&content_lines, width);
-        self.output.extend(box_lines);
+    fn push_tool_output(&mut self, color: DotColor, label: Option<&str>, output: &str) {
+        self.output.push(OutputItem::ToolOutput {
+            color,
+            label: label.map(|s| s.to_string()),
+            output: output.to_string(),
+        });
     }
 
     fn append_stream_delta(&mut self, text: &str) {
@@ -287,13 +280,6 @@ impl App {
         if !self.streaming {
             self.streaming = true;
             self.stream_buffer.clear();
-            if !self.output.is_empty() {
-                if let Some(last) = self.output.last() {
-                    if !line_is_blank(last) {
-                        self.output.push(Line::from(Span::raw("")));
-                    }
-                }
-            }
         }
         let chunk = if self.stream_buffer.is_empty() {
             text.trim_start_matches('\n')
@@ -308,8 +294,7 @@ impl App {
             return;
         }
         let content = self.stream_buffer.clone();
-        self.output
-            .extend(format_markdown_lines(&content, self.viewport_width));
+        self.output.push(OutputItem::Markdown(content.clone()));
         if !content.trim().is_empty() {
             self.last_copyable_output = Some(content);
         }
@@ -317,12 +302,32 @@ impl App {
         self.streaming = false;
     }
 
-    fn display_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = self.output.clone();
-        if self.streaming {
-            lines.extend(format_block_lines(DotColor::White, &self.stream_buffer));
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for item in &self.output {
+            let mut lines = match item {
+                OutputItem::Lines(lines) => lines.clone(),
+                OutputItem::Block { color, text } => format_block_lines(*color, text),
+                OutputItem::Markdown(text) => format_markdown_lines(text, width),
+                OutputItem::ToolOutput { color, label, output } => {
+                    format_tool_output_lines(*color, label.as_deref(), output, width)
+                }
+            };
+            if lines.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(Line::from(Span::raw("")));
+            }
+            out.append(&mut lines);
         }
-        lines
+        if self.streaming {
+            if !out.is_empty() {
+                out.push(Line::from(Span::raw("")));
+            }
+            out.extend(format_block_lines(DotColor::White, &self.stream_buffer));
+        }
+        out
     }
 
     fn refresh_slash(&mut self, registry: &SlashRegistry) {
@@ -940,7 +945,7 @@ async fn run_tui_inner(
         &cwd.display().to_string(),
         cols as usize,
     );
-    app.output.extend(welcome);
+    app.push_lines(welcome);
 
     refresh_session_state(&mut app, &store).await;
 
@@ -1663,7 +1668,7 @@ async fn handle_agent_event(
         AgentEvent::ToolCallFinished { output, ok, .. } => {
             let color = if ok { DotColor::Green } else { DotColor::Red };
             let label = app.last_tool_label.clone();
-            app.push_tool_output(color, label.as_deref(), output.trim(), app.viewport_width);
+            app.push_tool_output(color, label.as_deref(), output.trim());
             app.last_tool_label = None;
             app.status = Status::Thinking;
             app.blink_on = true;
@@ -1740,7 +1745,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     app.viewport_width = output_area.width;
 
-    let display_lines = app.display_lines();
+    let display_lines = app.display_lines(output_area.width);
     let total_lines = count_wrapped_lines(&display_lines, output_area.width);
     let visible_height = output_area.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
@@ -1763,16 +1768,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .title(Span::styled("会话信息", Style::default().fg(COLOR_ACCENT)))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(BORDER_COLOR))
-                .style(Style::default().bg(COLOR_PANEL_BG)),
+                .border_style(Style::default().fg(BORDER_COLOR)),
         )
-        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
+        .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(info_widget, info_area);
 
     let input_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(BORDER_COLOR))
-        .style(Style::default().bg(COLOR_PANEL_BG));
+        .border_style(Style::default().fg(BORDER_COLOR));
     let input_line = Line::from(vec![
         Span::styled(">", Style::default().fg(COLOR_ACCENT)),
         Span::raw(" "),
@@ -1780,12 +1783,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
     ]);
     let input_widget = Paragraph::new(Text::from(input_line))
         .block(input_block)
-        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
+        .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(input_widget, input_area);
 
     let status_text = build_status_bar(app);
     let status_widget = Paragraph::new(Text::from(Line::from(Span::raw(status_text))))
-        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
+        .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(status_widget, status_area);
 
     if let Some(prompt) = &app.permission_prompt {
@@ -1826,11 +1829,10 @@ fn render_permission_prompt(frame: &mut Frame, prompt: &PermissionPrompt) {
         .title(prompt.title.clone())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER_COLOR))
-        .style(Style::default().bg(COLOR_PANEL_BG));
+        .border_style(Style::default().fg(BORDER_COLOR));
     let widget = Paragraph::new(Text::from(lines))
         .block(block)
-        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
+        .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(widget, area);
 }
 
@@ -2569,8 +2571,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     .last()
                     .copied()
                     .unwrap_or_default()
-                    .fg(COLOR_WARN)
-                    .bg(COLOR_PANEL_BG);
+                    .fg(COLOR_WARN);
                 current.push(Span::styled(code.to_string(), style));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
@@ -2626,12 +2627,11 @@ fn format_thinking_block_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let content_limit = inner_width.saturating_sub(2);
     let content_width = content_width.min(content_limit.max(1));
 
-    let border_style = Style::default().fg(BORDER_COLOR).bg(COLOR_PANEL_BG);
+    let border_style = Style::default().fg(BORDER_COLOR);
     let title_style = Style::default()
         .fg(COLOR_ACCENT_DIM)
-        .bg(COLOR_PANEL_BG)
         .add_modifier(Modifier::BOLD);
-    let text_style = Style::default().fg(COLOR_MUTED).bg(COLOR_PANEL_BG);
+    let text_style = Style::default().fg(COLOR_MUTED);
 
     let label = " 思考 ";
     let mut label_text = label.to_string();
@@ -2823,11 +2823,11 @@ fn render_code_block_lines(
         spans.push(Span::styled("│", border_style));
         spans.push(Span::raw(" "));
         if regions.is_empty() {
-            spans.push(Span::raw(trimmed.clone()));
+            spans.push(Span::styled(trimmed.clone(), Style::default().fg(COLOR_TEXT)));
         } else {
             for (style, text) in regions {
-                let mut span_style =
-                    Style::default().fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
+                let mut span_style = Style::default()
+                    .fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
                 if style.font_style.contains(FontStyle::BOLD) {
                     span_style = span_style.add_modifier(Modifier::BOLD);
                 }
@@ -2892,20 +2892,48 @@ fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
         box_width = 10;
     }
     let inner = box_width.saturating_sub(2);
-    let top = format!("  ╰╭{}╮", "─".repeat(inner));
-    out.push(Line::from(Span::styled(top, Style::default().fg(BORDER_COLOR))));
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = truncate_to_width(line, inner);
-        let pad = inner.saturating_sub(UnicodeWidthStr::width(trimmed.as_str()));
-        let prefix = if idx == 0 { "   │" } else { "   │" };
+    let border_style = Style::default().fg(BORDER_COLOR);
+    let text_style = Style::default().fg(COLOR_TEXT);
+    let top = format!("  ╭{}╮", "─".repeat(inner));
+    out.push(Line::from(Span::styled(top, border_style)));
+    for line in lines.iter() {
+        let trimmed = truncate_to_width(line, inner.saturating_sub(2));
+        let pad = inner
+            .saturating_sub(2)
+            .saturating_sub(UnicodeWidthStr::width(trimmed.as_str()));
         let mut spans = Vec::new();
-        spans.push(Span::styled(prefix.to_string(), Style::default().fg(BORDER_COLOR)));
-        spans.push(Span::raw(format!("{}{}", trimmed, " ".repeat(pad))));
-        spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+        spans.push(Span::styled("  │ ", border_style));
+        spans.push(Span::styled(trimmed, text_style));
+        spans.push(Span::styled(" ".repeat(pad), text_style));
+        spans.push(Span::styled(" │", border_style));
         out.push(Line::from(spans));
     }
-    let bottom = format!("   ╰{}╯", "─".repeat(inner));
-    out.push(Line::from(Span::styled(bottom, Style::default().fg(BORDER_COLOR))));
+    let bottom = format!("  ╰{}╯", "─".repeat(inner));
+    out.push(Line::from(Span::styled(bottom, border_style)));
+    out
+}
+
+fn format_tool_output_lines(
+    color: DotColor,
+    label: Option<&str>,
+    output: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let (lines, omitted) = truncate_lines(output, 3);
+    let mut out = Vec::new();
+    if let Some(label) = label {
+        let mut line = Vec::new();
+        line.push(tool_dot_span(color));
+        line.push(Span::raw(" "));
+        line.push(Span::styled(label.to_string(), Style::default().fg(COLOR_TEXT)));
+        out.push(Line::from(line));
+    }
+    let mut content_lines = Vec::new();
+    content_lines.extend(lines);
+    if omitted > 0 {
+        content_lines.push(format!("... 已省略 {} 行", omitted));
+    }
+    out.extend(format_tool_box_lines(&content_lines, width));
     out
 }
 
