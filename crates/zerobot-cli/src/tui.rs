@@ -193,6 +193,7 @@ struct App {
     slash_selected: usize,
     slash_page: usize,
     slash_hint: String,
+    show_full_tool_output: bool,
 }
 
 #[derive(Clone)]
@@ -202,6 +203,7 @@ enum OutputItem {
     Markdown(String),
     ToolOutput {
         color: DotColor,
+        tool_name: String,
         label: Option<String>,
         output: String,
     },
@@ -240,6 +242,7 @@ impl App {
             slash_selected: 0,
             slash_page: 0,
             slash_hint: String::new(),
+            show_full_tool_output: false,
         }
     }
 
@@ -265,9 +268,16 @@ impl App {
         self.output.push(OutputItem::Markdown(text.to_string()));
     }
 
-    fn push_tool_output(&mut self, color: DotColor, label: Option<&str>, output: &str) {
+    fn push_tool_output(
+        &mut self,
+        color: DotColor,
+        tool_name: &str,
+        label: Option<&str>,
+        output: &str,
+    ) {
         self.output.push(OutputItem::ToolOutput {
             color,
+            tool_name: tool_name.to_string(),
             label: label.map(|s| s.to_string()),
             output: output.to_string(),
         });
@@ -309,8 +319,21 @@ impl App {
                 OutputItem::Lines(lines) => lines.clone(),
                 OutputItem::Block { color, text } => format_block_lines(*color, text),
                 OutputItem::Markdown(text) => format_markdown_lines(text, width),
-                OutputItem::ToolOutput { color, label, output } => {
-                    format_tool_output_lines(*color, label.as_deref(), output, width)
+                OutputItem::ToolOutput {
+                    color,
+                    tool_name,
+                    label,
+                    output,
+                } => {
+                    let always_full = is_full_output_tool(tool_name);
+                    format_tool_output_lines(
+                        *color,
+                        label.as_deref(),
+                        output,
+                        width,
+                        self.show_full_tool_output || always_full,
+                        always_full,
+                    )
                 }
             };
             if lines.is_empty() {
@@ -1094,6 +1117,16 @@ async fn handle_event(
                 *should_quit = true;
                 return Ok(true);
             }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+                app.show_full_tool_output = !app.show_full_tool_output;
+                let state = if app.show_full_tool_output {
+                    "已展开工具输出"
+                } else {
+                    "已折叠工具输出"
+                };
+                app.push_block(DotColor::White, state);
+                return Ok(true);
+            }
             if app.info_overlay.is_some() {
                 if handle_overlay_key(key, app) {
                     return Ok(true);
@@ -1665,10 +1698,10 @@ async fn handle_agent_event(
             app.last_tool_label = Some(label.clone());
             app.status = Status::Tool(label);
         }
-        AgentEvent::ToolCallFinished { output, ok, .. } => {
+        AgentEvent::ToolCallFinished { name, output, ok } => {
             let color = if ok { DotColor::Green } else { DotColor::Red };
             let label = app.last_tool_label.clone();
-            app.push_tool_output(color, label.as_deref(), output.trim());
+            app.push_tool_output(color, &name, label.as_deref(), output.trim());
             app.last_tool_label = None;
             app.status = Status::Thinking;
             app.blink_on = true;
@@ -1746,6 +1779,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     app.viewport_width = output_area.width;
 
     let display_lines = app.display_lines(output_area.width);
+    let output_style = Style::default().fg(COLOR_TEXT);
     let total_lines = count_wrapped_lines(&display_lines, output_area.width);
     let visible_height = output_area.height as usize;
     let max_scroll = total_lines.saturating_sub(visible_height);
@@ -1759,7 +1793,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let output_widget = Paragraph::new(Text::from(display_lines))
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0))
-        .style(Style::default().fg(COLOR_TEXT));
+        .style(output_style);
     frame.render_widget(output_widget, output_area);
 
     let info_widget = Paragraph::new(Text::from(info_lines))
@@ -2603,6 +2637,12 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 fn format_thinking_block_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut box_width = width.saturating_sub(6) as usize;
+    if box_width < 12 {
+        box_width = 12;
+    }
+    let inner_width = box_width.saturating_sub(2);
+    let content_limit = inner_width.saturating_sub(2);
     let mut content_lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
     while content_lines.first().is_some_and(|s| s.trim().is_empty()) {
         content_lines.remove(0);
@@ -2613,19 +2653,10 @@ fn format_thinking_block_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     if content_lines.is_empty() {
         content_lines.push("（无思考内容）".to_string());
     }
-
-    let mut content_width = 1usize;
-    for line in &content_lines {
-        content_width = content_width.max(UnicodeWidthStr::width(line.as_str()));
+    let mut wrapped_lines = Vec::new();
+    for line in content_lines {
+        wrapped_lines.extend(wrap_text_to_width(&line, content_limit.max(1)));
     }
-
-    let mut box_width = width.saturating_sub(6) as usize;
-    if box_width < 12 {
-        box_width = 12;
-    }
-    let inner_width = box_width.saturating_sub(2);
-    let content_limit = inner_width.saturating_sub(2);
-    let content_width = content_width.min(content_limit.max(1));
 
     let border_style = Style::default().fg(BORDER_COLOR);
     let title_style = Style::default()
@@ -2653,14 +2684,13 @@ fn format_thinking_block_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     top.push(Span::styled("╮", border_style));
     out.push(Line::from(top));
 
-    for line in content_lines {
-        let trimmed = truncate_to_width(&line, content_limit);
-        let trimmed_width = UnicodeWidthStr::width(trimmed.as_str());
-        let pad = content_limit.saturating_sub(trimmed_width);
+    for line in wrapped_lines {
+        let line_width = UnicodeWidthStr::width(line.as_str());
+        let pad = content_limit.saturating_sub(line_width);
         let mut spans = Vec::new();
         spans.push(Span::styled("│", border_style));
         spans.push(Span::styled(" ", border_style));
-        spans.push(Span::styled(trimmed, text_style));
+        spans.push(Span::styled(line, text_style));
         spans.push(Span::styled(" ".repeat(pad), text_style));
         spans.push(Span::styled(" ", border_style));
         spans.push(Span::styled("│", border_style));
@@ -2896,17 +2926,18 @@ fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
     let text_style = Style::default().fg(COLOR_TEXT);
     let top = format!("  ╭{}╮", "─".repeat(inner));
     out.push(Line::from(Span::styled(top, border_style)));
+    let content_width = inner.saturating_sub(2);
     for line in lines.iter() {
-        let trimmed = truncate_to_width(line, inner.saturating_sub(2));
-        let pad = inner
-            .saturating_sub(2)
-            .saturating_sub(UnicodeWidthStr::width(trimmed.as_str()));
-        let mut spans = Vec::new();
-        spans.push(Span::styled("  │ ", border_style));
-        spans.push(Span::styled(trimmed, text_style));
-        spans.push(Span::styled(" ".repeat(pad), text_style));
-        spans.push(Span::styled(" │", border_style));
-        out.push(Line::from(spans));
+        let wrapped = wrap_text_to_width(line, content_width.max(1));
+        for piece in wrapped {
+            let pad = content_width.saturating_sub(UnicodeWidthStr::width(piece.as_str()));
+            let mut spans = Vec::new();
+            spans.push(Span::styled("  │ ", border_style));
+            spans.push(Span::styled(piece, text_style));
+            spans.push(Span::styled(" ".repeat(pad), text_style));
+            spans.push(Span::styled(" │", border_style));
+            out.push(Line::from(spans));
+        }
     }
     let bottom = format!("  ╰{}╯", "─".repeat(inner));
     out.push(Line::from(Span::styled(bottom, border_style)));
@@ -2918,8 +2949,15 @@ fn format_tool_output_lines(
     label: Option<&str>,
     output: &str,
     width: u16,
+    show_full: bool,
+    always_full: bool,
 ) -> Vec<Line<'static>> {
-    let (lines, omitted) = truncate_lines(output, 3);
+    let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
+    let (lines, omitted) = if show_full || always_full {
+        (lines, 0)
+    } else {
+        truncate_lines(output, 3)
+    };
     let mut out = Vec::new();
     if let Some(label) = label {
         let mut line = Vec::new();
@@ -2969,6 +3007,33 @@ fn truncate_lines(text: &str, max: usize) -> (Vec<String>, usize) {
     }
     let kept = lines[..max].iter().map(|s| s.to_string()).collect();
     (kept, lines.len() - max)
+}
+
+fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+        if width + ch_width > max_width && !current.is_empty() {
+            out.push(current);
+            current = String::new();
+            width = 0;
+        }
+        current.push(ch);
+        width += ch_width;
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn is_full_output_tool(name: &str) -> bool {
+    matches!(name, "write" | "apply_patch" | "edit")
 }
 
 fn one_line(text: &str) -> String {
@@ -3022,16 +3087,73 @@ fn count_wrapped_lines(lines: &[Line<'static>], width: u16) -> usize {
     if width == 0 {
         return 0;
     }
-    lines
-        .iter()
-        .map(|line| {
-            let text = line.to_string();
-            let w = UnicodeWidthStr::width(text.as_str());
-            let width = width as usize;
-            let used = if w == 0 { 1 } else { (w + width - 1) / width };
-            used.max(1)
-        })
-        .sum()
+    let max = width as usize;
+    let mut total = 0usize;
+    for line in lines {
+        total += count_wrapped_line(line.to_string().as_str(), max);
+    }
+    total
+}
+
+fn count_wrapped_line(text: &str, max_width: usize) -> usize {
+    if max_width == 0 {
+        return 0;
+    }
+    if text.is_empty() {
+        return 1;
+    }
+    let mut count = 0usize;
+    let mut line_width = 0usize;
+    let mut iter = text.chars().peekable();
+
+    while let Some(ch) = iter.next() {
+        let is_space = ch.is_whitespace() && ch != '\u{00a0}';
+        let mut token = String::new();
+        token.push(ch);
+        while let Some(&next) = iter.peek() {
+            let next_is_space = next.is_whitespace() && next != '\u{00a0}';
+            if next_is_space == is_space {
+                token.push(next);
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let mut token_width = UnicodeWidthStr::width(token.as_str());
+        if token_width == 0 {
+            continue;
+        }
+
+        if !is_space && token_width > max_width {
+            if line_width > 0 {
+                count += 1;
+            }
+            let full = token_width / max_width;
+            if full > 0 {
+                count += full;
+                token_width %= max_width;
+            }
+            line_width = token_width;
+            continue;
+        }
+
+        if line_width + token_width > max_width {
+            count += 1;
+            line_width = 0;
+        }
+        if token_width > max_width {
+            let full = token_width / max_width;
+            count += full;
+            line_width = token_width % max_width;
+        } else {
+            line_width += token_width;
+        }
+    }
+
+    if line_width > 0 || count == 0 {
+        count += 1;
+    }
+    count
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
