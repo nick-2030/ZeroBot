@@ -52,8 +52,19 @@ enum DotColor {
     Red,
 }
 
-const BORDER_COLOR: Color = Color::DarkGray;
-const LOGO_COLOR: Color = Color::Cyan;
+const COLOR_BG: Color = Color::Rgb(26, 29, 36);
+const COLOR_PANEL_BG: Color = Color::Rgb(32, 36, 44);
+const COLOR_PANEL_BORDER: Color = Color::Rgb(70, 76, 88);
+const COLOR_TEXT: Color = Color::Rgb(220, 224, 232);
+const COLOR_MUTED: Color = Color::Rgb(136, 142, 156);
+const COLOR_ACCENT: Color = Color::Rgb(186, 148, 255);
+const COLOR_ACCENT_DIM: Color = Color::Rgb(132, 112, 190);
+const COLOR_SELECTED_BG: Color = Color::Rgb(48, 52, 64);
+const COLOR_SUCCESS: Color = Color::Rgb(124, 216, 168);
+const COLOR_ERROR: Color = Color::Rgb(236, 112, 104);
+const COLOR_WARN: Color = Color::Rgb(234, 196, 118);
+const LOGO_COLOR: Color = COLOR_ACCENT;
+const BORDER_COLOR: Color = COLOR_PANEL_BORDER;
 
 #[derive(Clone)]
 enum Status {
@@ -368,21 +379,38 @@ impl App {
         }
         let mut lines = Vec::new();
         let status_line = match &self.status {
-            Status::Idle => Line::from(Span::raw("状态: 空闲")),
+            Status::Idle => Line::from(Span::styled("状态: 空闲", Style::default().fg(COLOR_MUTED))),
             Status::Thinking => {
                 let dot = if self.blink_on { "●" } else { " " };
-                Line::from(Span::raw(format!("状态: {dot} 努力工作中")))
+                Line::from(Span::styled(
+                    format!("状态: {dot} 努力工作中"),
+                    Style::default().fg(COLOR_ACCENT),
+                ))
             }
-            Status::Tool(name) => Line::from(Span::raw(format!("状态: 工具执行中: {name}"))),
-            Status::Error(message) => Line::from(Span::raw(format!("状态: 错误: {message}"))),
-            Status::WaitingUserInput => Line::from(Span::raw("状态: 等待用户输入")),
-            Status::WaitingApproval => Line::from(Span::raw("状态: 等待授权")),
+            Status::Tool(name) => Line::from(Span::styled(
+                format!("状态: 工具执行中: {name}"),
+                Style::default().fg(COLOR_ACCENT),
+            )),
+            Status::Error(message) => Line::from(Span::styled(
+                format!("状态: 错误: {message}"),
+                Style::default().fg(COLOR_ERROR),
+            )),
+            Status::WaitingUserInput => Line::from(Span::styled(
+                "状态: 等待用户输入",
+                Style::default().fg(COLOR_WARN),
+            )),
+            Status::WaitingApproval => Line::from(Span::styled(
+                "状态: 等待授权",
+                Style::default().fg(COLOR_WARN),
+            )),
         };
         lines.push(status_line);
         if !self.todos.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Todo:",
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(COLOR_ACCENT),
             )));
             for item in self.todos.iter().take(2) {
                 let status = match item.status {
@@ -391,28 +419,38 @@ impl App {
                     TodoStatus::Completed => "completed",
                     TodoStatus::Cancelled => "cancelled",
                 };
-                lines.push(Line::from(Span::raw(format!("  [{status}] {}", item.content))));
+                lines.push(Line::from(Span::styled(
+                    format!("  [{status}] {}", item.content),
+                    Style::default().fg(COLOR_TEXT),
+                )));
             }
         }
         if !self.skills.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Skill 栈:",
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(COLOR_ACCENT),
             )));
             for skill in self.skills.iter().rev().take(2) {
-                lines.push(Line::from(Span::raw(format!(
-                    "  {}: {}",
-                    skill.name, skill.description
-                ))));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}: {}", skill.name, skill.description),
+                    Style::default().fg(COLOR_TEXT),
+                )));
             }
         }
         if self.slash_active() {
             lines.push(Line::from(Span::styled(
                 "Commands:",
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(COLOR_ACCENT),
             )));
             if self.slash_matches.is_empty() {
-                lines.push(Line::from(Span::raw("  （无匹配）")));
+                lines.push(Line::from(Span::styled(
+                    "  （无匹配）",
+                    Style::default().fg(COLOR_MUTED),
+                )));
             } else {
                 let page_size = slash_page_size();
                 let (page, pages) = slash_page_info(self.slash_matches.len(), self.slash_page);
@@ -420,23 +458,34 @@ impl App {
                 let end = (start + page_size).min(self.slash_matches.len());
                 for (idx, cmd) in self.slash_matches[start..end].iter().enumerate() {
                     let absolute_idx = start + idx;
-                    let prefix = if absolute_idx == self.slash_selected {
-                        "> "
+                    let selected = absolute_idx == self.slash_selected;
+                    let prefix = if selected { "▸ " } else { "  " };
+                    let mut spans = Vec::new();
+                    let style = if selected {
+                        Style::default().fg(COLOR_TEXT).bg(COLOR_SELECTED_BG)
                     } else {
-                        "  "
+                        Style::default().fg(COLOR_MUTED)
                     };
-                    let line = format!("{prefix}/{} - {}", cmd.name, cmd.description);
-                    lines.push(Line::from(Span::raw(line)));
+                    spans.push(Span::styled(prefix, style));
+                    spans.push(Span::styled(
+                        format!("/{}", cmd.name),
+                        style.fg(COLOR_ACCENT),
+                    ));
+                    spans.push(Span::styled("  ", style));
+                    spans.push(Span::styled(cmd.description.clone(), style));
+                    lines.push(Line::from(spans));
                 }
                 if pages > 1 {
-                    lines.push(Line::from(Span::raw(format!(
-                        "  Page {}/{}",
-                        page + 1,
-                        pages
-                    ))));
+                    lines.push(Line::from(Span::styled(
+                        format!("  Page {}/{}", page + 1, pages),
+                        Style::default().fg(COLOR_ACCENT_DIM),
+                    )));
                 }
             }
-            lines.push(Line::from(Span::raw("↑/↓ 选择  ←/→ 翻页  Enter/Tab 补全")));
+            lines.push(Line::from(Span::styled(
+                "↑/↓ 选择  ←/→ 翻页  Enter/Tab 补全",
+                Style::default().fg(COLOR_MUTED),
+            )));
         }
         lines
     }
@@ -653,25 +702,29 @@ impl UserInputOverlay {
             .unwrap_or_else(|| "需要用户输入".to_string());
         lines.push(Line::from(Span::styled(
             title,
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
         )));
         if self.request.questions.len() > 1 {
-            let mut spans = Vec::new();
-            spans.push(Span::raw("问题: "));
-            for (idx, q) in self.request.questions.iter().enumerate() {
-                let label = truncate_chars(&q.prompt, 12);
-                let text = format!("{}{} ", idx + 1, label);
-                if idx == self.current {
-                    spans.push(Span::styled(
-                        text,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    spans.push(Span::raw(text));
-                }
+        let mut spans = Vec::new();
+        spans.push(Span::styled("问题: ", Style::default().fg(COLOR_MUTED)));
+        for (idx, q) in self.request.questions.iter().enumerate() {
+            let label = truncate_chars(&q.prompt, 12);
+            let text = format!("{}{} ", idx + 1, label);
+            if idx == self.current {
+                spans.push(Span::styled(
+                    text,
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(COLOR_TEXT),
+                ));
+            } else {
+                spans.push(Span::styled(text, Style::default().fg(COLOR_MUTED)));
             }
-            lines.push(Line::from(spans));
         }
+        lines.push(Line::from(spans));
+    }
         if let Some(question) = self.current_question() {
             lines.push(Line::from(Span::raw(format!(
                 "问题 {}/{}: {}",
@@ -681,22 +734,34 @@ impl UserInputOverlay {
             ))));
             if let Some(options) = &question.options {
                 for (idx, opt) in options.iter().enumerate() {
-                    let prefix = if idx == self.selected && self.focus == UserInputFocus::Options {
-                        "> "
+                    let selected = idx == self.selected && self.focus == UserInputFocus::Options;
+                    let prefix = if selected { "▸ " } else { "  " };
+                    let style = if selected {
+                        Style::default().fg(COLOR_TEXT).bg(COLOR_SELECTED_BG)
                     } else {
-                        "  "
+                        Style::default().fg(COLOR_MUTED)
                     };
-                    lines.push(Line::from(Span::raw(format!("{prefix}{}", opt.label))));
+                    lines.push(Line::from(Span::styled(format!("{prefix}{}", opt.label), style)));
                 }
             } else {
-                lines.push(Line::from(Span::raw("（无选项，直接输入）")));
+                lines.push(Line::from(Span::styled(
+                    "（无选项，直接输入）",
+                    Style::default().fg(COLOR_MUTED),
+                )));
             }
             let note = self.current_note();
-            let prefix = if self.focus == UserInputFocus::Input { "> " } else { "  " };
-            lines.push(Line::from(Span::raw(format!("{prefix}输入内容: {note}"))));
+            let selected = self.focus == UserInputFocus::Input;
+            let prefix = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default().fg(COLOR_TEXT).bg(COLOR_SELECTED_BG)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
+            lines.push(Line::from(Span::styled(format!("{prefix}输入内容: {note}"), style)));
         }
-        lines.push(Line::from(Span::raw(
+        lines.push(Line::from(Span::styled(
             "↑/↓ 选择  ←/→ 切换  Tab 切换输入  Enter 下一项/提交  Esc 取消",
+            Style::default().fg(COLOR_MUTED),
         )));
         lines
     }
@@ -754,29 +819,46 @@ impl ToolApprovalOverlay {
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
             "需要工具授权".to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
         )));
-        lines.push(Line::from(Span::raw(format!(
-            "工具: {}",
-            self.request.tool_name
-        ))));
+        lines.push(Line::from(Span::styled(
+            format!("工具: {}", self.request.tool_name),
+            Style::default().fg(COLOR_TEXT),
+        )));
         if let Some(reason) = &self.request.reason {
             if !reason.trim().is_empty() {
-                lines.push(Line::from(Span::raw(format!("原因: {reason}"))));
+                lines.push(Line::from(Span::styled(
+                    format!("原因: {reason}"),
+                    Style::default().fg(COLOR_MUTED),
+                )));
             }
         }
         if let Ok(args) = serde_json::to_string(&self.request.arguments) {
             let args = one_line(&args);
             if !args.is_empty() {
-                lines.push(Line::from(Span::raw(format!("参数: {args}"))));
+                lines.push(Line::from(Span::styled(
+                    format!("参数: {args}"),
+                    Style::default().fg(COLOR_MUTED),
+                )));
             }
         }
         let options = ["仅本次允许", "本会话允许", "拒绝"];
         for (idx, opt) in options.iter().enumerate() {
-            let prefix = if idx == self.selected { "> " } else { "  " };
-            lines.push(Line::from(Span::raw(format!("{prefix}{opt}"))));
+            let selected = idx == self.selected;
+            let prefix = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default().fg(COLOR_TEXT).bg(COLOR_SELECTED_BG)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
+            lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
         }
-        lines.push(Line::from(Span::raw("↑/↓ 选择  Enter 确认  Esc 取消")));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ 选择  Enter 确认  Esc 取消",
+            Style::default().fg(COLOR_MUTED),
+        )));
         lines
     }
 }
@@ -1671,32 +1753,39 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let output_widget = Paragraph::new(Text::from(display_lines))
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
+        .scroll((app.scroll, 0))
+        .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(output_widget, output_area);
 
     let info_widget = Paragraph::new(Text::from(info_lines))
         .block(
             Block::default()
-                .title("会话信息")
+                .title(Span::styled("会话信息", Style::default().fg(COLOR_ACCENT)))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(BORDER_COLOR)),
+                .border_style(Style::default().fg(BORDER_COLOR))
+                .style(Style::default().bg(COLOR_PANEL_BG)),
         )
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
     frame.render_widget(info_widget, info_area);
 
-    let input_block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
+    let input_block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(BORDER_COLOR))
+        .style(Style::default().bg(COLOR_PANEL_BG));
     let input_line = Line::from(vec![
-        Span::styled(">", Style::default().fg(Color::Cyan)),
+        Span::styled(">", Style::default().fg(COLOR_ACCENT)),
         Span::raw(" "),
-        Span::raw(app.input.clone()),
+        Span::styled(app.input.clone(), Style::default().fg(COLOR_TEXT)),
     ]);
-    let input_widget = Paragraph::new(Text::from(input_line)).block(input_block);
+    let input_widget = Paragraph::new(Text::from(input_line))
+        .block(input_block)
+        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
     frame.render_widget(input_widget, input_area);
 
     let status_text = build_status_bar(app);
     let status_widget = Paragraph::new(Text::from(Line::from(Span::raw(status_text))))
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
     frame.render_widget(status_widget, status_area);
 
     if let Some(prompt) = &app.permission_prompt {
@@ -1723,16 +1812,25 @@ fn render_permission_prompt(frame: &mut Frame, prompt: &PermissionPrompt) {
         .iter()
         .enumerate()
         .map(|(idx, opt)| {
-            let prefix = if idx == prompt.selected { "> " } else { "  " };
-            Line::from(Span::raw(format!("{prefix}{opt}")))
+            let selected = idx == prompt.selected;
+            let prefix = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default().fg(COLOR_TEXT).bg(COLOR_SELECTED_BG)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
+            Line::from(Span::styled(format!("{prefix}{opt}"), style))
         })
         .collect::<Vec<_>>();
     let block = Block::default()
         .title(prompt.title.clone())
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER_COLOR));
-    let widget = Paragraph::new(Text::from(lines)).block(block);
+        .border_style(Style::default().fg(BORDER_COLOR))
+        .style(Style::default().bg(COLOR_PANEL_BG));
+    let widget = Paragraph::new(Text::from(lines))
+        .block(block)
+        .style(Style::default().fg(COLOR_TEXT).bg(COLOR_PANEL_BG));
     frame.render_widget(widget, area);
 }
 
@@ -1874,9 +1972,9 @@ fn slash_page_next(app: &mut App) -> bool {
 
 fn user_input_line(text: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(">", Style::default().fg(Color::Cyan)),
+        Span::styled(">", Style::default().fg(COLOR_ACCENT)),
         Span::raw(" "),
-        Span::raw(text.to_string()),
+        Span::styled(text.to_string(), Style::default().fg(COLOR_TEXT)),
     ])
 }
 
@@ -2141,7 +2239,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         }
         if blockquote_depth > 0 {
             let prefix = "│ ".repeat(blockquote_depth);
-            current.push(Span::styled(prefix, Style::default().fg(Color::DarkGray)));
+            current.push(Span::styled(prefix, Style::default().fg(COLOR_MUTED)));
         }
         let mut prefix = String::new();
         if !list_stack.is_empty() {
@@ -2216,7 +2314,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                         .last()
                         .copied()
                         .unwrap_or_default()
-                        .fg(Color::LightBlue)
+                        .fg(COLOR_ACCENT)
                         .add_modifier(Modifier::UNDERLINED);
                     style_stack.push(style);
                 }
@@ -2370,8 +2468,8 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     .last()
                     .copied()
                     .unwrap_or_default()
-                    .fg(Color::LightYellow)
-                    .bg(Color::DarkGray);
+                    .fg(COLOR_WARN)
+                    .bg(COLOR_PANEL_BG);
                 current.push(Span::styled(code.to_string(), style));
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
@@ -2512,7 +2610,7 @@ fn render_code_block_lines(
         content_width
     };
 
-    let border_style = Style::default().fg(Color::DarkGray);
+    let border_style = Style::default().fg(BORDER_COLOR);
     let (syntax_set, theme) = syntect_assets();
     let syntax = lang
         .map(|l| l.to_lowercase())
@@ -2597,18 +2695,18 @@ fn syntect_assets() -> (&'static SyntaxSet, &'static Theme) {
 
 fn dot_span(color: DotColor) -> Span<'static> {
     let fg = match color {
-        DotColor::White => Color::White,
-        DotColor::Green => Color::Green,
-        DotColor::Red => Color::Red,
+        DotColor::White => COLOR_ACCENT,
+        DotColor::Green => COLOR_SUCCESS,
+        DotColor::Red => COLOR_ERROR,
     };
     Span::styled("●", Style::default().fg(fg))
 }
 
 fn tool_dot_span(color: DotColor) -> Span<'static> {
     let fg = match color {
-        DotColor::White => Color::White,
-        DotColor::Green => Color::Green,
-        DotColor::Red => Color::Red,
+        DotColor::White => COLOR_ACCENT,
+        DotColor::Green => COLOR_SUCCESS,
+        DotColor::Red => COLOR_ERROR,
     };
     Span::styled("⏺", Style::default().fg(fg))
 }
