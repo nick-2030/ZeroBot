@@ -57,6 +57,14 @@ pub struct StoredToolCall {
     pub arguments: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileReadRecord {
+    pub session_id: String,
+    pub path: String,
+    pub mtime: i64,
+    pub read_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
@@ -106,6 +114,17 @@ pub trait SessionStore: Send + Sync {
         arguments: &str,
     ) -> ZeroBotResult<String>;
     async fn record_tool_output(&self, tool_call_id: &str, content: &str) -> ZeroBotResult<()>;
+    async fn record_file_read(
+        &self,
+        session_id: &str,
+        path: &str,
+        mtime: i64,
+    ) -> ZeroBotResult<()>;
+    async fn get_file_read(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> ZeroBotResult<Option<FileReadRecord>>;
     async fn get_skill_stack(&self, session_id: &str) -> ZeroBotResult<Vec<SkillStackEntry>>;
     async fn push_skill_stack(
         &self,
@@ -226,7 +245,26 @@ impl SessionStore for SqliteSessionStore {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_reads (
+                session_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                read_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, path),
+                FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_file_reads_session ON file_reads(session_id);")
             .execute(&self.pool)
             .await?;
 
@@ -424,6 +462,51 @@ impl SessionStore for SqliteSessionStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn record_file_read(
+        &self,
+        session_id: &str,
+        path: &str,
+        mtime: i64,
+    ) -> ZeroBotResult<()> {
+        let read_at = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            INSERT INTO file_reads (session_id, path, mtime, read_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id, path) DO UPDATE SET
+              mtime = excluded.mtime,
+              read_at = excluded.read_at
+            "#,
+        )
+        .bind(session_id)
+        .bind(path)
+        .bind(mtime)
+        .bind(read_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_file_read(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> ZeroBotResult<Option<FileReadRecord>> {
+        let record = sqlx::query_as::<_, (String, String, i64, i64)>(
+            "SELECT session_id, path, mtime, read_at FROM file_reads WHERE session_id = ? AND path = ?",
+        )
+        .bind(session_id)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record.map(|(session_id, path, mtime, read_at)| FileReadRecord {
+            session_id,
+            path,
+            mtime,
+            read_at,
+        }))
     }
 
     async fn get_skill_stack(&self, session_id: &str) -> ZeroBotResult<Vec<SkillStackEntry>> {

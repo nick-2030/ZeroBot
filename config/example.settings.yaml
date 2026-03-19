@@ -74,10 +74,10 @@ tools:
     - read
     - write
     - edit
-    - patch
+    - apply_patch
     - glob
     - grep
-    - shell
+    - bash
     # 待办列表
     - todoread
     - todowrite

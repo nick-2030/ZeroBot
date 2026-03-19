@@ -7,19 +7,23 @@ use crate::interaction::{InteractionHandler, UserInputRequest, UserInputResponse
 use crate::instruction;
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::provider::ProviderFactory;
-use crate::session::{SessionKind, SessionStore, TodoItem};
+use crate::session::{FileReadRecord, SessionKind, SessionStore, TodoItem};
 use crate::skills::{SkillAction, SkillManager, SkillContent, SkillStackEntry};
 use async_trait::async_trait;
-use diffy::Patch;
+use chrono::Utc;
+use diffy::{create_patch, Patch};
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio::time::timeout;
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 #[derive(Clone)]
@@ -97,25 +101,93 @@ fn io_error(op: &str, path: &std::path::Path, err: &io::Error) -> ZeroBotError {
     };
     ZeroBotError::Tool(format!("{op}失败: {detail}: {}", path.display()))
 }
+
+fn system_time_to_ts(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs() as i64
+}
+
+async fn record_file_read(ctx: &ToolContext, path: &Path) -> ZeroBotResult<()> {
+    let Some(store) = ctx.store() else {
+        return Ok(());
+    };
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|err| io_error("读取文件元信息", path, &err))?;
+    let mtime = metadata
+        .modified()
+        .map(system_time_to_ts)
+        .unwrap_or_default();
+    store
+        .record_file_read(&ctx.session_id, &path.to_string_lossy(), mtime)
+        .await?;
+    Ok(())
+}
+
+async fn ensure_read_before_write(ctx: &ToolContext, path: &Path) -> ZeroBotResult<Option<FileReadRecord>> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(io_error("读取文件元信息", path, &err)),
+    };
+    if metadata.is_dir() {
+        return Err(ZeroBotError::Tool("目标是目录，无法写入".to_string()));
+    }
+    let store = ctx
+        .store()
+        .ok_or_else(|| ZeroBotError::Tool("写入前需要 SessionStore 用于 read 校验".to_string()))?;
+    let current_mtime = metadata
+        .modified()
+        .map(system_time_to_ts)
+        .unwrap_or_default();
+    let record = store
+        .get_file_read(&ctx.session_id, &path.to_string_lossy())
+        .await?;
+    let Some(record) = record else {
+        return Err(ZeroBotError::Tool("写入前请先使用 read 读取目标文件".to_string()));
+    };
+    if record.mtime != current_mtime {
+        return Err(ZeroBotError::Tool(
+            "文件已发生变化，请重新使用 read 读取后再写入".to_string(),
+        ));
+    }
+    Ok(Some(record))
+}
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
+    pub title: Option<String>,
     pub content: String,
+    pub metadata: JsonValue,
     pub truncated: bool,
+    pub output_path: Option<String>,
 }
 
 impl ToolOutput {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
+            title: None,
             content: content.into(),
+            metadata: json!({}),
             truncated: false,
+            output_path: None,
         }
     }
 
-    pub fn truncated(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-            truncated: true,
-        }
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: JsonValue) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn truncated(mut self, output_path: Option<String>) -> Self {
+        self.truncated = true;
+        self.output_path = output_path;
+        self
     }
 }
 
@@ -184,10 +256,7 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| ZeroBotError::Tool(format!("未知工具: {name}")))?;
         let output = tool.run(ctx, args).await?;
-        if output.truncated {
-            return Ok(output);
-        }
-        truncate_tool_output(&output.content, output_settings).await
+        render_tool_output(ctx, output, output_settings).await
     }
 
     pub fn with_builtin() -> Self {
@@ -195,9 +264,11 @@ impl ToolRegistry {
         registry.register(ReadTool);
         registry.register(WriteTool);
         registry.register(EditTool);
+        registry.register(ApplyPatchTool);
         registry.register(PatchTool);
         registry.register(GlobTool);
         registry.register(GrepTool);
+        registry.register(BashTool);
         registry.register(ShellTool);
         registry.register(TodoReadTool);
         registry.register(TodoWriteTool);
@@ -523,10 +594,43 @@ impl Tool for McpToolAdapter {
     }
 }
 
-async fn truncate_tool_output(
-    content: &str,
+struct TruncateResult {
+    content: String,
+    truncated: bool,
+    output_path: Option<String>,
+    summary: Option<String>,
+}
+
+async fn render_tool_output(
+    ctx: &ToolContext,
+    output: ToolOutput,
     settings: &ToolOutputSettings,
 ) -> ZeroBotResult<ToolOutput> {
+    let title = output.title.clone();
+    let metadata = output.metadata.clone();
+    let trunc = truncate_tool_content(ctx, &output.content, settings).await?;
+    let wrapped = wrap_tool_output(
+        title.as_deref(),
+        &trunc.content,
+        &metadata,
+        trunc.summary.as_deref(),
+        trunc.truncated,
+        trunc.output_path.as_deref(),
+    );
+    Ok(ToolOutput {
+        title,
+        content: wrapped,
+        metadata,
+        truncated: trunc.truncated,
+        output_path: trunc.output_path,
+    })
+}
+
+async fn truncate_tool_content(
+    ctx: &ToolContext,
+    content: &str,
+    settings: &ToolOutputSettings,
+) -> ZeroBotResult<TruncateResult> {
     let max_lines = settings.max_lines;
     let max_bytes = settings.max_bytes;
     let direction = settings.direction;
@@ -535,7 +639,12 @@ async fn truncate_tool_output(
     let total_bytes = content.as_bytes().len();
 
     if lines.len() <= max_lines && total_bytes <= max_bytes {
-        return Ok(ToolOutput::new(content));
+        return Ok(TruncateResult {
+            content: content.to_string(),
+            truncated: false,
+            output_path: None,
+            summary: None,
+        });
     }
 
     let mut out: Vec<&str> = Vec::new();
@@ -573,23 +682,87 @@ async fn truncate_tool_output(
     let unit = if hit_bytes { "字节" } else { "行" };
     let preview = out.join("\n");
 
-    let summary = format!("...已截断 {removed} {unit}...");
-    let hint = "输出过长已截断，建议使用 grep 搜索，或使用 read 搭配 offset/limit 查看指定范围。"
-        .to_string();
-    let message = if direction == ToolOutputDirection::Head {
-        format!("{preview}\n\n{summary}\n\n{hint}")
+    let output_path = persist_tool_output(ctx, content).await?;
+    let summary = format!(
+        "输出过长已截断（移除 {removed} {unit}）。完整输出已保存至: {output_path}。可使用 read 配合 offset/limit 或 grep 进行检索。"
+    );
+
+    let truncated_preview = if direction == ToolOutputDirection::Head {
+        preview
     } else {
-        format!("{summary}\n\n{hint}\n\n{preview}")
+        preview
     };
 
-    Ok(ToolOutput::truncated(message))
+    Ok(TruncateResult {
+        content: truncated_preview,
+        truncated: true,
+        output_path: Some(output_path),
+        summary: Some(summary),
+    })
+}
+
+fn wrap_tool_output(
+    title: Option<&str>,
+    content: &str,
+    metadata: &JsonValue,
+    summary: Option<&str>,
+    truncated: bool,
+    output_path: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("<tool_output>\n");
+    if let Some(title) = title {
+        out.push_str("<title>");
+        out.push_str(title);
+        out.push_str("</title>\n");
+    }
+    if let Some(summary) = summary {
+        out.push_str("<summary>");
+        out.push_str(summary);
+        out.push_str("</summary>\n");
+    }
+    if truncated {
+        out.push_str("<truncated>true</truncated>\n");
+        if let Some(path) = output_path {
+            out.push_str("<output_path>");
+            out.push_str(path);
+            out.push_str("</output_path>\n");
+        }
+    }
+    out.push_str("<content>\n");
+    out.push_str(content);
+    out.push_str("\n</content>\n");
+    let metadata_json = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string());
+    out.push_str("<metadata>");
+    out.push_str(&metadata_json);
+    out.push_str("</metadata>\n");
+    out.push_str("</tool_output>");
+    out
+}
+
+async fn persist_tool_output(ctx: &ToolContext, content: &str) -> ZeroBotResult<String> {
+    let dir = ctx.cwd.join(".zerobot").join("tool-output");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|err| io_error("创建工具输出目录", &dir, &err))?;
+    let filename = format!(
+        "tool_output_{}_{}.txt",
+        Utc::now().timestamp(),
+        Uuid::new_v4()
+    );
+    let path = dir.join(filename);
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|err| io_error("写入工具输出", &path, &err))?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 struct ReadTool;
 
 #[derive(Deserialize)]
 struct ReadArgs {
-    path: String,
+    #[serde(rename = "filePath", alias = "path")]
+    file_path: String,
     #[serde(default)]
     offset: Option<usize>,
     #[serde(default)]
@@ -603,50 +776,173 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "读取文件内容"
+        "读取文件或目录内容（1-indexed 行号）"
     }
 
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径"},
-                "offset": {"type": "integer", "description": "起始行号（从 0 开始）"},
-                "limit": {"type": "integer", "description": "返回的最大行数"}
+                "filePath": {"type": "string", "description": "文件或目录路径（建议使用绝对路径）"},
+                "offset": {"type": "integer", "description": "起始行号（从 1 开始）"},
+                "limit": {"type": "integer", "description": "返回的最大行数（默认 2000）"}
             },
-            "required": ["path"]
+            "required": ["filePath"]
         })
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: ReadArgs = serde_json::from_value(args).map_err(param_error)?;
-        let path = ctx.resolve_path(&args.path)?;
-        let content = tokio::fs::read_to_string(&path)
+        let path = ctx.resolve_path(&args.file_path)?;
+        let offset = args.offset.unwrap_or(1);
+        let limit = args.limit.unwrap_or(2000);
+        if offset == 0 {
+            return Err(ZeroBotError::Tool("offset 必须从 1 开始".to_string()));
+        }
+        if limit == 0 {
+            return Err(ZeroBotError::Tool("limit 必须大于 0".to_string()));
+        }
+
+        let metadata = tokio::fs::metadata(&path)
             .await
             .map_err(|err| io_error("读取文件", &path, &err))?;
-        let offset = args.offset.unwrap_or(0);
-        let limit = args.limit.unwrap_or(usize::MAX);
-        if offset == 0 && limit == usize::MAX {
-            let mut output = content;
-            let reminders = instruction::resolve_nearby_instructions(&ctx.session_id, &path);
-            if !reminders.is_empty() {
-                let reminder_text = reminders
-                    .iter()
-                    .map(|item| item.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                output.push_str("\n\n<system-reminder>\n");
-                output.push_str(&reminder_text);
-                output.push_str("\n</system-reminder>");
+
+        let title = path
+            .strip_prefix(&ctx.cwd)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+
+        if metadata.is_dir() {
+            let mut entries = Vec::new();
+            let mut dir = tokio::fs::read_dir(&path)
+                .await
+                .map_err(|err| io_error("读取目录", &path, &err))?;
+            while let Some(entry) = dir
+                .next_entry()
+                .await
+                .map_err(|err| io_error("读取目录项", &path, &err))?
+            {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let file_type = entry.file_type().await.map_err(|err| {
+                    io_error("读取目录项", &entry.path(), &err)
+                })?;
+                if file_type.is_dir() {
+                    entries.push(format!("{name}/"));
+                } else {
+                    entries.push(name);
+                }
             }
-            return Ok(ToolOutput::new(output));
+            entries.sort();
+
+            if entries.is_empty() {
+                if offset > 1 {
+                    return Err(ZeroBotError::Tool(
+                        "offset 超出范围（目录为空）".to_string(),
+                    ));
+                }
+            } else if offset > entries.len() {
+                return Err(ZeroBotError::Tool(format!(
+                    "offset 超出范围（目录共有 {} 项）",
+                    entries.len()
+                )));
+            }
+            let start = offset.saturating_sub(1);
+            let end = (start + limit).min(entries.len());
+            let slice = entries[start..end].to_vec();
+            let truncated = end < entries.len();
+            let summary = if truncated {
+                format!(
+                    "Showing entries {}-{} of {}. Use offset={} to continue.",
+                    offset,
+                    offset + slice.len().saturating_sub(1),
+                    entries.len(),
+                    end + 1
+                )
+            } else {
+                format!("Directory entries: {}", entries.len())
+            };
+
+            let mut body = String::new();
+            body.push_str(&format!(
+                "<path>{}</path>\n<type>directory</type>\n<entries>\n",
+                path.display()
+            ));
+            body.push_str(&slice.join("\n"));
+            body.push_str("\n</entries>\n");
+            body.push_str(&format!("<summary>{summary}</summary>"));
+
+            return Ok(
+                ToolOutput::new(body)
+                    .with_title(title)
+                    .with_metadata(json!({
+                        "path": path.to_string_lossy(),
+                        "type": "directory",
+                        "offset": offset,
+                        "limit": limit,
+                        "total_entries": entries.len(),
+                        "truncated": truncated
+                    })),
+            );
         }
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                return Err(ZeroBotError::Tool("无法读取二进制文件".to_string()))
+            }
+            Err(err) => return Err(io_error("读取文件", &path, &err)),
+        };
+
         let lines: Vec<&str> = content.lines().collect();
-        if offset >= lines.len() {
-            return Ok(ToolOutput::new(""));
+        if lines.is_empty() {
+            if offset > 1 {
+                return Err(ZeroBotError::Tool(
+                    "offset 超出范围（文件为空）".to_string(),
+                ));
+            }
+        } else if offset > lines.len() {
+            return Err(ZeroBotError::Tool(format!(
+                "offset 超出范围（文件共有 {} 行）",
+                lines.len()
+            )));
         }
-        let end = offset.saturating_add(limit).min(lines.len());
-        let mut output = lines[offset..end].join("\n");
+        let start = offset.saturating_sub(1);
+        let end = (start + limit).min(lines.len());
+        let mut output_lines = Vec::new();
+        const MAX_LINE_LENGTH: usize = 2000;
+        for (idx, line) in lines[start..end].iter().enumerate() {
+            let mut text = line.to_string();
+            if text.chars().count() > MAX_LINE_LENGTH {
+                text = text.chars().take(MAX_LINE_LENGTH).collect::<String>()
+                    + "... (line truncated to 2000 chars)";
+            }
+            output_lines.push(format!("{}: {}", offset + idx, text));
+        }
+        let truncated = end < lines.len();
+        let summary = if lines.is_empty() {
+            "Empty file".to_string()
+        } else if truncated {
+            format!(
+                "Showing lines {}-{} of {}. Use offset={} to continue.",
+                offset,
+                offset + output_lines.len().saturating_sub(1),
+                lines.len(),
+                end + 1
+            )
+        } else {
+            format!("End of file - total {} lines", lines.len())
+        };
+
+        let mut body = String::new();
+        body.push_str(&format!(
+            "<path>{}</path>\n<type>file</type>\n<content>\n",
+            path.display()
+        ));
+        body.push_str(&output_lines.join("\n"));
+        body.push_str("\n</content>\n");
+        body.push_str(&format!("<summary>{summary}</summary>"));
+
         let reminders = instruction::resolve_nearby_instructions(&ctx.session_id, &path);
         if !reminders.is_empty() {
             let reminder_text = reminders
@@ -654,11 +950,25 @@ impl Tool for ReadTool {
                 .map(|item| item.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            output.push_str("\n\n<system-reminder>\n");
-            output.push_str(&reminder_text);
-            output.push_str("\n</system-reminder>");
+            body.push_str("\n<system-reminder>\n");
+            body.push_str(&reminder_text);
+            body.push_str("\n</system-reminder>");
         }
-        Ok(ToolOutput::new(output))
+
+        record_file_read(ctx, &path).await?;
+
+        Ok(
+            ToolOutput::new(body)
+                .with_title(title)
+                .with_metadata(json!({
+                    "path": path.to_string_lossy(),
+                    "type": "file",
+                    "offset": offset,
+                    "limit": limit,
+                    "total_lines": lines.len(),
+                    "truncated": truncated
+                })),
+        )
     }
 }
 
@@ -666,10 +976,11 @@ struct WriteTool;
 
 #[derive(Deserialize)]
 struct WriteArgs {
-    path: String,
+    #[serde(rename = "filePath", alias = "path")]
+    file_path: String,
     content: String,
     #[serde(default)]
-    append: bool,
+    append: Option<bool>,
 }
 
 #[async_trait]
@@ -679,46 +990,72 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "写入文件"
+        "写入文件（覆盖写入）"
     }
 
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径"},
+                "filePath": {"type": "string", "description": "文件路径（建议使用绝对路径）"},
                 "content": {"type": "string", "description": "写入内容"},
-                "append": {"type": "boolean", "description": "是否追加"}
             },
-            "required": ["path", "content"]
+            "required": ["filePath", "content"]
         })
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: WriteArgs = serde_json::from_value(args).map_err(param_error)?;
-        let path = ctx.resolve_path(&args.path)?;
+        if args.append.unwrap_or(false) {
+            return Err(ZeroBotError::Tool(
+                "append 已废弃，请使用 edit 或 apply_patch 完成追加".to_string(),
+            ));
+        }
+        let path = ctx.resolve_path(&args.file_path)?;
+        let existed = tokio::fs::metadata(&path).await.is_ok();
+        if existed {
+            let _ = ensure_read_before_write(ctx, &path).await?;
+        }
+        let before = if existed {
+            tokio::fs::read_to_string(&path)
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|err| io_error("创建目录", parent, &err))?;
         }
-        if args.append {
-            use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .map_err(|err| io_error("打开文件", &path, &err))?;
-            file.write_all(args.content.as_bytes())
-                .await
-                .map_err(|err| io_error("写入文件", &path, &err))?;
+        tokio::fs::write(&path, &args.content)
+            .await
+            .map_err(|err| io_error("写入文件", &path, &err))?;
+        let diff = create_patch(&before, &args.content).to_string();
+        let summary = if existed {
+            "Wrote file successfully."
         } else {
-            tokio::fs::write(&path, args.content)
-                .await
-                .map_err(|err| io_error("写入文件", &path, &err))?;
-        }
-        Ok(ToolOutput::new("写入完成"))
+            "Created file successfully."
+        };
+        let body = format!(
+            "<path>{}</path>\n<action>write</action>\n<summary>{}</summary>\n<diff>\n{}\n</diff>",
+            path.display(),
+            summary,
+            diff.trim_end()
+        );
+        Ok(
+            ToolOutput::new(body)
+                .with_title(
+                    path.strip_prefix(&ctx.cwd)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+                .with_metadata(json!({
+                    "path": path.to_string_lossy(),
+                    "existed": existed
+                })),
+        )
     }
 }
 
@@ -726,10 +1063,14 @@ struct EditTool;
 
 #[derive(Deserialize)]
 struct EditArgs {
-    path: String,
-    find: String,
-    replace: String,
+    #[serde(rename = "filePath", alias = "path")]
+    file_path: String,
+    #[serde(rename = "oldString", alias = "find")]
+    old_string: String,
+    #[serde(rename = "newString", alias = "replace")]
+    new_string: String,
     #[serde(default)]
+    #[serde(rename = "replaceAll", alias = "replace_all")]
     replace_all: bool,
 }
 
@@ -747,36 +1088,110 @@ impl Tool for EditTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "find": {"type": "string"},
-                "replace": {"type": "string"},
-                "replace_all": {"type": "boolean"}
+                "filePath": {"type": "string", "description": "要修改的文件路径"},
+                "oldString": {"type": "string", "description": "要替换的文本"},
+                "newString": {"type": "string", "description": "替换后的文本"},
+                "replaceAll": {"type": "boolean", "description": "是否替换全部匹配项"}
             },
-            "required": ["path", "find", "replace"]
+            "required": ["filePath", "oldString", "newString"]
         })
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: EditArgs = serde_json::from_value(args).map_err(param_error)?;
-        let path = ctx.resolve_path(&args.path)?;
+        let path = ctx.resolve_path(&args.file_path)?;
+        let _ = ensure_read_before_write(ctx, &path).await?;
         let mut content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|err| io_error("读取文件", &path, &err))?;
-        let count = if args.replace_all {
-            let replaced = content.replace(&args.find, &args.replace);
-            let count = content.matches(&args.find).count();
-            content = replaced;
-            count
-        } else if let Some(pos) = content.find(&args.find) {
-            content.replace_range(pos..pos + args.find.len(), &args.replace);
-            1
-        } else {
-            0
-        };
-        tokio::fs::write(&path, content)
+        if args.old_string == args.new_string {
+            return Err(ZeroBotError::Tool(
+                "oldString 与 newString 相同，未产生任何修改".to_string(),
+            ));
+        }
+        if args.old_string.is_empty() {
+            return Err(ZeroBotError::Tool("oldString 不能为空".to_string()));
+        }
+
+        let original = content.clone();
+        let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+        let old = args.old_string.replace("\r\n", "\n").replace('\r', "\n");
+        let new = args.new_string.replace("\r\n", "\n").replace('\r', "\n");
+        let old = if line_ending == "\n" { old } else { old.replace('\n', "\r\n") };
+        let new = if line_ending == "\n" { new } else { new.replace('\n', "\r\n") };
+
+        let count = content.matches(&old).count();
+        if count == 0 {
+            return Err(ZeroBotError::Tool("oldString 未找到".to_string()));
+        }
+        if !args.replace_all && count > 1 {
+            return Err(ZeroBotError::Tool(
+                "找到多个匹配项，请提供更长的 oldString 或设置 replaceAll".to_string(),
+            ));
+        }
+
+        if args.replace_all {
+            content = content.replace(&old, &new);
+        } else if let Some(pos) = content.find(&old) {
+            content.replace_range(pos..pos + old.len(), &new);
+        }
+
+        tokio::fs::write(&path, &content)
             .await
             .map_err(|err| io_error("写入文件", &path, &err))?;
-        Ok(ToolOutput::new(format!("已替换 {count} 处")))
+        let diff = create_patch(&original, &content).to_string();
+        let body = format!(
+            "<path>{}</path>\n<action>edit</action>\n<summary>Replaced {count} occurrence(s).</summary>\n<diff>\n{}\n</diff>",
+            path.display(),
+            diff.trim_end()
+        );
+        Ok(
+            ToolOutput::new(body)
+                .with_title(
+                    path.strip_prefix(&ctx.cwd)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+                .with_metadata(json!({
+                    "path": path.to_string_lossy(),
+                    "replaced": count
+                })),
+        )
+    }
+}
+
+struct ApplyPatchTool;
+
+#[derive(Deserialize)]
+struct ApplyPatchArgs {
+    #[serde(rename = "patchText", alias = "patch", alias = "patch_text")]
+    patch_text: String,
+}
+
+#[async_trait]
+impl Tool for ApplyPatchTool {
+    fn name(&self) -> &str {
+        "apply_patch"
+    }
+
+    fn description(&self) -> &str {
+        "应用补丁（*** Begin Patch 格式）"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patchText": {"type": "string", "description": "完整补丁内容（*** Begin Patch ... *** End Patch）"}
+            },
+            "required": ["patchText"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: ApplyPatchArgs = serde_json::from_value(args).map_err(param_error)?;
+        apply_patch_text(ctx, &args.patch_text).await
     }
 }
 
@@ -784,8 +1199,10 @@ struct PatchTool;
 
 #[derive(Deserialize)]
 struct PatchArgs {
-    path: String,
-    patch: String,
+    #[serde(rename = "patchText", alias = "patch")]
+    patch_text: String,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[async_trait]
@@ -795,35 +1212,455 @@ impl Tool for PatchTool {
     }
 
     fn description(&self) -> &str {
-        "应用补丁"
+        "补丁兼容工具（推荐使用 apply_patch）"
     }
 
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "patch": {"type": "string"}
+                "patchText": {"type": "string", "description": "补丁内容（*** Begin Patch ...）"},
+                "path": {"type": "string", "description": "旧版兼容：与 patch 配合的目标文件路径"}
             },
-            "required": ["path", "patch"]
+            "required": ["patchText"]
         })
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: PatchArgs = serde_json::from_value(args).map_err(param_error)?;
-        let path = ctx.resolve_path(&args.path)?;
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|err| io_error("读取文件", &path, &err))?;
-        let patch = Patch::from_str(&args.patch)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
-        let updated = diffy::apply(&content, &patch)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
-        tokio::fs::write(&path, updated)
-            .await
-            .map_err(|err| io_error("写入文件", &path, &err))?;
-        Ok(ToolOutput::new("补丁已应用"))
+        let trimmed = args.patch_text.trim_start();
+        if trimmed.starts_with("*** Begin Patch") {
+            return apply_patch_text(ctx, &args.patch_text).await;
+        }
+        if let Some(path) = args.path {
+            return apply_legacy_patch(ctx, &path, &args.patch_text).await;
+        }
+        Err(ZeroBotError::Tool(
+            "patch 需要 patchText（*** Begin Patch 格式）或旧版 path+patch".to_string(),
+        ))
     }
+}
+
+#[derive(Debug)]
+enum ApplyPatchOp {
+    Add { path: String, content: String },
+    Update {
+        path: String,
+        move_to: Option<String>,
+        hunks: Vec<ApplyPatchHunk>,
+    },
+    Delete { path: String },
+}
+
+#[derive(Debug)]
+struct ApplyPatchHunk {
+    lines: Vec<ApplyPatchLine>,
+}
+
+#[derive(Debug)]
+enum ApplyPatchLine {
+    Context(String),
+    Add(String),
+    Remove(String),
+}
+
+async fn apply_patch_text(ctx: &ToolContext, patch_text: &str) -> ZeroBotResult<ToolOutput> {
+    let ops = parse_apply_patch(patch_text)?;
+    if ops.is_empty() {
+        return Err(ZeroBotError::Tool("补丁为空".to_string()));
+    }
+
+    let mut diffs = Vec::new();
+    let mut files = Vec::new();
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+
+    for op in ops {
+        match op {
+            ApplyPatchOp::Add { path, content } => {
+                let full = resolve_relative_path(ctx, &path)?;
+                if tokio::fs::metadata(&full).await.is_ok() {
+                    return Err(ZeroBotError::Tool(format!(
+                        "文件已存在，无法 Add: {}",
+                        full.display()
+                    )));
+                }
+                if let Some(parent) = full.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|err| io_error("创建目录", parent, &err))?;
+                }
+                tokio::fs::write(&full, &content)
+                    .await
+                    .map_err(|err| io_error("写入文件", &full, &err))?;
+                let diff = create_patch("", &content).to_string();
+                let (add, del) = count_diff_changes(&diff);
+                additions += add;
+                deletions += del;
+                diffs.push(format!("## {}\n{}", full.display(), diff.trim_end()));
+                files.push(format!("{} (add)", full.display()));
+            }
+            ApplyPatchOp::Update {
+                path,
+                move_to,
+                hunks,
+            } => {
+                let full = resolve_relative_path(ctx, &path)?;
+                let _ = ensure_read_before_write(ctx, &full).await?;
+                let original = tokio::fs::read_to_string(&full)
+                    .await
+                    .map_err(|err| io_error("读取文件", &full, &err))?;
+                let updated = apply_hunks(&original, &hunks)?;
+                let target = if let Some(move_to) = move_to {
+                    resolve_relative_path(ctx, &move_to)?
+                } else {
+                    full.clone()
+                };
+                if target != full && tokio::fs::metadata(&target).await.is_ok() {
+                    return Err(ZeroBotError::Tool(format!(
+                        "目标已存在，无法 Move to: {}",
+                        target.display()
+                    )));
+                }
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|err| io_error("创建目录", parent, &err))?;
+                }
+                tokio::fs::write(&target, &updated)
+                    .await
+                    .map_err(|err| io_error("写入文件", &target, &err))?;
+                if target != full {
+                    tokio::fs::remove_file(&full)
+                        .await
+                        .map_err(|err| io_error("删除文件", &full, &err))?;
+                }
+                let diff = create_patch(&original, &updated).to_string();
+                let (add, del) = count_diff_changes(&diff);
+                additions += add;
+                deletions += del;
+                diffs.push(format!("## {}\n{}", target.display(), diff.trim_end()));
+                let label = if target != full {
+                    format!("{} (move to {})", full.display(), target.display())
+                } else {
+                    format!("{} (update)", full.display())
+                };
+                files.push(label);
+            }
+            ApplyPatchOp::Delete { path } => {
+                let full = resolve_relative_path(ctx, &path)?;
+                let _ = ensure_read_before_write(ctx, &full).await?;
+                let original = tokio::fs::read_to_string(&full)
+                    .await
+                    .map_err(|err| io_error("读取文件", &full, &err))?;
+                tokio::fs::remove_file(&full)
+                    .await
+                    .map_err(|err| io_error("删除文件", &full, &err))?;
+                let diff = create_patch(&original, "").to_string();
+                let (add, del) = count_diff_changes(&diff);
+                additions += add;
+                deletions += del;
+                diffs.push(format!("## {}\n{}", full.display(), diff.trim_end()));
+                files.push(format!("{} (delete)", full.display()));
+            }
+        }
+    }
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<summary>Applied patch to {} file(s).</summary>\n",
+        files.len()
+    ));
+    body.push_str("<files>\n");
+    body.push_str(&files.join("\n"));
+    body.push_str("\n</files>\n<diff>\n");
+    body.push_str(&diffs.join("\n\n"));
+    body.push_str("\n</diff>");
+
+    Ok(
+        ToolOutput::new(body)
+            .with_title("apply_patch")
+            .with_metadata(json!({
+                "files_changed": files.len(),
+                "additions": additions,
+                "deletions": deletions
+            })),
+    )
+}
+
+async fn apply_legacy_patch(
+    ctx: &ToolContext,
+    path: &str,
+    patch_text: &str,
+) -> ZeroBotResult<ToolOutput> {
+    let full = ctx.resolve_path(path)?;
+    let _ = ensure_read_before_write(ctx, &full).await?;
+    let content = tokio::fs::read_to_string(&full)
+        .await
+        .map_err(|err| io_error("读取文件", &full, &err))?;
+    let patch = Patch::from_str(patch_text).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+    let updated = diffy::apply(&content, &patch)
+        .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+    tokio::fs::write(&full, &updated)
+        .await
+        .map_err(|err| io_error("写入文件", &full, &err))?;
+    let diff = create_patch(&content, &updated).to_string();
+    let (additions, deletions) = count_diff_changes(&diff);
+    let body = format!(
+        "<summary>Applied legacy patch.</summary>\n<diff>\n{}\n</diff>",
+        diff.trim_end()
+    );
+    Ok(
+        ToolOutput::new(body)
+            .with_title("patch")
+            .with_metadata(json!({
+                "path": full.to_string_lossy(),
+                "additions": additions,
+                "deletions": deletions
+            })),
+    )
+}
+
+fn parse_apply_patch(patch: &str) -> ZeroBotResult<Vec<ApplyPatchOp>> {
+    let normalized = patch.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+    if lines.is_empty() || lines[0].trim() != "*** Begin Patch" {
+        return Err(ZeroBotError::Tool(
+            "apply_patch 需要以 \"*** Begin Patch\" 开头".to_string(),
+        ));
+    }
+    let mut ops = Vec::new();
+    let mut i = 1usize;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        if line == "*** End Patch" {
+            break;
+        }
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            let path = path.trim().to_string();
+            if path.is_empty() {
+                return Err(ZeroBotError::Tool("Add File 缺少路径".to_string()));
+            }
+            i += 1;
+            let mut content_lines = Vec::new();
+            while i < lines.len() {
+                let line = lines[i];
+                if line.starts_with("*** ") {
+                    break;
+                }
+                if !line.starts_with('+') {
+                    return Err(ZeroBotError::Tool(
+                        "Add File 只能包含 '+' 开头的内容行".to_string(),
+                    ));
+                }
+                content_lines.push(line[1..].to_string());
+                i += 1;
+            }
+            let mut content = content_lines.join("\n");
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            ops.push(ApplyPatchOp::Add { path, content });
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            let path = path.trim().to_string();
+            if path.is_empty() {
+                return Err(ZeroBotError::Tool("Delete File 缺少路径".to_string()));
+            }
+            i += 1;
+            ops.push(ApplyPatchOp::Delete { path });
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            let path = path.trim().to_string();
+            if path.is_empty() {
+                return Err(ZeroBotError::Tool("Update File 缺少路径".to_string()));
+            }
+            i += 1;
+            let mut move_to = None;
+            if i < lines.len() {
+                if let Some(next) = lines[i].strip_prefix("*** Move to: ") {
+                    let target = next.trim().to_string();
+                    if target.is_empty() {
+                        return Err(ZeroBotError::Tool("Move to 缺少路径".to_string()));
+                    }
+                    move_to = Some(target);
+                    i += 1;
+                }
+            }
+            let mut hunks = Vec::new();
+            while i < lines.len() {
+                let line = lines[i];
+                if line.starts_with("*** ") {
+                    break;
+                }
+                if line.trim().is_empty() {
+                    i += 1;
+                    continue;
+                }
+                if !line.starts_with("@@") {
+                    return Err(ZeroBotError::Tool(format!(
+                        "Update File 需要 @@ 开头的 hunk，遇到: {line}"
+                    )));
+                }
+                i += 1;
+                let mut hunk_lines = Vec::new();
+                while i < lines.len() {
+                    let line = lines[i];
+                    if line.starts_with("@@") || line.starts_with("*** ") {
+                        break;
+                    }
+                    if line == "*** End of File" {
+                        i += 1;
+                        continue;
+                    }
+                    let mut chars = line.chars();
+                    let prefix = chars.next().ok_or_else(|| {
+                        ZeroBotError::Tool("空行不符合补丁格式".to_string())
+                    })?;
+                    let rest = chars.collect::<String>();
+                    match prefix {
+                        ' ' => hunk_lines.push(ApplyPatchLine::Context(rest)),
+                        '+' => hunk_lines.push(ApplyPatchLine::Add(rest)),
+                        '-' => hunk_lines.push(ApplyPatchLine::Remove(rest)),
+                        _ => {
+                            return Err(ZeroBotError::Tool(format!(
+                                "无效的补丁行前缀: {prefix}"
+                            )))
+                        }
+                    }
+                    i += 1;
+                }
+                if hunk_lines.is_empty() {
+                    return Err(ZeroBotError::Tool("空的 hunk".to_string()));
+                }
+                hunks.push(ApplyPatchHunk { lines: hunk_lines });
+            }
+            if hunks.is_empty() {
+                return Err(ZeroBotError::Tool("Update File 缺少 hunk".to_string()));
+            }
+            ops.push(ApplyPatchOp::Update {
+                path,
+                move_to,
+                hunks,
+            });
+            continue;
+        }
+
+        return Err(ZeroBotError::Tool(format!(
+            "未知补丁头: {line}"
+        )));
+    }
+    Ok(ops)
+}
+
+fn apply_hunks(content: &str, hunks: &[ApplyPatchHunk]) -> ZeroBotResult<String> {
+    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let normalized = content.replace("\r\n", "\n");
+    let ends_with_newline = normalized.ends_with('\n');
+    let mut lines: Vec<String> = if normalized.is_empty() {
+        Vec::new()
+    } else {
+        normalized
+            .split_terminator('\n')
+            .map(|s| s.to_string())
+            .collect()
+    };
+
+    for hunk in hunks {
+        let mut pattern = Vec::new();
+        for line in &hunk.lines {
+            match line {
+                ApplyPatchLine::Context(text) | ApplyPatchLine::Remove(text) => {
+                    pattern.push(text.as_str());
+                }
+                ApplyPatchLine::Add(_) => {}
+            }
+        }
+
+        let start = if pattern.is_empty() {
+            lines.len()
+        } else {
+            let mut found = None;
+            for idx in 0..=lines.len().saturating_sub(pattern.len()) {
+                if pattern
+                    .iter()
+                    .enumerate()
+                    .all(|(off, text)| lines.get(idx + off).map(|s| s.as_str()) == Some(*text))
+                {
+                    found = Some(idx);
+                    break;
+                }
+            }
+            found.ok_or_else(|| ZeroBotError::Tool("hunk 未匹配到目标内容".to_string()))?
+        };
+
+        let mut replacement = Vec::new();
+        let mut cursor = start;
+        for line in &hunk.lines {
+            match line {
+                ApplyPatchLine::Context(text) => {
+                    if lines.get(cursor).map(|s| s.as_str()) != Some(text.as_str()) {
+                        return Err(ZeroBotError::Tool(
+                            "hunk 内容与文件不匹配".to_string(),
+                        ));
+                    }
+                    replacement.push(text.clone());
+                    cursor += 1;
+                }
+                ApplyPatchLine::Remove(text) => {
+                    if lines.get(cursor).map(|s| s.as_str()) != Some(text.as_str()) {
+                        return Err(ZeroBotError::Tool(
+                            "hunk 内容与文件不匹配".to_string(),
+                        ));
+                    }
+                    cursor += 1;
+                }
+                ApplyPatchLine::Add(text) => replacement.push(text.clone()),
+            }
+        }
+
+        let end = start + pattern.len();
+        lines.splice(start..end, replacement);
+    }
+
+    let mut output = lines.join("\n");
+    if ends_with_newline {
+        output.push('\n');
+    }
+    if line_ending == "\r\n" {
+        output = output.replace('\n', "\r\n");
+    }
+    Ok(output)
+}
+
+fn resolve_relative_path(ctx: &ToolContext, path: &str) -> ZeroBotResult<PathBuf> {
+    let input = Path::new(path);
+    if input.is_absolute() {
+        return Err(ZeroBotError::Tool("补丁路径必须为相对路径".to_string()));
+    }
+    ctx.resolve_path(path)
+}
+
+fn count_diff_changes(diff: &str) -> (usize, usize) {
+    let mut additions = 0;
+    let mut deletions = 0;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            continue;
+        }
+        if line.starts_with('+') {
+            additions += 1;
+        } else if line.starts_with('-') {
+            deletions += 1;
+        }
+    }
+    (additions, deletions)
 }
 
 struct GlobTool;
@@ -831,6 +1668,8 @@ struct GlobTool;
 #[derive(Deserialize)]
 struct GlobArgs {
     pattern: String,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[async_trait]
@@ -847,7 +1686,8 @@ impl Tool for GlobTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string"}
+                "pattern": {"type": "string", "description": "glob 模式"},
+                "path": {"type": "string", "description": "搜索目录（默认当前工作目录）"}
             },
             "required": ["pattern"]
         })
@@ -855,16 +1695,71 @@ impl Tool for GlobTool {
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: GlobArgs = serde_json::from_value(args).map_err(param_error)?;
-        let pattern = ctx.cwd.join(&args.pattern);
+        let root = if let Some(path) = args.path.as_deref() {
+            ctx.resolve_path(path)?
+        } else {
+            ctx.cwd.clone()
+        };
+        let pattern = if Path::new(&args.pattern).is_absolute() {
+            PathBuf::from(&args.pattern)
+        } else {
+            root.join(&args.pattern)
+        };
         let mut results = Vec::new();
         for entry in glob::glob(pattern.to_string_lossy().as_ref())
             .map_err(|err| ZeroBotError::Tool(format!("glob 模式无效: {err}")))?
         {
             if let Ok(path) = entry {
-                results.push(path.to_string_lossy().to_string());
+                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    let mtime = meta
+                        .modified()
+                        .map(system_time_to_ts)
+                        .unwrap_or_default();
+                    results.push((path, mtime));
+                }
             }
         }
-        Ok(ToolOutput::new(results.join("\n")))
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+        let limit = 100usize;
+        let truncated = results.len() > limit;
+        let slice = if truncated {
+            results[..limit].to_vec()
+        } else {
+            results.clone()
+        };
+        let output_lines = slice
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let summary = if output_lines.is_empty() {
+            "No files found".to_string()
+        } else if truncated {
+            format!(
+                "Found {} files (showing first {}).",
+                results.len(),
+                limit
+            )
+        } else {
+            format!("Found {} files.", results.len())
+        };
+        let body = format!(
+            "<summary>{summary}</summary>\n<results>\n{}\n</results>",
+            output_lines.join("\n")
+        );
+        Ok(
+            ToolOutput::new(body)
+                .with_title(
+                    root.strip_prefix(&ctx.cwd)
+                        .unwrap_or(&root)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+                .with_metadata(json!({
+                    "path": root.to_string_lossy(),
+                    "count": results.len(),
+                    "truncated": truncated
+                })),
+        )
     }
 }
 
@@ -873,7 +1768,10 @@ struct GrepTool;
 #[derive(Deserialize)]
 struct GrepArgs {
     pattern: String,
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    include: Option<String>,
 }
 
 #[async_trait]
@@ -890,16 +1788,21 @@ impl Tool for GrepTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string"},
-                "path": {"type": "string"}
+                "pattern": {"type": "string", "description": "要搜索的正则表达式"},
+                "path": {"type": "string", "description": "搜索目录（默认当前工作目录）"},
+                "include": {"type": "string", "description": "包含的文件模式（如 *.rs）"}
             },
-            "required": ["pattern", "path"]
+            "required": ["pattern"]
         })
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: GrepArgs = serde_json::from_value(args).map_err(param_error)?;
-        let root = ctx.resolve_path(&args.path)?;
+        let root = if let Some(path) = args.path.as_deref() {
+            ctx.resolve_path(path)?
+        } else {
+            ctx.cwd.clone()
+        };
         let regex = Regex::new(&args.pattern)
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         if !root.exists() {
@@ -909,23 +1812,162 @@ impl Tool for GrepTool {
             )));
         }
 
-        let mut matches = Vec::new();
-        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        let include = if let Some(pattern) = args.include.as_deref() {
+            Some(
+                glob::Pattern::new(pattern)
+                    .map_err(|err| ZeroBotError::Tool(format!("include 模式无效: {err}")))?,
+            )
+        } else {
+            None
+        };
+
+        let mut matches: HashMap<PathBuf, Vec<(usize, String)>> = HashMap::new();
+        let mut total_matches = 0usize;
+        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() {
                 continue;
             }
             let path = entry.path();
+            if let Some(pattern) = include.as_ref() {
+                let relative = path.strip_prefix(&root).unwrap_or(path);
+                if !pattern.matches_path(relative) {
+                    continue;
+                }
+            }
             let content = std::fs::read_to_string(path);
             if let Ok(content) = content {
                 for (idx, line) in content.lines().enumerate() {
                     if regex.is_match(line) {
-                        matches.push(format!("{}:{}:{}", path.display(), idx + 1, line));
+                        total_matches += 1;
+                        let entry = matches.entry(path.to_path_buf()).or_default();
+                        let mut text = line.to_string();
+                        const MAX_LINE_LENGTH: usize = 2000;
+                        if text.chars().count() > MAX_LINE_LENGTH {
+                            text = text
+                                .chars()
+                                .take(MAX_LINE_LENGTH)
+                                .collect::<String>()
+                                + "...";
+                        }
+                        entry.push((idx + 1, text));
                     }
                 }
             }
         }
 
-        Ok(ToolOutput::new(matches.join("\n")))
+        if matches.is_empty() {
+            return Ok(
+                ToolOutput::new("<summary>No files found</summary>\n<results>\n</results>")
+                    .with_title(
+                        root.strip_prefix(&ctx.cwd)
+                            .unwrap_or(&root)
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                    .with_metadata(json!({
+                        "path": root.to_string_lossy(),
+                        "matches": 0,
+                        "truncated": false
+                    })),
+            );
+        }
+
+        let mut files: Vec<(PathBuf, i64)> = Vec::new();
+        for (path, _) in matches.iter() {
+            let mtime = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(system_time_to_ts)
+                .unwrap_or_default();
+            files.push((path.clone(), mtime));
+        }
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut results = Vec::new();
+        let mut shown = 0usize;
+        let limit = 100usize;
+        for (path, _) in files {
+            if shown >= limit {
+                break;
+            }
+            results.push(format!("{}:", path.display()));
+            if let Some(lines) = matches.get(&path) {
+                for (line_no, text) in lines {
+                    if shown >= limit {
+                        break;
+                    }
+                    results.push(format!("  Line {}: {}", line_no, text));
+                    shown += 1;
+                }
+            }
+            results.push(String::new());
+        }
+        let truncated = total_matches > shown;
+        let summary = if truncated {
+            format!("Found {total_matches} matches (showing first {shown}).")
+        } else {
+            format!("Found {total_matches} matches.")
+        };
+
+        let body = format!(
+            "<summary>{summary}</summary>\n<results>\n{}\n</results>",
+            results.join("\n")
+        );
+        Ok(
+            ToolOutput::new(body)
+                .with_title(
+                    root.strip_prefix(&ctx.cwd)
+                        .unwrap_or(&root)
+                        .to_string_lossy()
+                        .to_string(),
+                )
+                .with_metadata(json!({
+                    "path": root.to_string_lossy(),
+                    "matches": total_matches,
+                    "truncated": truncated
+                })),
+        )
+    }
+}
+
+struct BashTool;
+
+#[derive(Deserialize)]
+struct BashArgs {
+    command: String,
+    #[serde(default, alias = "dir")]
+    workdir: Option<String>,
+    #[serde(default, rename = "timeoutMs", alias = "timeout")]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "执行 shell 命令（支持 workdir/timeoutMs/description）"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的命令"},
+                "workdir": {"type": "string", "description": "工作目录（默认当前工作目录）"},
+                "timeoutMs": {"type": "integer", "description": "超时时间（毫秒，默认 120000）"},
+                "description": {"type": "string", "description": "对命令的简要说明"}
+            },
+            "required": ["command"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: BashArgs = serde_json::from_value(args).map_err(param_error)?;
+        run_bash_command(ctx, &args.command, args.workdir.as_deref(), args.timeout_ms, args.description.as_deref()).await
     }
 }
 
@@ -945,7 +1987,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "执行 shell 命令"
+        "兼容旧版 shell 工具（推荐使用 bash）"
     }
 
     fn parameters(&self) -> JsonValue {
@@ -961,30 +2003,83 @@ impl Tool for ShellTool {
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: ShellArgs = serde_json::from_value(args).map_err(param_error)?;
-        let dir = if let Some(dir) = args.dir {
-            ctx.resolve_path(&dir)?
-        } else {
-            ctx.cwd.clone()
-        };
-        let output = Command::new("/bin/sh")
+        run_bash_command(ctx, &args.command, args.dir.as_deref(), None, None).await
+    }
+}
+
+async fn run_bash_command(
+    ctx: &ToolContext,
+    command: &str,
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+    description: Option<&str>,
+) -> ZeroBotResult<ToolOutput> {
+    let dir = if let Some(dir) = workdir {
+        ctx.resolve_path(dir)?
+    } else {
+        ctx.cwd.clone()
+    };
+    let timeout_ms = timeout_ms.unwrap_or(120_000);
+    let output = timeout(Duration::from_millis(timeout_ms), async {
+        Command::new("/bin/sh")
             .arg("-lc")
-            .arg(args.command)
+            .arg(command)
             .current_dir(dir)
             .output()
-            .await?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if output.status.success() {
-            Ok(ToolOutput::new(stdout))
-        } else {
-            let message = if stderr.trim().is_empty() {
-                "命令执行失败".to_string()
-            } else {
-                stderr
-            };
-            Err(ZeroBotError::Tool(message))
+            .await
+    })
+    .await;
+    let (stdout, stderr, exit_code) = match output {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(-1);
+            (stdout, stderr, exit_code)
         }
-    }
+        Ok(Err(err)) => {
+            return Err(ZeroBotError::Tool(format!("命令执行失败: {err}")));
+        }
+        Err(_) => {
+            let msg = format!("命令执行超时（{} ms）", timeout_ms);
+            let body = format!(
+                "<command>{}</command>\n<exit_code>-1</exit_code>\n<stdout></stdout>\n<stderr>{}</stderr>",
+                command,
+                msg
+            );
+            return Ok(
+                ToolOutput::new(body)
+                    .with_title("bash")
+                    .with_metadata(json!({
+                        "command": command,
+                        "workdir": workdir,
+                        "timeout_ms": timeout_ms,
+                        "description": description,
+                        "exit_code": -1,
+                        "ok": false
+                    })),
+            );
+        }
+    };
+
+    let body = format!(
+        "<command>{}</command>\n<exit_code>{}</exit_code>\n<stdout>\n{}\n</stdout>\n<stderr>\n{}\n</stderr>",
+        command,
+        exit_code,
+        stdout.trim_end(),
+        stderr.trim_end()
+    );
+    Ok(
+        ToolOutput::new(body)
+            .with_title("bash")
+            .with_metadata(json!({
+                "command": command,
+                "workdir": workdir,
+                "timeout_ms": timeout_ms,
+                "description": description,
+                "exit_code": exit_code,
+                "ok": exit_code == 0
+            })),
+    )
 }
 
 struct TodoReadTool;
@@ -1186,6 +2281,14 @@ mod tests {
     use async_trait::async_trait;
     use crate::interaction::{InteractionHandler, UserInputAnswer};
 
+    fn extract_tag(content: &str, tag: &str) -> Option<String> {
+        let start_tag = format!("<{tag}>");
+        let end_tag = format!("</{tag}>");
+        let start = content.find(&start_tag)? + start_tag.len();
+        let end = content[start..].find(&end_tag)? + start;
+        Some(content[start..end].to_string())
+    }
+
     #[tokio::test]
     async fn registry_runs_builtin_tool() {
         let dir = TempDir::new().unwrap();
@@ -1193,7 +2296,7 @@ mod tests {
         let registry = ToolRegistry::with_builtin();
         let args = serde_json::json!({"path": "test.txt", "content": "hi"});
         let output = registry.run(&ctx, "write", args).await.unwrap();
-        assert_eq!(output.content, "写入完成");
+        assert!(output.content.contains("<action>write</action>"));
     }
 
     #[tokio::test]
@@ -1203,10 +2306,14 @@ mod tests {
             max_bytes: 16,
             direction: ToolOutputDirection::Head,
         };
+        let dir = TempDir::new().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
         let content = "line1\nline2\nline3\nline4";
-        let output = truncate_tool_output(content, &settings).await.unwrap();
+        let output = truncate_tool_content(&ctx, content, &settings).await.unwrap();
         assert!(output.truncated);
-        assert!(output.content.contains("已截断"));
+        assert!(output.summary.unwrap_or_default().contains("输出过长已截断"));
+        let path = output.output_path.unwrap();
+        assert!(tokio::fs::metadata(path).await.is_ok());
     }
 
     #[tokio::test]
@@ -1263,7 +2370,8 @@ mod tests {
             .run(&ctx, tool_name, serde_json::json!({"text":"hi"}))
             .await
             .unwrap();
-        assert_eq!(output.content, "ok");
+        let inner = extract_tag(&output.content, "content").unwrap_or_default();
+        assert!(inner.contains("ok"));
     }
 
     #[tokio::test]
@@ -1290,10 +2398,12 @@ mod tests {
             ]
         });
         let output = registry.run(&ctx, "todowrite", write_args).await.unwrap();
-        assert!(output.content.contains("第一步"));
+        let inner = extract_tag(&output.content, "content").unwrap_or_default();
+        assert!(inner.contains("第一步"));
 
         let output = registry.run(&ctx, "todoread", serde_json::json!({})).await.unwrap();
-        assert!(output.content.contains("第二步"));
+        let inner = extract_tag(&output.content, "content").unwrap_or_default();
+        assert!(inner.contains("第二步"));
     }
 
     #[tokio::test]
@@ -1319,6 +2429,40 @@ mod tests {
         });
         let result = registry.run(&ctx, "todowrite", write_args).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn write_requires_prior_read() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        store.init().await.unwrap();
+        let session = store.create_session("test".to_string()).await.unwrap();
+        let store = Arc::new(store);
+
+        let file_path = dir.path().join("demo.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let ctx = ToolContext::new(
+            dir.path().to_path_buf(),
+            vec![],
+            session.id.clone(),
+            Some(store),
+            None,
+        );
+        let registry = ToolRegistry::with_builtin();
+
+        let write_args = serde_json::json!({"filePath": "demo.txt", "content": "hi"});
+        let result = registry.run(&ctx, "write", write_args).await;
+        assert!(result.is_err());
+
+        let _ = registry
+            .run(&ctx, "read", serde_json::json!({"filePath": "demo.txt"}))
+            .await
+            .unwrap();
+
+        let write_args = serde_json::json!({"filePath": "demo.txt", "content": "hi"});
+        let result = registry.run(&ctx, "write", write_args).await;
+        assert!(result.is_ok());
     }
 
     struct MockInteraction {
@@ -1382,7 +2526,8 @@ mod tests {
             .run(&ctx, "request_user_input", args)
             .await
             .unwrap();
-        let parsed: UserInputResponse = serde_json::from_str(&output.content).unwrap();
+        let inner = extract_tag(&output.content, "content").unwrap_or_default();
+        let parsed: UserInputResponse = serde_json::from_str(&inner).unwrap();
         assert_eq!(parsed, response);
     }
 
@@ -1450,6 +2595,7 @@ description: 示例
             .run(&ctx, "subagent", serde_json::json!({"name":"demo","prompt":"hi"}))
             .await
             .unwrap();
-        assert_eq!(output.content, "子代理输出");
+        let inner = extract_tag(&output.content, "content").unwrap_or_default();
+        assert!(inner.contains("子代理输出"));
     }
 }
