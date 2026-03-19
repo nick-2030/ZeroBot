@@ -2180,7 +2180,7 @@ fn format_block_lines(color: DotColor, text: &str) -> Vec<Line<'static>> {
 }
 
 fn format_markdown_lines(text: &str, width: u16) -> Vec<Line<'static>> {
-    let mut lines = markdown_to_lines(text, width);
+    let mut lines = markdown_to_lines_with_thinking(text, width);
     if lines.is_empty() {
         return vec![Line::from(vec![dot_span(DotColor::White), Span::raw(" ")])];
     }
@@ -2195,6 +2195,107 @@ fn format_markdown_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         }
         spans.extend(line.spans.drain(..));
         out.push(Line::from(spans));
+    }
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThinkingSegmentKind {
+    Normal,
+    Thinking,
+}
+
+struct ThinkingSegment {
+    kind: ThinkingSegmentKind,
+    content: String,
+}
+
+fn normalize_thinking_fences(text: &str) -> String {
+    let mut out = String::new();
+    let text = text
+        .replace("<think>", "<thinking>")
+        .replace("</think>", "</thinking>");
+    let mut in_thinking = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !in_thinking {
+            if trimmed.starts_with("```thinking") || trimmed.starts_with("```analysis") {
+                in_thinking = true;
+                out.push_str("<thinking>\n");
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        } else if trimmed.starts_with("```") {
+            in_thinking = false;
+            out.push_str("</thinking>\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if in_thinking {
+        out.push_str("</thinking>\n");
+    }
+    out
+}
+
+fn split_thinking_blocks(text: &str) -> Vec<ThinkingSegment> {
+    const OPEN: &str = "<thinking>";
+    const CLOSE: &str = "</thinking>";
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find(OPEN) else {
+            if !rest.is_empty() {
+                out.push(ThinkingSegment {
+                    kind: ThinkingSegmentKind::Normal,
+                    content: rest.to_string(),
+                });
+            }
+            break;
+        };
+        let before = &rest[..start];
+        if !before.is_empty() {
+            out.push(ThinkingSegment {
+                kind: ThinkingSegmentKind::Normal,
+                content: before.to_string(),
+            });
+        }
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            out.push(ThinkingSegment {
+                kind: ThinkingSegmentKind::Normal,
+                content: rest.to_string(),
+            });
+            break;
+        };
+        let content = &after_open[..end];
+        out.push(ThinkingSegment {
+            kind: ThinkingSegmentKind::Thinking,
+            content: content.to_string(),
+        });
+        rest = &after_open[end + CLOSE.len()..];
+    }
+    out
+}
+
+fn markdown_to_lines_with_thinking(text: &str, width: u16) -> Vec<Line<'static>> {
+    let normalized = normalize_thinking_fences(text);
+    let segments = split_thinking_blocks(&normalized);
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for seg in segments {
+        match seg.kind {
+            ThinkingSegmentKind::Normal => {
+                out.extend(markdown_to_lines(&seg.content, width));
+            }
+            ThinkingSegmentKind::Thinking => {
+                out.extend(format_thinking_block_lines(&seg.content, width));
+            }
+        }
     }
     out
 }
@@ -2498,6 +2599,79 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         lines.pop();
     }
     lines
+}
+
+fn format_thinking_block_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut content_lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    while content_lines.first().is_some_and(|s| s.trim().is_empty()) {
+        content_lines.remove(0);
+    }
+    while content_lines.last().is_some_and(|s| s.trim().is_empty()) {
+        content_lines.pop();
+    }
+    if content_lines.is_empty() {
+        content_lines.push("（无思考内容）".to_string());
+    }
+
+    let mut content_width = 1usize;
+    for line in &content_lines {
+        content_width = content_width.max(UnicodeWidthStr::width(line.as_str()));
+    }
+
+    let mut box_width = width.saturating_sub(6) as usize;
+    if box_width < 12 {
+        box_width = 12;
+    }
+    let inner_width = box_width.saturating_sub(2);
+    let content_limit = inner_width.saturating_sub(2);
+    let content_width = content_width.min(content_limit.max(1));
+
+    let border_style = Style::default().fg(BORDER_COLOR).bg(COLOR_PANEL_BG);
+    let title_style = Style::default()
+        .fg(COLOR_ACCENT_DIM)
+        .bg(COLOR_PANEL_BG)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(COLOR_MUTED).bg(COLOR_PANEL_BG);
+
+    let label = " 思考 ";
+    let mut label_text = label.to_string();
+    let mut label_width = UnicodeWidthStr::width(label_text.as_str());
+    if label_width > inner_width {
+        label_text = truncate_to_width(&label_text, inner_width);
+        label_width = UnicodeWidthStr::width(label_text.as_str());
+    }
+    let dash_total = inner_width.saturating_sub(label_width);
+    let left_dash = dash_total / 2;
+    let right_dash = dash_total - left_dash;
+
+    let mut out = Vec::new();
+    let mut top = Vec::new();
+    top.push(Span::styled("╭", border_style));
+    top.push(Span::styled("─".repeat(left_dash), border_style));
+    top.push(Span::styled(label_text, title_style));
+    top.push(Span::styled("─".repeat(right_dash), border_style));
+    top.push(Span::styled("╮", border_style));
+    out.push(Line::from(top));
+
+    for line in content_lines {
+        let trimmed = truncate_to_width(&line, content_limit);
+        let trimmed_width = UnicodeWidthStr::width(trimmed.as_str());
+        let pad = content_limit.saturating_sub(trimmed_width);
+        let mut spans = Vec::new();
+        spans.push(Span::styled("│", border_style));
+        spans.push(Span::styled(" ", border_style));
+        spans.push(Span::styled(trimmed, text_style));
+        spans.push(Span::styled(" ".repeat(pad), text_style));
+        spans.push(Span::styled(" ", border_style));
+        spans.push(Span::styled("│", border_style));
+        out.push(Line::from(spans));
+    }
+
+    out.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(inner_width)),
+        border_style,
+    )));
+    out
 }
 
 fn render_table_lines(
