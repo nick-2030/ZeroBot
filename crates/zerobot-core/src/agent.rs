@@ -112,6 +112,9 @@ impl Agent {
                 created_at: Utc::now().timestamp(),
             })
             .await?;
+        let _ = self
+            .maybe_record_user_summary(session_id, &input_text)
+            .await?;
 
         let instruction_sources = crate::instruction::system_sources(&self.settings, &self.cwd);
         let url_instructions = crate::instruction::fetch_url_instructions(&instruction_sources.urls).await;
@@ -304,6 +307,9 @@ impl Agent {
                         })
                         .await?;
                     last_response = msg.content.clone();
+                    let _ = self
+                        .maybe_record_session_brief(session_id, &msg.content)
+                        .await;
                     if !had_delta {
                         self.emit(
                             &events,
@@ -355,6 +361,9 @@ impl Agent {
                     created_at: Utc::now().timestamp(),
                 })
                 .await?;
+            let _ = self
+                .maybe_record_session_brief(session_id, &msg.content)
+                .await;
             if !content.is_empty() {
                 last_response = msg.content.clone();
                 if !had_delta {
@@ -511,6 +520,74 @@ impl Agent {
         }
         self.store.append_message(message.clone()).await?;
         Ok(message)
+    }
+
+    async fn maybe_record_session_brief(
+        &self,
+        session_id: &str,
+        assistant_content: &str,
+    ) -> ZeroBotResult<()> {
+        let session = match self.store.get_session(session_id).await? {
+            Some(session) => session,
+            None => return Ok(()),
+        };
+
+        let mut first_ai = None;
+        if session.first_ai_message.is_none() && !assistant_content.trim().is_empty() {
+            first_ai = Some(assistant_content.trim().to_string());
+        }
+
+        let mut summary = None;
+        if session.summary.is_none() {
+            if let Some(user) = self
+                .store
+                .list_messages(session_id)
+                .await?
+                .into_iter()
+                .find(|msg| matches!(msg.role, MessageRole::User) && !msg.content.trim().is_empty())
+            {
+                summary = Some(self.summarize_first_user(&user.content));
+            }
+        }
+
+        if first_ai.is_some() || summary.is_some() {
+            self.store
+                .update_session_brief(
+                    session_id,
+                    first_ai.as_deref(),
+                    summary.as_deref(),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn maybe_record_user_summary(
+        &self,
+        session_id: &str,
+        user_content: &str,
+    ) -> ZeroBotResult<()> {
+        let session = match self.store.get_session(session_id).await? {
+            Some(session) => session,
+            None => return Ok(()),
+        };
+        if session.summary.is_some() {
+            return Ok(());
+        }
+        let summary = self.summarize_first_user(user_content);
+        self.store
+            .update_session_brief(session_id, None, Some(&summary))
+            .await?;
+        Ok(())
+    }
+
+    fn summarize_first_user(&self, content: &str) -> String {
+        let mut text = content.trim().replace('\n', " ").replace('\r', " ");
+        if text.chars().count() > 20 {
+            text = text.chars().take(20).collect();
+        }
+        text
     }
 
     async fn handle_tool_call(

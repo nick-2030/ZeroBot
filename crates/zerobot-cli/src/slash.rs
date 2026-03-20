@@ -83,6 +83,12 @@ impl SlashRegistry {
                     usage: "/session list|new [title]|show <id>",
                 },
                 SlashCommandSpec {
+                    name: "resume",
+                    aliases: &[],
+                    description: "恢复历史会话",
+                    usage: "/resume [id]",
+                },
+                SlashCommandSpec {
                     name: "compact",
                     aliases: &[],
                     description: "压缩当前会话上下文",

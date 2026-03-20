@@ -34,6 +34,8 @@ struct Cli {
     model: Option<String>,
     #[arg(long)]
     cwd: Option<PathBuf>,
+    #[arg(long)]
+    resume: Option<String>,
     #[arg(long, default_value_t = false)]
     no_alt_screen: bool,
     #[command(subcommand)]
@@ -85,6 +87,10 @@ async fn main() -> Result<()> {
 
     let settings = loaded.settings.clone();
 
+    if cli.command.is_some() && cli.resume.is_some() {
+        anyhow::bail!("--resume 只能在交互模式使用");
+    }
+
     match cli.command {
         Some(Command::Exec { prompt }) => {
             run_exec(&settings, &cwd, cli.provider, cli.model, &prompt).await?;
@@ -99,7 +105,15 @@ async fn main() -> Result<()> {
             handle_provider_cmd(&settings, cmd)?;
         }
         None => {
-            run_repl(&settings, &cwd, cli.provider, cli.model, !cli.no_alt_screen).await?;
+            run_repl(
+                &settings,
+                &cwd,
+                cli.provider,
+                cli.model,
+                cli.resume,
+                !cli.no_alt_screen,
+            )
+            .await?;
         }
     }
 
@@ -134,7 +148,12 @@ async fn handle_session_cmd(settings: &Settings, cwd: &PathBuf, cmd: SessionCmd)
         SessionCmd::List => {
             let sessions = store.list_sessions().await?;
             for session in sessions {
-                println!("{}\t{}", session.id, session.title);
+                let summary = session_summary_for_display(&store, &session).await;
+                if summary.is_empty() {
+                    println!("{}  {}", session.id, session.title);
+                } else {
+                    println!("{}  {}  {}", session.id, session.title, summary);
+                }
             }
         }
         SessionCmd::Show { id } => {
@@ -258,6 +277,7 @@ async fn run_repl(
     cwd: &PathBuf,
     provider_override: Option<String>,
     model_override: Option<String>,
+    resume_id: Option<String>,
     use_alt_screen: bool,
 ) -> Result<()> {
     let workspace_root = resolve_workspace_root(cwd);
@@ -265,15 +285,24 @@ async fn run_repl(
     let store = SqliteSessionStore::new(db_path).await?;
     store.init().await?;
     let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
-    let session = create_session_with_hooks(
-        &store,
-        &hooks,
-        "交互会话".to_string(),
-        None,
-        zerobot_core::session::SessionKind::Main,
-    )
-    .await?;
-    let _log_guard = init_logging_with_stdout(settings, Some(&session.id), false)?;
+    let session_id = if let Some(resume) = resume_id.clone() {
+        let exists = store
+            .get_session(&resume)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("会话不存在: {resume}"))?;
+        exists.id
+    } else {
+        create_session_with_hooks(
+            &store,
+            &hooks,
+            "交互会话".to_string(),
+            None,
+            zerobot_core::session::SessionKind::Main,
+        )
+        .await?
+        .id
+    };
+    let _log_guard = init_logging_with_stdout(settings, Some(&session_id), false)?;
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
     let approvals = store.list_tool_approvals().await.unwrap_or_default();
@@ -310,23 +339,30 @@ async fn run_repl(
         tool_approvals.clone(),
     ));
     let provider_id = resolve_provider_id(settings, provider_override.as_deref());
-    tui::run_tui(
+    let final_session_id = tui::run_tui(
         settings.clone(),
         cwd.clone(),
-        session.id.clone(),
+        session_id.clone(),
         store.clone(),
         tools.clone(),
         provider_factory.clone(),
         model.clone(),
         provider_id,
         hooks.clone(),
+        resume_id.is_some(),
         use_alt_screen,
         provider_state.clone(),
         tool_approvals.clone(),
     )
     .await?;
 
-    end_session_with_hooks(&hooks, &session.id).await;
+    let messages = store.list_messages(&final_session_id).await?;
+    if messages.is_empty() {
+        store.delete_session(&final_session_id).await?;
+    } else {
+        end_session_with_hooks(&hooks, &final_session_id).await;
+        println!("恢复本会话: zerobot --resume {}", final_session_id);
+    }
     Ok(())
 }
 
@@ -407,6 +443,29 @@ fn resolve_api_key(api_key: Option<String>, api_key_env: Option<String>, provide
         _ => "OPENAI_API_KEY",
     };
     std::env::var(env_name).unwrap_or_default()
+}
+
+async fn session_summary_for_display(
+    store: &SqliteSessionStore,
+    session: &zerobot_core::session::Session,
+) -> String {
+    if let Ok(messages) = store.list_messages(&session.id).await {
+        if let Some(first) = messages
+            .into_iter()
+            .find(|msg| matches!(msg.role, zerobot_core::session::MessageRole::User) && !msg.content.trim().is_empty())
+        {
+            return summarize_user_message(&first.content);
+        }
+    }
+    session.summary.clone().unwrap_or_default()
+}
+
+fn summarize_user_message(content: &str) -> String {
+    let mut text = content.trim().replace('\n', " ").replace('\r', " ");
+    if text.chars().count() > 20 {
+        text = text.chars().take(20).collect();
+    }
+    text
 }
 
 #[cfg(test)]

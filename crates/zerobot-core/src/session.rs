@@ -19,6 +19,10 @@ pub struct Session {
     pub created_at: i64,
     pub updated_at: i64,
     pub archived_at: Option<i64>,
+    #[serde(default)]
+    pub first_ai_message: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,6 +141,13 @@ pub trait SessionStore: Send + Sync {
     async fn set_todos(&self, session_id: &str, todos: &[TodoItem]) -> ZeroBotResult<()>;
     async fn list_tool_approvals(&self) -> ZeroBotResult<Vec<String>>;
     async fn insert_tool_approval(&self, key: &str) -> ZeroBotResult<()>;
+    async fn update_session_brief(
+        &self,
+        session_id: &str,
+        first_ai_message: Option<&str>,
+        summary: Option<&str>,
+    ) -> ZeroBotResult<()>;
+    async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()>;
 }
 
 #[derive(Clone)]
@@ -179,7 +190,9 @@ impl SessionStore for SqliteSessionStore {
                 kind TEXT NOT NULL DEFAULT 'main',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                archived_at INTEGER
+                archived_at INTEGER,
+                first_ai_message TEXT,
+                summary TEXT
             );
             "#,
         )
@@ -190,6 +203,12 @@ impl SessionStore for SqliteSessionStore {
             .execute(&self.pool)
             .await;
         let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN kind TEXT DEFAULT 'main';")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN first_ai_message TEXT;")
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE sessions ADD COLUMN summary TEXT;")
             .execute(&self.pool)
             .await;
 
@@ -333,6 +352,8 @@ impl SessionStore for SqliteSessionStore {
             created_at: now,
             updated_at: now,
             archived_at: None,
+            first_ai_message: None,
+            summary: None,
         };
         sqlx::query(
             "INSERT INTO sessions (id, title, parent_id, kind, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -350,8 +371,8 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn get_session(&self, id: &str) -> ZeroBotResult<Option<Session>> {
-        let row = sqlx::query_as::<_, (String, String, Option<String>, String, i64, i64, Option<i64>)>(
-            "SELECT id, title, parent_id, kind, created_at, updated_at, archived_at FROM sessions WHERE id = ?",
+        let row = sqlx::query_as::<_, (String, String, Option<String>, String, i64, i64, Option<i64>, Option<String>, Option<String>)>(
+            "SELECT id, title, parent_id, kind, created_at, updated_at, archived_at, first_ai_message, summary FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -365,12 +386,14 @@ impl SessionStore for SqliteSessionStore {
             created_at: row.4,
             updated_at: row.5,
             archived_at: row.6,
+            first_ai_message: row.7,
+            summary: row.8,
         }))
     }
 
     async fn list_sessions(&self) -> ZeroBotResult<Vec<Session>> {
-        let rows = sqlx::query_as::<_, (String, String, Option<String>, String, i64, i64, Option<i64>)>(
-            "SELECT id, title, parent_id, kind, created_at, updated_at, archived_at FROM sessions ORDER BY updated_at DESC",
+        let rows = sqlx::query_as::<_, (String, String, Option<String>, String, i64, i64, Option<i64>, Option<String>, Option<String>)>(
+            "SELECT id, title, parent_id, kind, created_at, updated_at, archived_at, first_ai_message, summary FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -385,6 +408,8 @@ impl SessionStore for SqliteSessionStore {
                 created_at: row.4,
                 updated_at: row.5,
                 archived_at: row.6,
+                first_ai_message: row.7,
+                summary: row.8,
             })
             .collect())
     }
@@ -647,6 +672,42 @@ impl SessionStore for SqliteSessionStore {
         sqlx::query("INSERT OR IGNORE INTO tool_approvals (approval_key, created_at) VALUES (?, ?)")
             .bind(key)
             .bind(Utc::now().timestamp())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_session_brief(
+        &self,
+        session_id: &str,
+        first_ai_message: Option<&str>,
+        summary: Option<&str>,
+    ) -> ZeroBotResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE sessions SET
+              first_ai_message = CASE
+                WHEN first_ai_message IS NULL AND ?1 IS NOT NULL THEN ?1
+                ELSE first_ai_message
+              END,
+              summary = CASE
+                WHEN summary IS NULL AND ?2 IS NOT NULL THEN ?2
+                ELSE summary
+              END
+            WHERE id = ?3
+            "#,
+        )
+        .bind(first_ai_message)
+        .bind(summary)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()> {
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(session_id)
             .execute(&self.pool)
             .await?;
         Ok(())

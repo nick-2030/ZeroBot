@@ -34,11 +34,21 @@ use zerobot_core::interaction::{
     ToolApprovalRequest,
     ToolApprovalResponse,
     UserInputAnswer,
+    UserInputOption,
+    UserInputQuestion,
     UserInputRequest,
     UserInputResponse,
 };
 use zerobot_core::provider::{ProviderFactory, TokenUsage};
-use zerobot_core::session::{create_session_with_hooks, SessionKind, SessionStore, TodoItem, TodoStatus};
+use zerobot_core::session::{
+    create_session_with_hooks,
+    MessageRole,
+    Session,
+    SessionKind,
+    SessionStore,
+    TodoItem,
+    TodoStatus,
+};
 use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
@@ -122,6 +132,9 @@ enum UiRequest {
     ToolApproval {
         request: ToolApprovalRequest,
         respond_to: oneshot::Sender<ToolApprovalResponse>,
+    },
+    ResumeSelected {
+        session_id: String,
     },
 }
 
@@ -902,10 +915,11 @@ pub async fn run_tui(
     model: String,
     provider_id: String,
     hooks: HookManager,
+    resume: bool,
     use_alt_screen: bool,
     provider_state: Arc<StdRwLock<String>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
-) -> Result<()> {
+) -> Result<String> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     if use_alt_screen {
@@ -925,6 +939,7 @@ pub async fn run_tui(
         model,
         provider_id,
         hooks,
+        resume,
         provider_state,
         tool_approvals,
     )
@@ -954,9 +969,10 @@ async fn run_tui_inner(
     model: String,
     provider_id: String,
     hooks: HookManager,
+    resume: bool,
     provider_state: Arc<StdRwLock<String>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
-) -> Result<()> {
+) -> Result<String> {
     let slash = SlashRegistry::extended();
     let mut app = App::new(session_id.clone(), provider_id.clone(), model.clone());
     app.slash_hint = slash.hint(6);
@@ -970,12 +986,15 @@ async fn run_tui_inner(
         cols as usize,
     );
     app.push_lines(welcome);
-
-    refresh_session_state(&mut app, &store).await;
+    if resume {
+        resume_session(&mut app, &store, &session_id).await;
+    } else {
+        refresh_session_state(&mut app, &store).await;
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiRequest>();
-    let interaction: Arc<dyn InteractionHandler> = Arc::new(UiInteractionHandler { tx: ui_tx });
+    let interaction: Arc<dyn InteractionHandler> = Arc::new(UiInteractionHandler { tx: ui_tx.clone() });
     let mut runner: Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>> =
         None;
     let mut reader = EventStream::new();
@@ -1015,6 +1034,7 @@ async fn run_tui_inner(
                             &interaction,
                             &provider_state,
                             &tool_approvals,
+                            &ui_tx,
                             &tx,
                             &mut should_quit,
                         )
@@ -1029,7 +1049,7 @@ async fn run_tui_inner(
                     dirty = true;
                 }
                 Some(req) = ui_rx.recv() => {
-                    handle_ui_request(req, &mut app);
+                    handle_ui_request(req, &mut app, &store).await;
                     dirty = true;
                 }
                 result = handle => {
@@ -1071,6 +1091,7 @@ async fn run_tui_inner(
                             &interaction,
                             &provider_state,
                             &tool_approvals,
+                            &ui_tx,
                             &tx,
                             &mut should_quit,
                         )
@@ -1085,14 +1106,14 @@ async fn run_tui_inner(
                     dirty = true;
                 }
                 Some(req) = ui_rx.recv() => {
-                    handle_ui_request(req, &mut app);
+                    handle_ui_request(req, &mut app, &store).await;
                     dirty = true;
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(app.session_id.clone())
 }
 
 async fn handle_event(
@@ -1109,6 +1130,7 @@ async fn handle_event(
     interaction: &Arc<dyn InteractionHandler>,
     provider_state: &Arc<StdRwLock<String>>,
     tool_approvals: &Arc<TokioRwLock<HashSet<String>>>,
+    ui_tx: &mpsc::UnboundedSender<UiRequest>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     should_quit: &mut bool,
 ) -> Result<bool> {
@@ -1351,7 +1373,8 @@ async fn handle_event(
                                                 let mut lines = Vec::new();
                                                 lines.push("会话列表:".to_string());
                                                 for session in sessions {
-                                                    lines.push(format!("  {}\t{}", session.id, session.title));
+                                                    let summary = session_summary_for_display(store, &session).await;
+                                                    lines.push(format_session_line(&session, &summary));
                                                 }
                                                 app.push_block(DotColor::White, &lines.join("\n"));
                                             }
@@ -1438,6 +1461,69 @@ async fn handle_event(
                                         );
                                     }
                                 }
+                            }
+                            "resume" => {
+                                let target = args.split_whitespace().next().unwrap_or("");
+                                if !target.is_empty() {
+                                    resume_session(app, store, target).await;
+                                    return Ok(true);
+                                }
+
+                                let sessions = match store.list_sessions().await {
+                                    Ok(sessions) => sessions,
+                                    Err(err) => {
+                                        app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
+                                        return Ok(true);
+                                    }
+                                };
+                                if sessions.is_empty() {
+                                    app.push_block(DotColor::White, "暂无可恢复的会话");
+                                    return Ok(true);
+                                }
+
+                                let mut options = Vec::new();
+                                for session in &sessions {
+                                    let summary = session_summary_for_display(store, session).await;
+                                    options.push(UserInputOption {
+                                        id: session.id.clone(),
+                                        label: format_session_option(session, &summary),
+                                    });
+                                }
+                                let request = UserInputRequest {
+                                    id: "resume".to_string(),
+                                    title: Some("选择要恢复的会话".to_string()),
+                                    questions: vec![UserInputQuestion {
+                                        id: "session".to_string(),
+                                        prompt: "请选择会话".to_string(),
+                                        options: Some(options),
+                                    }],
+                                };
+                                let (resp_tx, resp_rx) = oneshot::channel();
+                                if ui_tx
+                                    .send(UiRequest::UserInput {
+                                        request,
+                                        respond_to: resp_tx,
+                                    })
+                                    .is_err()
+                                {
+                                    app.push_block(DotColor::Red, "无法发起恢复选择");
+                                    return Ok(true);
+                                }
+                                let ui_tx = ui_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(resp) = resp_rx.await {
+                                        if resp.cancelled {
+                                            return;
+                                        }
+                                        let selected = resp
+                                            .answers
+                                            .get("session")
+                                            .and_then(|ans| ans.option_id.clone());
+                                        if let Some(session_id) = selected {
+                                            let _ = ui_tx.send(UiRequest::ResumeSelected { session_id });
+                                        }
+                                    }
+                                });
                             }
                             "compact" => {
                                 app.push_block(DotColor::White, "开始压缩上下文...");
@@ -1641,7 +1727,11 @@ async fn handle_event(
     Ok(false)
 }
 
-fn handle_ui_request(req: UiRequest, app: &mut App) {
+async fn handle_ui_request(
+    req: UiRequest,
+    app: &mut App,
+    store: &std::sync::Arc<dyn SessionStore>,
+) {
     match req {
         UiRequest::UserInput { request, respond_to } => {
             app.enqueue_overlay(InfoOverlay::UserInput(UserInputOverlay::new(
@@ -1652,6 +1742,9 @@ fn handle_ui_request(req: UiRequest, app: &mut App) {
             app.enqueue_overlay(InfoOverlay::ToolApproval(ToolApprovalOverlay::new(
                 request, respond_to,
             )));
+        }
+        UiRequest::ResumeSelected { session_id } => {
+            resume_session(app, store, &session_id).await;
         }
     }
 }
@@ -1730,6 +1823,96 @@ async fn refresh_session_state(app: &mut App, store: &std::sync::Arc<dyn Session
     }
     if let Ok(stack) = store.get_skill_stack(&app.session_id).await {
         app.skills = stack;
+    }
+}
+
+async fn resume_session(app: &mut App, store: &std::sync::Arc<dyn SessionStore>, session_id: &str) {
+    match store.get_session(session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            app.push_block(DotColor::Red, &format!("会话不存在: {session_id}"));
+            return;
+        }
+        Err(err) => {
+            app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
+            return;
+        }
+    }
+
+    app.session_id = session_id.to_string();
+    app.output.clear();
+    app.stream_buffer.clear();
+    app.streaming = false;
+    app.scroll = 0;
+    app.stick_to_bottom = true;
+    app.status = Status::Idle;
+    app.context_used = None;
+    app.context_limit = None;
+    app.last_tool_label = None;
+    app.last_copyable_output = None;
+
+    if let Ok(messages) = store.list_messages(session_id).await {
+        for message in messages {
+            match message.role {
+                MessageRole::User => {
+                    app.push_line(user_input_line(&message.content));
+                }
+                MessageRole::Assistant => {
+                    app.push_markdown_block(&message.content);
+                    if !message.content.trim().is_empty() {
+                        app.last_copyable_output = Some(message.content.clone());
+                    }
+                }
+                MessageRole::Tool => {
+                    app.push_block(DotColor::White, &message.content);
+                }
+                MessageRole::System => {
+                    app.push_block(DotColor::White, &message.content);
+                }
+            }
+        }
+    }
+
+    refresh_session_state(app, store).await;
+    app.push_block(DotColor::White, &format!("已恢复会话: {session_id}"));
+}
+
+async fn session_summary_for_display(
+    store: &std::sync::Arc<dyn SessionStore>,
+    session: &Session,
+) -> String {
+    if let Ok(messages) = store.list_messages(&session.id).await {
+        if let Some(first) = messages
+            .into_iter()
+            .find(|msg| matches!(msg.role, MessageRole::User) && !msg.content.trim().is_empty())
+        {
+            return summarize_user_message(&first.content);
+        }
+    }
+    session.summary.clone().unwrap_or_default()
+}
+
+fn summarize_user_message(content: &str) -> String {
+    let mut text = content.trim().replace('\n', " ").replace('\r', " ");
+    if text.chars().count() > 20 {
+        text = text.chars().take(20).collect();
+    }
+    text
+}
+
+fn format_session_line(session: &Session, summary: &str) -> String {
+    if summary.is_empty() {
+        format!("  {}  {}", session.id, session.title)
+    } else {
+        format!("  {}  {}  {}", session.id, session.title, summary)
+    }
+}
+
+fn format_session_option(session: &Session, summary: &str) -> String {
+    if summary.is_empty() {
+        format!("{}  {}", session.id, session.title)
+    } else {
+        format!("{}  {}  {}", session.id, session.title, summary)
     }
 }
 
