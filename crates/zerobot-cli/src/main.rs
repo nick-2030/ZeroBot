@@ -17,6 +17,7 @@ use zerobot_core::session::{
 };
 use zerobot_core::tool::{SubagentTool, ToolRegistry};
 use zerobot_core::ZeroBotError;
+use zerobot_core::workspace::{resolve_session_db_path, resolve_workspace_root};
 
 mod tui;
 mod slash;
@@ -89,7 +90,7 @@ async fn main() -> Result<()> {
             run_exec(&settings, &cwd, cli.provider, cli.model, &prompt).await?;
         }
         Some(Command::Session { cmd }) => {
-            handle_session_cmd(&settings, cmd).await?;
+            handle_session_cmd(&settings, &cwd, cmd).await?;
         }
         Some(Command::Config { cmd }) => {
             handle_config_cmd(&loaded, cmd)?;
@@ -117,8 +118,10 @@ fn parse_overrides(values: Vec<String>) -> Result<Vec<(String, String)>> {
     Ok(overrides)
 }
 
-async fn handle_session_cmd(settings: &Settings, cmd: SessionCmd) -> Result<()> {
-    let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+async fn handle_session_cmd(settings: &Settings, cwd: &PathBuf, cmd: SessionCmd) -> Result<()> {
+    let workspace_root = resolve_workspace_root(cwd);
+    let db_path = resolve_session_db_path(&workspace_root);
+    let store = SqliteSessionStore::new(db_path).await?;
     store.init().await?;
 
     match cmd {
@@ -188,7 +191,9 @@ async fn run_exec(
     model_override: Option<String>,
     prompt: &str,
 ) -> Result<()> {
-    let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+    let workspace_root = resolve_workspace_root(cwd);
+    let db_path = resolve_session_db_path(&workspace_root);
+    let store = SqliteSessionStore::new(db_path).await?;
     store.init().await?;
     let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
     let session = create_session_with_hooks(
@@ -202,6 +207,7 @@ async fn run_exec(
     let _log_guard = init_logging(settings, Some(&session.id))?;
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
+    let approvals = store.list_tool_approvals().await.unwrap_or_default();
     let store = Arc::new(store);
     let provider_factory = {
         let settings = settings.clone();
@@ -212,7 +218,9 @@ async fn run_exec(
         })
     };
     let provider = (provider_factory)()?;
-    let tool_approvals = Arc::new(TokioRwLock::new(HashSet::new()));
+    let tool_approvals = Arc::new(TokioRwLock::new(
+        approvals.into_iter().collect::<HashSet<_>>(),
+    ));
     let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
@@ -252,7 +260,9 @@ async fn run_repl(
     model_override: Option<String>,
     use_alt_screen: bool,
 ) -> Result<()> {
-    let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+    let workspace_root = resolve_workspace_root(cwd);
+    let db_path = resolve_session_db_path(&workspace_root);
+    let store = SqliteSessionStore::new(db_path).await?;
     store.init().await?;
     let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
     let session = create_session_with_hooks(
@@ -266,6 +276,7 @@ async fn run_repl(
     let _log_guard = init_logging_with_stdout(settings, Some(&session.id), false)?;
 
     let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
+    let approvals = store.list_tool_approvals().await.unwrap_or_default();
     let store = Arc::new(store);
     let provider_state = Arc::new(StdRwLock::new(resolve_provider_id(
         settings,
@@ -282,7 +293,9 @@ async fn run_repl(
             build_provider(&settings, Some(&current)).map_err(|err| ZeroBotError::Provider(err.to_string()))
         })
     };
-    let tool_approvals = Arc::new(TokioRwLock::new(HashSet::new()));
+    let tool_approvals = Arc::new(TokioRwLock::new(
+        approvals.into_iter().collect::<HashSet<_>>(),
+    ));
     let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
@@ -394,15 +407,6 @@ fn resolve_api_key(api_key: Option<String>, api_key_env: Option<String>, provide
         _ => "OPENAI_API_KEY",
     };
     std::env::var(env_name).unwrap_or_default()
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
 }
 
 #[cfg(test)]

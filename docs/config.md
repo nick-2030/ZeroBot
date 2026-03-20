@@ -28,7 +28,7 @@
 - `default_provider`：默认提供商名称。
 - `default_model`：默认模型名称。
 - `providers`：多提供商配置表。
-- `session.db_path`：SQLite 数据库路径。
+- `session`：会话相关设置（数据库路径固定为 `~/.zerobot/state/workspaces/{workspace}/zerobot.db`，工作区映射保存在 `~/.zerobot/state/workspaces/index.yaml`）。
 - `session.max_history`：历史消息最大数量。
 - `context.max_messages`：上下文保留的最大消息条数（0 表示不限制）。
 - `context.max_chars`：上下文保留的最大字符数（0 表示不限制）。

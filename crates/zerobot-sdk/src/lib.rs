@@ -16,6 +16,7 @@ use zerobot_core::session::{
 };
 use zerobot_core::tool::{SubagentTool, ToolRegistry};
 use zerobot_core::ZeroBotError;
+use zerobot_core::workspace::{resolve_session_db_path, resolve_workspace_root};
 
 pub struct ZeroBot {
     settings: Settings,
@@ -32,8 +33,11 @@ impl ZeroBot {
         let loader = ConfigLoader::new(cwd.clone());
         let loaded = loader.load()?;
         let settings = loaded.settings;
-        let store = SqliteSessionStore::new(expand_home(&settings.session.db_path)).await?;
+        let workspace_root = resolve_workspace_root(&cwd);
+        let db_path = resolve_session_db_path(&workspace_root);
+        let store = SqliteSessionStore::new(db_path).await?;
         store.init().await?;
+        let approvals = store.list_tool_approvals().await.unwrap_or_default();
         let store = Arc::new(store);
         let model = resolve_model(&settings, None, None)?;
         let hooks = zerobot_core::hooks::HookManager::load(&settings, &cwd, None)?;
@@ -45,7 +49,9 @@ impl ZeroBot {
             hooks,
             cwd,
             model,
-            tool_approvals: Arc::new(RwLock::new(HashSet::new())),
+            tool_approvals: Arc::new(RwLock::new(
+                approvals.into_iter().collect::<HashSet<_>>(),
+            )),
         })
     }
 
@@ -253,13 +259,4 @@ fn resolve_api_key(api_key: Option<String>, api_key_env: Option<String>, provide
         _ => "OPENAI_API_KEY",
     };
     std::env::var(env_name).unwrap_or_default()
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
 }

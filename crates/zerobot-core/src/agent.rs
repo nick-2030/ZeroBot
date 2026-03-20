@@ -624,6 +624,10 @@ impl Agent {
                     ToolApprovalDecision::AllowSession => {
                         self.tool_approvals.write().await.insert(approval_key.clone());
                     }
+                    ToolApprovalDecision::AllowWorkspace => {
+                        self.tool_approvals.write().await.insert(approval_key.clone());
+                        self.store.insert_tool_approval(&approval_key).await?;
+                    }
                     ToolApprovalDecision::Deny => {
                         approved = false;
                         deny_message = Some("工具调用被拒绝".to_string());

@@ -59,6 +59,7 @@ pub struct ToolApprovalRequest {
 pub enum ToolApprovalDecision {
     AllowOnce,
     AllowSession,
+    AllowWorkspace,
     Deny,
 }
 

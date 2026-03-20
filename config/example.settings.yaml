@@ -33,8 +33,7 @@ providers:
 
 # 会话与存储
 session:
-  # 默认数据库路径
-  db_path: "~/.zerobot/state/zerobot.db"
+  # 数据库固定在 ~/.zerobot/state/workspaces/{workspace}/zerobot.db
   # 历史消息保留数量
   max_history: 200
 

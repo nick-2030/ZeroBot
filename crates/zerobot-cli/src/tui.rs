@@ -820,7 +820,7 @@ impl ToolApprovalOverlay {
                 }
             }
             KeyCode::Down => {
-                if self.selected + 1 < 3 {
+                if self.selected + 1 < 4 {
                     self.selected += 1;
                     return OverlayAction::Updated;
                 }
@@ -829,6 +829,7 @@ impl ToolApprovalOverlay {
                 let decision = match self.selected {
                     0 => ToolApprovalDecision::AllowOnce,
                     1 => ToolApprovalDecision::AllowSession,
+                    2 => ToolApprovalDecision::AllowWorkspace,
                     _ => ToolApprovalDecision::Deny,
                 };
                 self.finish(decision);
@@ -872,7 +873,7 @@ impl ToolApprovalOverlay {
                 )));
             }
         }
-        let options = ["仅本次允许", "本会话允许", "拒绝"];
+        let options = ["仅本次允许", "本会话允许", "本工作区允许", "拒绝"];
         for (idx, opt) in options.iter().enumerate() {
             let selected = idx == self.selected;
             let prefix = if selected { "▸ " } else { "  " };

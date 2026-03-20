@@ -1,4 +1,5 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::workspace::resolve_workspace_root;
 use crate::prompt::default_system_prompt;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
@@ -52,17 +53,8 @@ pub struct ProviderSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSettings {
-    #[serde(default = "default_db_path")]
-    pub db_path: String,
     #[serde(default = "default_max_history")]
     pub max_history: usize,
-}
-
-fn default_db_path() -> String {
-    default_state_dir()
-        .join("zerobot.db")
-        .to_string_lossy()
-        .to_string()
 }
 
 fn default_max_history() -> usize {
@@ -371,7 +363,6 @@ impl Default for Settings {
 impl Default for SessionSettings {
     fn default() -> Self {
         Self {
-            db_path: default_db_path(),
             max_history: default_max_history(),
         }
     }
@@ -548,7 +539,7 @@ impl ConfigLoader {
             }
         }
 
-        let project_dir = self.cwd.clone();
+        let project_dir = resolve_workspace_root(&self.cwd);
         let project_settings = project_dir.join(".zerobot").join("settings.yaml");
         let local_settings = project_dir
             .join(".zerobot")
@@ -701,11 +692,6 @@ fn merge_yaml(base: YamlValue, overlay: YamlValue) -> YamlValue {
         }
         (_, overlay) => overlay,
     }
-}
-
-fn default_state_dir() -> PathBuf {
-    let home = home_dir();
-    home.join(".zerobot").join("state")
 }
 
 fn user_settings_path() -> Option<PathBuf> {

@@ -135,6 +135,8 @@ pub trait SessionStore: Send + Sync {
     async fn clear_skill_stack(&self, session_id: &str) -> ZeroBotResult<()>;
     async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>>;
     async fn set_todos(&self, session_id: &str, todos: &[TodoItem]) -> ZeroBotResult<()>;
+    async fn list_tool_approvals(&self) -> ZeroBotResult<Vec<String>>;
+    async fn insert_tool_approval(&self, key: &str) -> ZeroBotResult<()>;
 }
 
 #[derive(Clone)]
@@ -296,6 +298,17 @@ impl SessionStore for SqliteSessionStore {
                 session_id TEXT PRIMARY KEY,
                 stack_json TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS tool_approvals (
+                approval_key TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
             );
             "#,
         )
@@ -620,6 +633,22 @@ impl SessionStore for SqliteSessionStore {
             .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_tool_approvals(&self) -> ZeroBotResult<Vec<String>> {
+        let rows = sqlx::query_as::<_, (String,)>("SELECT approval_key FROM tool_approvals")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    async fn insert_tool_approval(&self, key: &str) -> ZeroBotResult<()> {
+        sqlx::query("INSERT OR IGNORE INTO tool_approvals (approval_key, created_at) VALUES (?, ?)")
+            .bind(key)
+            .bind(Utc::now().timestamp())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

@@ -15,6 +15,7 @@ pub mod provider;
 pub mod session;
 pub mod skills;
 pub mod tool;
+pub mod workspace;
 
 pub use agent::Agent;
 pub use agents::{AgentDefinition, AgentManager};
@@ -56,3 +57,4 @@ pub use session::{
 };
 pub use skills::{format_skill_stack, SkillAction, SkillContent, SkillInfo, SkillManager, SkillStackEntry};
 pub use tool::{ToolContext, ToolRegistry};
+pub use workspace::{resolve_session_db_path, resolve_workspace_root, workspace_key};

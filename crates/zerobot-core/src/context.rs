@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::workspace::resolve_workspace_root;
 use crate::instruction;
 use crate::provider::{ProviderMessage, ProviderMessageRole};
 use crate::session::{Message, MessageRole, StoredToolCall};
@@ -291,7 +292,7 @@ fn message_to_provider(message: Message) -> ProviderMessage {
 }
 
 fn build_environment_block(model: &str, cwd: &Path) -> String {
-    let workspace = find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let workspace = resolve_workspace_root(cwd);
     let git_repo = workspace.join(".git").exists();
     let date = Local::now().format("%Y-%m-%d").to_string();
     let platform = std::env::consts::OS;
@@ -310,19 +311,7 @@ fn build_environment_block(model: &str, cwd: &Path) -> String {
     .join("\n")
 }
 
-fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        let parent = current.parent()?.to_path_buf();
-        if parent == current {
-            return None;
-        }
-        current = parent;
-    }
-}
+// workspace resolution moved to crate::workspace
 
 #[cfg(test)]
 mod tests {

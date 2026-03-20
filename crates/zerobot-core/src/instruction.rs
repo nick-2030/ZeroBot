@@ -1,4 +1,5 @@
 use crate::config::Settings;
+use crate::workspace::resolve_workspace_root;
 use glob::glob;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ pub struct InstructionSources {
 }
 
 pub fn system_sources(settings: &Settings, cwd: &Path) -> InstructionSources {
-    let root = find_workspace_root(cwd);
+    let root = resolve_workspace_root(cwd);
     let mut files = Vec::new();
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
@@ -97,7 +98,7 @@ pub async fn fetch_url_instructions(urls: &[String]) -> Vec<Instruction> {
 
 pub fn resolve_nearby_instructions(session_id: &str, filepath: &Path) -> Vec<Instruction> {
     let base = filepath.parent().unwrap_or(filepath);
-    let root = find_workspace_root(base);
+    let root = resolve_workspace_root(base);
     let mut results = Vec::new();
     let mut current = filepath.parent().map(|p| p.to_path_buf());
     while let Some(dir) = current {
@@ -190,23 +191,7 @@ fn find_instruction_in_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn find_workspace_root(start: &Path) -> PathBuf {
-    let mut current = start.to_path_buf();
-    loop {
-        if current.join(".git").exists() {
-            return current;
-        }
-        let parent = match current.parent() {
-            Some(p) => p.to_path_buf(),
-            None => break,
-        };
-        if parent == current {
-            break;
-        }
-        current = parent;
-    }
-    start.to_path_buf()
-}
+// workspace resolution moved to crate::workspace
 
 fn is_url(raw: &str) -> bool {
     raw.starts_with("http://") || raw.starts_with("https://")
