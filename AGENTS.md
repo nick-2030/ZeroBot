@@ -1,6 +1,6 @@
 # 项目知识库
 
-**生成时间:** 2026-03-17
+**生成时间:** 2026-03-20
 **提交:** N/A
 **分支:** N/A
 
@@ -25,6 +25,7 @@ ZeroBot 是一个基于 Rust 的 AI Agent 系统，提供 CLI（`zerobot-cli`）
 | 会话状态 | `crates/zerobot-core/src/session.rs` | 对话状态管理 |
 | 工具执行 | `crates/zerobot-core/src/tool.rs` | 工具定义和处理 |
 | 配置加载 | `crates/zerobot-core/src/config.rs` | 设置加载 |
+| 日志初始化 | `crates/zerobot-core/src/logging.rs` | 日志初始化与路径规则 |
 | CLI 入口 | `crates/zerobot-cli/src/main.rs` | CLI 解析和初始化 |
 | TUI 渲染 | `crates/zerobot-cli/src/tui.rs` | 终端界面 |
 | MCP 集成 | `crates/zerobot-core/src/mcp.rs` | 模型上下文协议 |
@@ -33,6 +34,7 @@ ZeroBot 是一个基于 Rust 的 AI Agent 系统，提供 CLI（`zerobot-cli`）
 - **语言:** Rust 2021 版本。
 - **配置:** YAML 格式（`.zerobot/settings.local.yaml`、`config/example.settings.yaml`）。
 - **依赖:** 使用 `tokio` 异步 runtime，`tracing` 日志。
+- **日志路径:** 按天单文件写入，位于 `~/.zerobot/logs/YYYY-MM-DD.log`。
 
 ## 命令
 ```bash
