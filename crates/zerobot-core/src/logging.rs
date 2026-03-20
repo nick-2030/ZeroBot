@@ -52,10 +52,10 @@ pub fn init_logging_with_stdout(
     Ok(LogGuard { _file: file })
 }
 
-fn build_log_path(session_id: &str) -> PathBuf {
+fn build_log_path(_session_id: &str) -> PathBuf {
     let date = Local::now().format("%Y-%m-%d").to_string();
     let base = log_root();
-    base.join(date).join(format!("{session_id}.log"))
+    base.join(format!("{date}.log"))
 }
 
 fn log_root() -> PathBuf {
