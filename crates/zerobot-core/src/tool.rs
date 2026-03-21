@@ -11,7 +11,7 @@ use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::plugin::PluginManager;
 use crate::provider::ProviderFactory;
 use crate::session::{FileReadRecord, SessionKind, SessionStore, TodoItem};
-use crate::skills::{SkillAction, SkillContent, SkillManager, SkillStackEntry};
+use crate::skills::{format_skill_summary, SkillContent, SkillManager};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use diffy::{create_patch, Patch};
@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
+use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -325,17 +326,28 @@ impl ToolRegistry {
     pub async fn with_builtin_async(
         settings: &crate::config::Settings,
         cwd: &std::path::Path,
-        store: Option<Arc<dyn SessionStore>>,
+        _store: Option<Arc<dyn SessionStore>>,
         plugins: Option<Arc<PluginManager>>,
     ) -> ZeroBotResult<Self> {
         let mut registry = Self::with_builtin();
         registry.plugins = plugins.clone();
 
         if settings.skills.enabled {
-            let store =
-                store.ok_or_else(|| ZeroBotError::Tool("Skill 需要 SessionStore".to_string()))?;
             let manager = Arc::new(SkillManager::new(settings, cwd));
-            registry.register(SkillTool { manager, store });
+            let description = match manager.discover() {
+                Ok(list) => {
+                    if list.is_empty() {
+                        "加载指定 Skill 的内容。当前没有可用 Skill。".to_string()
+                    } else {
+                        format!("加载指定 Skill 的内容。\n\n{}", format_skill_summary(&list))
+                    }
+                }
+                Err(_) => "加载指定 Skill 的内容。".to_string(),
+            };
+            registry.register(SkillTool {
+                manager,
+                description,
+            });
         }
 
         let workspace_root = crate::workspace::resolve_workspace_root(cwd);
@@ -493,13 +505,7 @@ impl Tool for SubagentTool {
         )
         .await?;
 
-        let parent_skill_hooks = self
-            .store
-            .get_skill_stack(&ctx.session_id)
-            .await?
-            .into_iter()
-            .flat_map(|entry| entry.hooks)
-            .collect::<Vec<_>>();
+        let parent_skill_hooks: Vec<crate::hooks::HookDefinition> = Vec::new();
         let start_decision = self
             .parent_hooks
             .apply_event(
@@ -562,15 +568,12 @@ impl Tool for SubagentTool {
 
 struct SkillTool {
     manager: Arc<SkillManager>,
-    store: Arc<dyn SessionStore>,
+    description: String,
 }
 
 #[derive(Deserialize)]
 struct SkillArgs {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    action: Option<SkillAction>,
+    name: String,
 }
 
 #[async_trait]
@@ -580,72 +583,100 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        "加载指定 Skill 的内容"
+        &self.description
     }
 
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Skill 名称"},
-                "action": {"type": "string", "enum": ["start", "end"], "description": "start 或 end"}
+                "name": {"type": "string", "description": "可用 Skill 名称"}
             },
-            "required": []
+            "required": ["name"]
         })
     }
 
     async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: SkillArgs =
             serde_json::from_value(args).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
-        let action = args.action.unwrap_or(SkillAction::Start);
-        match action {
-            SkillAction::Start => {
-                let name = args
-                    .name
-                    .ok_or_else(|| ZeroBotError::Tool("skill 缺少 name".to_string()))?;
-                let SkillContent { info, body } = self.manager.load(&name)?;
-                self.store
-                    .push_skill_stack(
-                        &_ctx.session_id,
-                        SkillStackEntry {
-                            name: info.name.clone(),
-                            description: info.description.clone(),
-                            path: info.path.clone(),
-                            hooks: info.hooks.clone(),
-                            started_at: chrono::Utc::now().timestamp(),
-                        },
-                    )
-                    .await?;
-                let output = format!(
-                    "<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>",
-                    info.name,
-                    info.path.display(),
-                    body
-                );
-                Ok(ToolOutput::new(output))
-            }
-            SkillAction::End => {
-                let current = self.store.get_skill_stack(&_ctx.session_id).await?;
-                if current.is_empty() {
-                    return Ok(ToolOutput::new("skill 栈为空，无需结束"));
-                }
-                let top = current.last().cloned();
-                if let Some(name) = args.name {
-                    if let Some(top) = top.as_ref() {
-                        if top.name != name {
-                            return Err(ZeroBotError::Tool(format!(
-                                "skill 栈顶为 {}，与 end 名称不一致",
-                                top.name
-                            )));
-                        }
+        let SkillContent { info, body } = match self.manager.load(&args.name) {
+            Ok(content) => content,
+            Err(ZeroBotError::Skill(_)) => {
+                let available = self
+                    .manager
+                    .discover()?
+                    .into_iter()
+                    .map(|skill| skill.name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ZeroBotError::Tool(format!(
+                    "Skill \"{}\" 未找到。可用 Skills: {}",
+                    args.name,
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available
                     }
-                }
-                let popped = self.store.pop_skill_stack(&_ctx.session_id).await?;
-                let name = popped.map(|s| s.name).unwrap_or_else(|| "未知".to_string());
-                Ok(ToolOutput::new(format!("skill 已结束: {name}")))
+                )));
             }
+            Err(err) => return Err(err),
+        };
+
+        let dir = info
+            .path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let base = Url::from_directory_path(&dir)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| format!("file://{}", dir.display()));
+        let files = sample_skill_files(&dir, 10)
+            .into_iter()
+            .map(|file| format!("<file>{}</file>", file.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let output = [
+            format!("<skill_content name=\"{}\">", info.name),
+            format!("# Skill: {}", info.name),
+            String::new(),
+            body.trim().to_string(),
+            String::new(),
+            format!("Base directory for this skill: {base}"),
+            "Relative paths in this skill (for example scripts/ and references/) are relative to this base directory.".to_string(),
+            "Note: file list is sampled.".to_string(),
+            String::new(),
+            "<skill_files>".to_string(),
+            files,
+            "</skill_files>".to_string(),
+            "</skill_content>".to_string(),
+        ]
+        .join("\n");
+
+        Ok(ToolOutput::new(output)
+            .with_title(format!("Loaded skill: {}", info.name))
+            .with_metadata(json!({
+                "name": info.name,
+                "dir": dir.to_string_lossy().to_string(),
+            })))
+    }
+}
+
+fn sample_skill_files(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name() == "SKILL.md" {
+            continue;
+        }
+        out.push(entry.path().to_path_buf());
+        if out.len() >= limit {
+            break;
         }
     }
+    out
 }
 
 struct McpToolAdapter {
@@ -2925,6 +2956,75 @@ mod tests {
         let write_args = serde_json::json!({"filePath": "demo.txt", "content": "hi"});
         let result = registry.run(&ctx, "write", write_args).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn skill_tool_loads_content_block() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join(".zerobot/skills/demo");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: demo
+description: demo skill
+---
+
+# Demo
+
+Use demo skill.
+"#,
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("scripts/helper.txt"), "ok").unwrap();
+
+        let mut settings = Settings::default();
+        settings.skills.enabled = true;
+        let registry = ToolRegistry::with_builtin_async(&settings, dir.path(), None, None)
+            .await
+            .unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
+        let output = registry
+            .run(&ctx, "skill", serde_json::json!({"name": "demo"}))
+            .await
+            .unwrap();
+        assert_eq!(output.title.as_deref(), Some("Loaded skill: demo"));
+        assert!(output.content.contains("<skill_content name=\"demo\">"));
+        assert!(output.content.contains("Base directory for this skill:"));
+        assert!(output.content.contains("<skill_files>"));
+        assert!(output.content.contains("<file>"));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_reports_available_skills_when_not_found() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join(".zerobot/skills/demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: demo
+description: demo skill
+---
+
+content
+"#,
+        )
+        .unwrap();
+
+        let mut settings = Settings::default();
+        settings.skills.enabled = true;
+        let registry = ToolRegistry::with_builtin_async(&settings, dir.path(), None, None)
+            .await
+            .unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
+        let err = registry
+            .run(&ctx, "skill", serde_json::json!({"name": "missing"}))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("未找到"));
+        assert!(text.contains("demo"));
     }
 
     struct MockInteraction {

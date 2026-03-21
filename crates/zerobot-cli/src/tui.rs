@@ -39,7 +39,6 @@ use zerobot_core::session::{
     create_session_with_hooks, MessageRole, Session, SessionKind, SessionStore, TodoItem,
     TodoStatus,
 };
-use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
 use zerobot_core::{discover_template_commands, init_prompt, render_template_prompt};
@@ -179,7 +178,6 @@ struct App {
     scroll: u16,
     stick_to_bottom: bool,
     todos: Vec<TodoItem>,
-    skills: Vec<SkillStackEntry>,
     usage: Option<TokenUsage>,
     context_used: Option<usize>,
     context_limit: Option<u32>,
@@ -231,7 +229,6 @@ impl App {
             scroll: 0,
             stick_to_bottom: true,
             todos: Vec::new(),
-            skills: Vec::new(),
             usage: None,
             context_used: None,
             context_limit: None,
@@ -457,20 +454,6 @@ impl App {
                 };
                 lines.push(Line::from(Span::styled(
                     format!("  [{status}] {}", item.content),
-                    Style::default().fg(COLOR_TEXT),
-                )));
-            }
-        }
-        if !self.skills.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "Skill 栈:",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(COLOR_ACCENT),
-            )));
-            for skill in self.skills.iter().rev().take(2) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}: {}", skill.name, skill.description),
                     Style::default().fg(COLOR_TEXT),
                 )));
             }
@@ -1962,9 +1945,6 @@ async fn handle_agent_event(
 async fn refresh_session_state(app: &mut App, store: &std::sync::Arc<dyn SessionStore>) {
     if let Ok(todos) = store.get_todos(&app.session_id).await {
         app.todos = todos;
-    }
-    if let Ok(stack) = store.get_skill_stack(&app.session_id).await {
-        app.skills = stack;
     }
 }
 

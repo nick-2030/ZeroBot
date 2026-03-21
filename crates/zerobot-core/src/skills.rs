@@ -1,23 +1,16 @@
 use crate::config::Settings;
 use crate::error::{ZeroBotError, ZeroBotResult};
-use crate::hooks::HookDefinition;
+use crate::workspace::resolve_workspace_root;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use url::Url;
 use walkdir::WalkDir;
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SkillAction {
-    Start,
-    End,
-}
 
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
-    pub hooks: Vec<HookDefinition>,
     pub path: PathBuf,
 }
 
@@ -27,27 +20,49 @@ pub struct SkillContent {
     pub body: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SkillStackEntry {
-    pub name: String,
-    pub description: String,
-    pub path: PathBuf,
-    pub hooks: Vec<HookDefinition>,
-    pub started_at: i64,
-}
-
 pub struct SkillManager {
     roots: Vec<PathBuf>,
 }
 
 impl SkillManager {
     pub fn new(settings: &Settings, cwd: &Path) -> Self {
+        let workspace_root = resolve_workspace_root(cwd);
+        let home = home_dir();
         let mut roots = Vec::new();
-        roots.push(expand_home("~/.zerobot/skills"));
-        roots.push(cwd.join(".zerobot").join("skills"));
-        for path in &settings.skills.paths {
-            roots.push(expand_home(path));
+
+        // Claude/Agents compatibility (global)
+        roots.push(home.join(".claude").join("skills"));
+        roots.push(home.join(".agents").join("skills"));
+        // ZeroBot native roots (global)
+        push_zerobot_skill_roots(&mut roots, &home.join(".zerobot"));
+
+        // Claude/Agents compatibility (project and ancestors)
+        let mut cursor = cwd;
+        loop {
+            roots.push(cursor.join(".claude").join("skills"));
+            roots.push(cursor.join(".agents").join("skills"));
+            if cursor == workspace_root {
+                break;
+            }
+            let Some(parent) = cursor.parent() else {
+                break;
+            };
+            cursor = parent;
         }
+
+        // ZeroBot native roots (workspace)
+        push_zerobot_skill_roots(&mut roots, &workspace_root.join(".zerobot"));
+
+        for path in &settings.skills.paths {
+            let expanded = expand_home(path);
+            if expanded.is_absolute() {
+                roots.push(expanded);
+            } else {
+                roots.push(cwd.join(expanded));
+            }
+        }
+
+        dedup_paths(&mut roots);
         Self { roots }
     }
 
@@ -56,7 +71,7 @@ impl SkillManager {
     }
 
     pub fn discover(&self) -> ZeroBotResult<Vec<SkillInfo>> {
-        let mut out = Vec::new();
+        let mut out = BTreeMap::<String, SkillInfo>::new();
         for root in &self.roots {
             if !root.exists() {
                 continue;
@@ -70,16 +85,18 @@ impl SkillManager {
                 }
                 let content = std::fs::read_to_string(entry.path())?;
                 if let Ok((meta, _body)) = parse_skill_file(&content) {
-                    out.push(SkillInfo {
-                        name: meta.name,
-                        description: meta.description,
-                        hooks: meta.hooks.unwrap_or_default(),
-                        path: entry.path().to_path_buf(),
-                    });
+                    out.insert(
+                        meta.name.clone(),
+                        SkillInfo {
+                            name: meta.name,
+                            description: meta.description,
+                            path: entry.path().to_path_buf(),
+                        },
+                    );
                 }
             }
         }
-        Ok(out)
+        Ok(out.into_values().collect())
     }
 
     pub fn load(&self, name: &str) -> ZeroBotResult<SkillContent> {
@@ -101,8 +118,6 @@ struct SkillFrontmatter {
     #[allow(dead_code)]
     #[serde(default)]
     metadata: HashMap<String, serde_yaml::Value>,
-    #[serde(default)]
-    hooks: Option<Vec<HookDefinition>>,
 }
 
 fn parse_skill_file(input: &str) -> ZeroBotResult<(SkillFrontmatter, String)> {
@@ -150,30 +165,55 @@ pub fn format_skill_index(skills: &[SkillInfo]) -> String {
         return "当前未发现可用的 Skill。".to_string();
     }
     let mut lines = Vec::new();
-    lines.push("可用 Skill 列表：".to_string());
+    lines.push("Skills 提供任务特定的专用流程与指令。".to_string());
+    lines.push("当任务匹配某个 Skill 的描述时，调用 skill 工具按名称加载内容。".to_string());
+    lines.push("<available_skills>".to_string());
     for skill in skills {
-        lines.push(format!("- {}：{}", skill.name, skill.description));
+        lines.push("  <skill>".to_string());
+        lines.push(format!("    <name>{}</name>", skill.name));
+        lines.push(format!(
+            "    <description>{}</description>",
+            skill.description
+        ));
+        lines.push(format!(
+            "    <location>{}</location>",
+            file_url(&skill.path)
+        ));
+        lines.push("  </skill>".to_string());
     }
-    lines.push("当需要某个 Skill 时，调用 skill 工具加载具体内容。".to_string());
+    lines.push("</available_skills>".to_string());
     lines.join("\n")
 }
 
-pub fn format_skill_stack(stack: &[SkillStackEntry]) -> String {
-    if stack.is_empty() {
-        return "当前没有进行中的 Skill。".to_string();
+pub fn format_skill_summary(skills: &[SkillInfo]) -> String {
+    if skills.is_empty() {
+        return "No skills are currently available.".to_string();
     }
     let mut lines = Vec::new();
-    lines.push("当前 Skill 栈（必须按顺序完成并调用 skill end）：".to_string());
-    for skill in stack.iter().rev() {
-        lines.push(format!(
-            "- {}：{}（{}）",
-            skill.name,
-            skill.description,
-            skill.path.display()
-        ));
+    lines.push("## Available Skills".to_string());
+    for skill in skills {
+        lines.push(format!("- **{}**: {}", skill.name, skill.description));
     }
-    lines.push("未结束的 Skill 会阻止会话停止。".to_string());
     lines.join("\n")
+}
+
+fn file_url(path: &Path) -> String {
+    Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
+fn push_zerobot_skill_roots(out: &mut Vec<PathBuf>, base: &Path) {
+    out.push(base.join("skill"));
+    out.push(base.join("skills"));
+}
+
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    paths.retain(|path| {
+        let key = path.to_string_lossy().to_string();
+        seen.insert(key)
+    });
 }
 
 #[cfg(test)]
@@ -199,26 +239,65 @@ description: 示例
     #[test]
     fn discover_and_load_skills() {
         let dir = TempDir::new().unwrap();
-        let root = dir.path().join("skills/demo");
+        let workspace = dir.path().join("workspace");
+        let cwd = workspace.join("nested/repo");
+        let extra = dir.path().join("extra");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+
+        let root = workspace.join(".zerobot/skills/zerobot-test-skill-demo-a");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("SKILL.md"),
             r#"---
-name: demo
-description: 示例
+name: zerobot-test-skill-demo-a
+description: 项目技能
 ---
 
-内容
+项目内容
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(workspace.join(".zerobot/skill/zerobot-test-skill-demo-b"))
+            .unwrap();
+        std::fs::write(
+            workspace.join(".zerobot/skill/zerobot-test-skill-demo-b/SKILL.md"),
+            r#"---
+name: zerobot-test-skill-demo-b
+description: 备用技能
+---
+
+备用内容
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(extra.join("zerobot-test-skill-python")).unwrap();
+        std::fs::write(
+            extra.join("zerobot-test-skill-python/SKILL.md"),
+            r#"---
+name: zerobot-test-skill-python
+description: Python 技能
+---
+
+py-body
 "#,
         )
         .unwrap();
 
         let mut settings = Settings::default();
-        settings.skills.paths = vec![dir.path().join("skills").to_string_lossy().to_string()];
-        let manager = SkillManager::new(&settings, Path::new("."));
+        settings.skills.paths = vec![extra.to_string_lossy().to_string()];
+        let manager = SkillManager::new(&settings, &cwd);
         let skills = manager.discover().unwrap();
-        assert_eq!(skills.len(), 1);
-        let loaded = manager.load("demo").unwrap();
-        assert_eq!(loaded.body, "内容");
+        assert!(skills
+            .iter()
+            .any(|item| item.name == "zerobot-test-skill-demo-a"));
+        assert!(skills
+            .iter()
+            .any(|item| item.name == "zerobot-test-skill-demo-b"));
+        assert!(skills
+            .iter()
+            .any(|item| item.name == "zerobot-test-skill-python"));
+        let loaded = manager.load("zerobot-test-skill-demo-a").unwrap();
+        assert_eq!(loaded.body, "项目内容");
     }
 }

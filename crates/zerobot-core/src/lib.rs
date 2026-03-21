@@ -58,8 +58,6 @@ pub use session::{
     create_session_with_hooks, end_session_with_hooks, Message, MessageRole, Session, SessionKind,
     SessionStore, SqliteSessionStore,
 };
-pub use skills::{
-    format_skill_stack, SkillAction, SkillContent, SkillInfo, SkillManager, SkillStackEntry,
-};
+pub use skills::{format_skill_summary, SkillContent, SkillInfo, SkillManager};
 pub use tool::{ToolContext, ToolRegistry, ToolRouteContext};
 pub use workspace::{resolve_session_db_path, resolve_workspace_root, workspace_key};

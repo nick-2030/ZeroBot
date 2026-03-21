@@ -8,7 +8,7 @@ use crate::interaction::{InteractionHandler, ToolApprovalDecision, ToolApprovalR
 use crate::plugin::{PluginHookWarning, PluginManager};
 use crate::provider::{Provider, ProviderEvent, ProviderRequest, ToolCall};
 use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
-use crate::skills::{format_skill_stack, SkillInfo};
+use crate::skills::SkillInfo;
 use crate::tool::{ToolContext, ToolRegistry, ToolRouteContext};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -188,14 +188,7 @@ impl Agent {
                 skill_list.as_deref(),
                 Some(&url_instruction_text),
             );
-            let skill_stack = self.store.get_skill_stack(session_id).await?;
             let mut system = context.system.unwrap_or_default();
-            if !skill_stack.is_empty() {
-                if !system.trim().is_empty() {
-                    system.push_str("\n\n");
-                }
-                system.push_str(&format_skill_stack(&skill_stack));
-            }
 
             if self.settings.context.compaction.enabled && self.settings.context.compaction.auto {
                 if let Some(limit) = context.context_limit {
@@ -540,25 +533,6 @@ impl Agent {
                     Some(&url_instruction_text),
                 )
                 .await;
-                let skill_stack = self.store.get_skill_stack(session_id).await?;
-                if !skill_stack.is_empty() {
-                    let notice = format_skill_stack(&skill_stack);
-                    let _ = self
-                        .append_message_with_hooks(Message {
-                            id: Uuid::new_v4().to_string(),
-                            session_id: session_id.to_string(),
-                            role: MessageRole::System,
-                            content: format!(
-                                "Skill 仍在执行中，请继续完成并调用 skill end。\n\n{notice}"
-                            ),
-                            summary: false,
-                            tool_call_id: None,
-                            tool_calls: None,
-                            created_at: Utc::now().timestamp(),
-                        })
-                        .await?;
-                    continue;
-                }
                 self.emit(&events, AgentEvent::Done);
                 break;
             }
@@ -1334,14 +1308,9 @@ impl Agent {
 
     async fn load_skill_hooks(
         &self,
-        session_id: &str,
+        _session_id: &str,
     ) -> ZeroBotResult<Vec<crate::hooks::HookDefinition>> {
-        let stack = self.store.get_skill_stack(session_id).await?;
-        let mut hooks = Vec::new();
-        for entry in stack {
-            hooks.extend(entry.hooks);
-        }
-        Ok(hooks)
+        Ok(Vec::new())
     }
 }
 

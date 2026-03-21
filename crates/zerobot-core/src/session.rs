@@ -1,6 +1,5 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookManager;
-use crate::skills::SkillStackEntry;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -125,11 +124,6 @@ pub trait SessionStore: Send + Sync {
         session_id: &str,
         path: &str,
     ) -> ZeroBotResult<Option<FileReadRecord>>;
-    async fn get_skill_stack(&self, session_id: &str) -> ZeroBotResult<Vec<SkillStackEntry>>;
-    async fn push_skill_stack(&self, session_id: &str, entry: SkillStackEntry)
-        -> ZeroBotResult<()>;
-    async fn pop_skill_stack(&self, session_id: &str) -> ZeroBotResult<Option<SkillStackEntry>>;
-    async fn clear_skill_stack(&self, session_id: &str) -> ZeroBotResult<()>;
     async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>>;
     async fn set_todos(&self, session_id: &str, todos: &[TodoItem]) -> ZeroBotResult<()>;
     async fn list_tool_approvals(&self) -> ZeroBotResult<Vec<String>>;
@@ -303,18 +297,6 @@ impl SessionStore for SqliteSessionStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);")
             .execute(&self.pool)
             .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS skill_stack (
-                session_id TEXT PRIMARY KEY,
-                stack_json TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(id)
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
 
         sqlx::query(
             r#"
@@ -543,60 +525,6 @@ impl SessionStore for SqliteSessionStore {
         )
     }
 
-    async fn get_skill_stack(&self, session_id: &str) -> ZeroBotResult<Vec<SkillStackEntry>> {
-        let row = sqlx::query_as::<_, (String,)>(
-            "SELECT stack_json FROM skill_stack WHERE session_id = ?",
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if let Some(row) = row {
-            let stack: Vec<SkillStackEntry> = serde_json::from_str(&row.0)
-                .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
-            Ok(stack)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    async fn push_skill_stack(
-        &self,
-        session_id: &str,
-        entry: SkillStackEntry,
-    ) -> ZeroBotResult<()> {
-        let mut stack = self.get_skill_stack(session_id).await?;
-        stack.push(entry);
-        let json = serde_json::to_string(&stack)
-            .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
-        sqlx::query("INSERT OR REPLACE INTO skill_stack (session_id, stack_json) VALUES (?, ?)")
-            .bind(session_id)
-            .bind(json)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn pop_skill_stack(&self, session_id: &str) -> ZeroBotResult<Option<SkillStackEntry>> {
-        let mut stack = self.get_skill_stack(session_id).await?;
-        let popped = stack.pop();
-        let json = serde_json::to_string(&stack)
-            .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
-        sqlx::query("INSERT OR REPLACE INTO skill_stack (session_id, stack_json) VALUES (?, ?)")
-            .bind(session_id)
-            .bind(json)
-            .execute(&self.pool)
-            .await?;
-        Ok(popped)
-    }
-
-    async fn clear_skill_stack(&self, session_id: &str) -> ZeroBotResult<()> {
-        sqlx::query("DELETE FROM skill_stack WHERE session_id = ?")
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>> {
         let rows = sqlx::query_as::<_, (String, String, String)>(
             "SELECT content, status, priority FROM todos WHERE session_id = ? ORDER BY position ASC",
@@ -823,33 +751,6 @@ mod tests {
             .unwrap();
         assert_eq!(child.parent_id, Some(parent.id));
         assert_eq!(child.kind, SessionKind::Sub);
-    }
-
-    #[tokio::test]
-    async fn skill_stack_push_pop() {
-        let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db"))
-            .await
-            .unwrap();
-        store.init().await.unwrap();
-        let session = store.create_session("test".to_string()).await.unwrap();
-        let entry = SkillStackEntry {
-            name: "demo".to_string(),
-            description: "示例".to_string(),
-            path: dir.path().join("SKILL.md"),
-            hooks: Vec::new(),
-            started_at: 0,
-        };
-        store
-            .push_skill_stack(&session.id, entry.clone())
-            .await
-            .unwrap();
-        let stack = store.get_skill_stack(&session.id).await.unwrap();
-        assert_eq!(stack.len(), 1);
-        let popped = store.pop_skill_stack(&session.id).await.unwrap().unwrap();
-        assert_eq!(popped.name, "demo");
-        let stack = store.get_skill_stack(&session.id).await.unwrap();
-        assert!(stack.is_empty());
     }
 
     #[tokio::test]
