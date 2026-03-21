@@ -251,6 +251,7 @@ impl App {
 
     fn push_line(&mut self, line: Line<'static>) {
         self.output.push(OutputItem::Lines(vec![line]));
+        self.stick_to_bottom = true;
     }
 
     fn push_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -258,6 +259,7 @@ impl App {
             return;
         }
         self.output.push(OutputItem::Lines(lines));
+        self.stick_to_bottom = true;
     }
 
     fn push_block(&mut self, color: DotColor, text: &str) {
@@ -265,10 +267,12 @@ impl App {
             color,
             text: text.to_string(),
         });
+        self.stick_to_bottom = true;
     }
 
     fn push_markdown_block(&mut self, text: &str) {
         self.output.push(OutputItem::Markdown(text.to_string()));
+        self.stick_to_bottom = true;
     }
 
     fn push_tool_output(
@@ -284,6 +288,7 @@ impl App {
             label: label.map(|s| s.to_string()),
             output: output.to_string(),
         });
+        self.stick_to_bottom = true;
     }
 
     fn append_stream_delta(&mut self, text: &str) {
@@ -300,6 +305,7 @@ impl App {
             text
         };
         self.stream_buffer.push_str(chunk);
+        self.stick_to_bottom = true;
     }
 
     fn finalize_stream(&mut self) {
@@ -313,6 +319,7 @@ impl App {
         }
         self.stream_buffer.clear();
         self.streaming = false;
+        self.stick_to_bottom = true;
     }
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
