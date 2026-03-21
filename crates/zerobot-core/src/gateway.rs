@@ -6,6 +6,7 @@ use crate::cron::{CronJob, CronService};
 use crate::error::ZeroBotResult;
 use crate::heartbeat::{HeartbeatExecuteHandler, HeartbeatNotifyHandler, HeartbeatService};
 use crate::hooks::HookManager;
+use crate::plugin::PluginManager;
 use crate::provider::ProviderFactory;
 use crate::session::{create_session_with_hooks, SessionKind, SessionStore};
 use crate::tool::{ToolRegistry, ToolRouteContext};
@@ -27,6 +28,7 @@ struct GatewayExecutor {
     provider_factory: ProviderFactory,
     model: String,
     tool_approvals: Arc<RwLock<HashSet<String>>>,
+    plugins: Option<Arc<PluginManager>>,
     outbound: mpsc::UnboundedSender<OutboundMessage>,
     sessions: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -73,6 +75,7 @@ impl GatewayExecutor {
             self.cwd.clone(),
             self.hooks.clone(),
             None,
+            self.plugins.clone(),
             self.tool_approvals.clone(),
             route,
             Some(self.outbound.clone()),
@@ -88,6 +91,7 @@ pub struct GatewayRuntime {
     cron_service: Arc<CronService>,
     heartbeat_service: HeartbeatService,
     executor: GatewayExecutor,
+    plugins: Option<Arc<PluginManager>>,
 }
 
 impl GatewayRuntime {
@@ -97,6 +101,7 @@ impl GatewayRuntime {
         store: Arc<dyn SessionStore>,
         tools: ToolRegistry,
         hooks: HookManager,
+        plugins: Option<Arc<PluginManager>>,
         provider_factory: ProviderFactory,
         model: String,
         tool_approvals: Arc<RwLock<HashSet<String>>>,
@@ -136,6 +141,7 @@ impl GatewayRuntime {
             provider_factory,
             model,
             tool_approvals,
+            plugins,
             outbound: outbound_tx.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -249,6 +255,7 @@ impl GatewayRuntime {
             channel_manager,
             cron_service,
             heartbeat_service,
+            plugins: executor.plugins.clone(),
             executor,
         })
     }
@@ -331,6 +338,9 @@ impl GatewayRuntime {
         self.heartbeat_service.stop().await;
         self.cron_service.stop().await;
         self.channel_manager.stop_all().await?;
+        if let Some(plugins) = &self.plugins {
+            plugins.shutdown().await;
+        }
         tracing::info!("gateway stopped");
         Ok(())
     }

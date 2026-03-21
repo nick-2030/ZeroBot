@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::events::AgentEvent;
+use zerobot_core::plugin::PluginManager;
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
 use zerobot_core::session::{create_session_with_hooks, Session, SessionStore, SqliteSessionStore};
 use zerobot_core::tool::{SubagentTool, ToolRegistry};
@@ -20,6 +21,7 @@ pub struct ZeroBot {
     hooks: zerobot_core::hooks::HookManager,
     cwd: PathBuf,
     model: String,
+    plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -36,7 +38,10 @@ impl ZeroBot {
         let store = Arc::new(store);
         let model = resolve_model(&settings, None, None)?;
         let hooks = zerobot_core::hooks::HookManager::load(&settings, &cwd, None)?;
-        let tools = ToolRegistry::with_builtin_async(&settings, &cwd, Some(store.clone())).await?;
+        let plugins = PluginManager::new(&settings, &cwd).await?;
+        let tools =
+            ToolRegistry::with_builtin_async(&settings, &cwd, Some(store.clone()), plugins.clone())
+                .await?;
         Ok(Self {
             settings: settings.clone(),
             store: store.clone(),
@@ -44,8 +49,15 @@ impl ZeroBot {
             hooks,
             cwd,
             model,
+            plugins,
             tool_approvals: Arc::new(RwLock::new(approvals.into_iter().collect::<HashSet<_>>())),
         })
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(plugins) = &self.plugins {
+            plugins.shutdown().await;
+        }
     }
 
     pub async fn start_session(&self, title: Option<String>) -> Result<SessionHandle> {
@@ -65,6 +77,7 @@ impl ZeroBot {
             hooks: self.hooks.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
+            plugins: self.plugins.clone(),
             tool_approvals: self.tool_approvals.clone(),
         })
     }
@@ -83,6 +96,7 @@ impl ZeroBot {
             hooks: self.hooks.clone(),
             cwd: self.cwd.clone(),
             model: self.model.clone(),
+            plugins: self.plugins.clone(),
             tool_approvals: self.tool_approvals.clone(),
         })
     }
@@ -97,6 +111,7 @@ pub struct SessionHandle {
     hooks: zerobot_core::hooks::HookManager,
     cwd: PathBuf,
     model: String,
+    plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -132,6 +147,7 @@ impl SessionHandle {
             self.cwd.clone(),
             self.hooks.clone(),
             None,
+            self.plugins.clone(),
             self.tool_approvals.clone(),
             None,
             None,
@@ -171,6 +187,7 @@ impl SessionHandle {
             self.cwd.clone(),
             self.hooks.clone(),
             None,
+            self.plugins.clone(),
             self.tool_approvals.clone(),
             None,
             None,

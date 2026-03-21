@@ -17,6 +17,7 @@ use zerobot_core::cron::{CronPayload, CronSchedule, CronScheduleKind, CronServic
 use zerobot_core::gateway::GatewayRuntime;
 use zerobot_core::heartbeat::HeartbeatService;
 use zerobot_core::logging::{init_logging, init_logging_with_stdout};
+use zerobot_core::plugin::PluginManager;
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
 use zerobot_core::session::{
     create_session_with_hooks, end_session_with_hooks, SessionStore, SqliteSessionStore,
@@ -92,6 +93,23 @@ enum ConfigCmd {
 #[derive(Subcommand)]
 enum ProviderCmd {
     List,
+    AuthMethods {
+        provider: String,
+    },
+    AuthAuthorize {
+        provider: String,
+        plugin: String,
+        method_index: usize,
+        #[arg(long = "input", value_name = "KEY=VALUE")]
+        inputs: Vec<String>,
+    },
+    AuthCallback {
+        provider: String,
+        plugin: String,
+        method_index: usize,
+        #[arg(long)]
+        code: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -179,7 +197,7 @@ async fn main() -> Result<()> {
             handle_config_cmd(&loaded, cmd)?;
         }
         Some(Command::Provider { cmd }) => {
-            handle_provider_cmd(&settings, cmd)?;
+            handle_provider_cmd(&settings, &cwd, cmd).await?;
         }
         Some(Command::Gateway) => {
             run_gateway(&settings, &cwd, cli.provider, cli.model).await?;
@@ -216,6 +234,18 @@ fn parse_overrides(values: Vec<String>) -> Result<Vec<(String, String)>> {
         }
     }
     Ok(overrides)
+}
+
+fn parse_key_values(values: Vec<String>) -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for raw in values {
+        if let Some((key, value)) = raw.split_once('=') {
+            map.insert(key.trim().to_string(), value.trim().to_string());
+        } else {
+            anyhow::bail!("键值格式错误，需使用 KEY=VALUE: {raw}");
+        }
+    }
+    Ok(map)
 }
 
 async fn handle_session_cmd(_settings: &Settings, cwd: &PathBuf, cmd: SessionCmd) -> Result<()> {
@@ -278,12 +308,68 @@ fn handle_config_cmd(loaded: &zerobot_core::config::LoadedConfig, cmd: ConfigCmd
     Ok(())
 }
 
-fn handle_provider_cmd(settings: &Settings, cmd: ProviderCmd) -> Result<()> {
+async fn handle_provider_cmd(settings: &Settings, cwd: &PathBuf, cmd: ProviderCmd) -> Result<()> {
     match cmd {
         ProviderCmd::List => {
             for (name, info) in &settings.providers {
                 println!("{}\t{}", name, info.kind);
             }
+        }
+        ProviderCmd::AuthMethods { provider } => {
+            let manager = PluginManager::new(settings, cwd).await?;
+            let Some(manager) = manager else {
+                println!("no plugin auth methods");
+                return Ok(());
+            };
+            let methods = manager.list_auth_methods(&provider).await?;
+            if methods.is_empty() {
+                println!("no plugin auth methods");
+            } else {
+                for method in methods {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        method.provider,
+                        method.plugin,
+                        method.index,
+                        method.method_type,
+                        method.label
+                    );
+                }
+            }
+            manager.shutdown().await;
+        }
+        ProviderCmd::AuthAuthorize {
+            provider,
+            plugin,
+            method_index,
+            inputs,
+        } => {
+            let manager = PluginManager::new(settings, cwd).await?;
+            let Some(manager) = manager else {
+                anyhow::bail!("插件系统未启用");
+            };
+            let parsed = parse_key_values(inputs)?;
+            let result = manager
+                .authorize(&provider, &plugin, method_index, parsed)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            manager.shutdown().await;
+        }
+        ProviderCmd::AuthCallback {
+            provider,
+            plugin,
+            method_index,
+            code,
+        } => {
+            let manager = PluginManager::new(settings, cwd).await?;
+            let Some(manager) = manager else {
+                anyhow::bail!("插件系统未启用");
+            };
+            let result = manager
+                .callback(&provider, &plugin, method_index, code)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            manager.shutdown().await;
         }
     }
     Ok(())
@@ -330,7 +416,10 @@ async fn run_exec(
     let tool_approvals = Arc::new(TokioRwLock::new(
         approvals.into_iter().collect::<HashSet<_>>(),
     ));
-    let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
+    let plugins = PluginManager::new(settings, cwd).await?;
+    let mut tools =
+        ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone()), plugins.clone())
+            .await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
         settings.clone(),
@@ -352,6 +441,7 @@ async fn run_exec(
         cwd.clone(),
         hooks.clone(),
         None,
+        plugins.clone(),
         tool_approvals.clone(),
         None,
         None,
@@ -359,6 +449,9 @@ async fn run_exec(
 
     let result = agent.run_turn(&session.id, prompt, None).await;
     end_session_with_hooks(&hooks, &session.id).await;
+    if let Some(plugins) = &plugins {
+        plugins.shutdown().await;
+    }
     let output = result?;
     println!("{output}");
     Ok(())
@@ -422,7 +515,10 @@ async fn run_repl(
     let tool_approvals = Arc::new(TokioRwLock::new(
         approvals.into_iter().collect::<HashSet<_>>(),
     ));
-    let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
+    let plugins = PluginManager::new(settings, cwd).await?;
+    let mut tools =
+        ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone()), plugins.clone())
+            .await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
         settings.clone(),
@@ -449,6 +545,7 @@ async fn run_repl(
         resume_id.is_some(),
         use_alt_screen,
         provider_state.clone(),
+        plugins.clone(),
         tool_approvals.clone(),
     )
     .await?;
@@ -459,6 +556,9 @@ async fn run_repl(
     } else {
         end_session_with_hooks(&hooks, &final_session_id).await;
         println!("恢复本会话: zerobot --resume {}", final_session_id);
+    }
+    if let Some(plugins) = &plugins {
+        plugins.shutdown().await;
     }
     Ok(())
 }
@@ -496,7 +596,10 @@ async fn run_gateway(
     let tool_approvals = Arc::new(TokioRwLock::new(
         approvals.into_iter().collect::<HashSet<_>>(),
     ));
-    let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
+    let plugins = PluginManager::new(settings, cwd).await?;
+    let mut tools =
+        ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone()), plugins.clone())
+            .await?;
     let subagent_tools = tools.clone();
     tools.register(SubagentTool::new(
         settings.clone(),
@@ -516,6 +619,7 @@ async fn run_gateway(
         store,
         tools,
         hooks,
+        plugins,
         provider_factory,
         model,
         tool_approvals,
@@ -728,8 +832,14 @@ async fn handle_heartbeat_cmd(
             let tool_approvals = Arc::new(TokioRwLock::new(
                 approvals.into_iter().collect::<HashSet<_>>(),
             ));
-            let mut tools =
-                ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
+            let plugins = PluginManager::new(settings, cwd).await?;
+            let mut tools = ToolRegistry::with_builtin_async(
+                settings,
+                cwd,
+                Some(store.clone()),
+                plugins.clone(),
+            )
+            .await?;
             let subagent_tools = tools.clone();
             tools.register(SubagentTool::new(
                 settings.clone(),
@@ -755,6 +865,7 @@ async fn handle_heartbeat_cmd(
                 let settings = settings.clone();
                 let tool_approvals = tool_approvals.clone();
                 let session_id_slot = session_id_slot.clone();
+                let plugins = plugins.clone();
                 Arc::new(move |tasks: String| {
                     let store = store.clone();
                     let tools = tools.clone();
@@ -765,6 +876,7 @@ async fn handle_heartbeat_cmd(
                     let settings = settings.clone();
                     let tool_approvals = tool_approvals.clone();
                     let session_id_slot = session_id_slot.clone();
+                    let plugins = plugins.clone();
                     let route =
                         route_target
                             .clone()
@@ -799,6 +911,7 @@ async fn handle_heartbeat_cmd(
                             cwd,
                             hooks,
                             None,
+                            plugins,
                             tool_approvals,
                             route,
                             None,
@@ -838,6 +951,9 @@ async fn handle_heartbeat_cmd(
                 println!("{content}");
             } else {
                 println!("skip");
+            }
+            if let Some(plugins) = &plugins {
+                plugins.shutdown().await;
             }
         }
     }

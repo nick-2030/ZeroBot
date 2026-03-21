@@ -186,6 +186,11 @@ impl HeartbeatService {
                 }),
             }],
             max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            headers: std::collections::HashMap::new(),
+            provider_options: serde_json::json!({}),
         };
 
         let response = provider.send(request).await?;

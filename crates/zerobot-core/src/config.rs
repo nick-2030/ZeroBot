@@ -37,6 +37,8 @@ pub struct Settings {
     pub mcp: McpSettings,
     #[serde(default)]
     pub skills: SkillsSettings,
+    #[serde(default)]
+    pub plugins: PluginsSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -404,6 +406,98 @@ pub struct SkillsSettings {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginFailureMode {
+    Open,
+    Closed,
+}
+
+fn default_plugin_failure_mode() -> PluginFailureMode {
+    PluginFailureMode::Open
+}
+
+fn default_plugin_hook_timeout_ms() -> u64 {
+    3000
+}
+
+fn default_plugin_tool_timeout_ms() -> u64 {
+    120_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginEntryConfig {
+    pub name: String,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub hook_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub failure_mode: Option<PluginFailureMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginManifest {
+    #[serde(default)]
+    pub name: String,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub hook_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub failure_mode: Option<PluginFailureMode>,
+}
+
+impl PluginManifest {
+    pub fn into_entry(self) -> PluginEntryConfig {
+        PluginEntryConfig {
+            name: self.name,
+            command: self.command,
+            env: self.env,
+            enabled: self.enabled,
+            hook_timeout_ms: self.hook_timeout_ms,
+            tool_timeout_ms: self.tool_timeout_ms,
+            failure_mode: self.failure_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginsSettings {
+    #[serde(default = "default_plugins_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<PluginEntryConfig>,
+    #[serde(default = "default_plugins_auto_enable_tools")]
+    pub auto_enable_tools: bool,
+    #[serde(default = "default_plugin_hook_timeout_ms")]
+    pub default_hook_timeout_ms: u64,
+    #[serde(default = "default_plugin_tool_timeout_ms")]
+    pub default_tool_timeout_ms: u64,
+    #[serde(default = "default_plugin_failure_mode")]
+    pub failure_mode: PluginFailureMode,
+}
+
+fn default_plugins_enabled() -> bool {
+    true
+}
+
+fn default_plugins_auto_enable_tools() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum McpServerConfig {
@@ -477,6 +571,7 @@ impl Default for Settings {
             channels: ChannelsSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
+            plugins: PluginsSettings::default(),
         }
     }
 }
@@ -637,6 +732,20 @@ impl Default for SkillsSettings {
     }
 }
 
+impl Default for PluginsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_plugins_enabled(),
+            paths: Vec::new(),
+            entries: Vec::new(),
+            auto_enable_tools: default_plugins_auto_enable_tools(),
+            default_hook_timeout_ms: default_plugin_hook_timeout_ms(),
+            default_tool_timeout_ms: default_plugin_tool_timeout_ms(),
+            failure_mode: default_plugin_failure_mode(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
     Defaults,
@@ -770,8 +879,9 @@ impl ConfigLoader {
             warnings.push("settings.local.yaml 未加入 .gitignore".to_string());
         }
 
-        let settings: Settings =
+        let mut settings: Settings =
             serde_yaml::from_value(merged).map_err(|err| ZeroBotError::Config(err.to_string()))?;
+        settings.plugins.entries = deduplicate_plugin_entries(settings.plugins.entries);
 
         Ok(LoadedConfig {
             settings,
@@ -840,12 +950,19 @@ fn set_yaml_path(target: &mut YamlValue, path: &str, value: YamlValue) -> ZeroBo
 }
 
 fn merge_yaml(base: YamlValue, overlay: YamlValue) -> YamlValue {
+    merge_yaml_at_path(base, overlay, &[])
+}
+
+fn merge_yaml_at_path(base: YamlValue, overlay: YamlValue, path: &[String]) -> YamlValue {
     match (base, overlay) {
         (YamlValue::Mapping(mut base_map), YamlValue::Mapping(overlay_map)) => {
             for (key, value) in overlay_map {
-                let entry = base_map.remove(&key);
-                let merged = if let Some(existing) = entry {
-                    merge_yaml(existing, value)
+                let key_name = key.as_str().unwrap_or_default().to_string();
+                let mut next_path = path.to_vec();
+                next_path.push(key_name);
+                let existing = base_map.remove(&key);
+                let merged = if let Some(existing) = existing {
+                    merge_yaml_at_path(existing, value, &next_path)
                 } else {
                     value
                 };
@@ -853,8 +970,26 @@ fn merge_yaml(base: YamlValue, overlay: YamlValue) -> YamlValue {
             }
             YamlValue::Mapping(base_map)
         }
+        (YamlValue::Sequence(mut base_seq), YamlValue::Sequence(overlay_seq))
+            if path.len() == 2 && path[0] == "plugins" && path[1] == "entries" =>
+        {
+            base_seq.extend(overlay_seq);
+            YamlValue::Sequence(base_seq)
+        }
         (_, overlay) => overlay,
     }
+}
+
+fn deduplicate_plugin_entries(entries: Vec<PluginEntryConfig>) -> Vec<PluginEntryConfig> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in entries.into_iter().rev() {
+        if seen.insert(entry.name.clone()) {
+            out.push(entry);
+        }
+    }
+    out.reverse();
+    out
 }
 
 fn user_settings_path() -> Option<PathBuf> {
@@ -996,5 +1131,40 @@ skills:
         assert_eq!(loaded.settings.mcp.servers[1].name(), "remote-one");
         assert!(loaded.settings.skills.enabled);
         assert_eq!(loaded.settings.skills.paths.len(), 1);
+    }
+
+    #[test]
+    fn plugin_entries_merge_and_deduplicate() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        write_file(
+            &cwd.join(".zerobot/settings.yaml"),
+            r#"
+plugins:
+  entries:
+    - name: "demo"
+      command: ["echo", "user"]
+    - name: "keep"
+      command: ["echo", "keep"]
+"#,
+        );
+        write_file(
+            &cwd.join(".zerobot/settings.local.yaml"),
+            r#"
+plugins:
+  entries:
+    - name: "demo"
+      command: ["echo", "local"]
+"#,
+        );
+        let loaded = ConfigLoader::new(cwd.to_path_buf()).load().unwrap();
+        let entries = loaded.settings.plugins.entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "keep");
+        assert_eq!(entries[1].name, "demo");
+        assert_eq!(
+            entries[1].command,
+            vec!["echo".to_string(), "local".to_string()]
+        );
     }
 }

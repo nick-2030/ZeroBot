@@ -1,9 +1,11 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
-use reqwest::Client;
+use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -49,6 +51,13 @@ pub struct ProviderRequest {
     pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default = "default_provider_options")]
+    pub provider_options: JsonValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +88,56 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+fn default_provider_options() -> JsonValue {
+    JsonValue::Object(Default::default())
+}
+
+fn insert_optional_f32(
+    map: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: Option<f32>,
+) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+fn insert_optional_u32(
+    map: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: Option<u32>,
+) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+fn merge_payload_options(payload: &mut JsonValue, options: JsonValue) {
+    let Some(overlay) = options.as_object() else {
+        return;
+    };
+    let Some(target) = payload.as_object_mut() else {
+        return;
+    };
+    for (key, value) in overlay {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn apply_headers(builder: RequestBuilder, headers: &HashMap<String, String>) -> RequestBuilder {
+    let mut req = builder;
+    for (key, value) in headers {
+        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        req = req.header(name, value);
+    }
+    req
 }
 
 #[async_trait]
@@ -141,9 +200,21 @@ impl Provider for OpenAIProvider {
             return Err(ZeroBotError::Provider("OpenAI API Key 为空".to_string()));
         }
 
+        let ProviderRequest {
+            model,
+            system,
+            messages: request_messages,
+            tools: request_tools,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            headers,
+            provider_options,
+        } = request;
+
         let url = format!("{}/chat/completions", self.base_url);
-        let tools = request
-            .tools
+        let tools = request_tools
             .into_iter()
             .map(|tool| {
                 serde_json::json!({
@@ -158,13 +229,13 @@ impl Provider for OpenAIProvider {
             .collect::<Vec<_>>();
 
         let mut messages = Vec::new();
-        if let Some(system) = request.system {
+        if let Some(system) = system {
             messages.push(serde_json::json!({
                 "role": "system",
                 "content": system
             }));
         }
-        for msg in request.messages {
+        for msg in request_messages {
             match msg.role {
                 ProviderMessageRole::Tool => {
                     let Some(call_id) = msg.tool_call_id else {
@@ -221,20 +292,21 @@ impl Provider for OpenAIProvider {
             }
         }
 
-        let payload = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-        });
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert("model".to_string(), serde_json::json!(model));
+        payload_map.insert("messages".to_string(), serde_json::json!(messages));
+        payload_map.insert("tools".to_string(), serde_json::json!(tools));
+        payload_map.insert("tool_choice".to_string(), serde_json::json!("auto"));
+        insert_optional_u32(&mut payload_map, "max_tokens", max_tokens);
+        insert_optional_f32(&mut payload_map, "temperature", temperature);
+        insert_optional_f32(&mut payload_map, "top_p", top_p);
+        insert_optional_u32(&mut payload_map, "top_k", top_k);
+        let mut payload = JsonValue::Object(payload_map);
+        merge_payload_options(&mut payload, provider_options);
 
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await?;
+        let request = self.client.post(url).bearer_auth(&self.api_key);
+        let request = apply_headers(request, &headers);
+        let response = request.json(&payload).send().await?;
 
         let status = response.status();
         let text = response.text().await?;
@@ -311,9 +383,21 @@ impl Provider for OpenAIProvider {
         let base_url = self.base_url.clone();
 
         tokio::spawn(async move {
+            let ProviderRequest {
+                model,
+                system,
+                messages: request_messages,
+                tools: request_tools,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                headers,
+                provider_options,
+            } = request;
+
             let url = format!("{}/chat/completions", base_url);
-            let tools = request
-                .tools
+            let tools = request_tools
                 .into_iter()
                 .map(|tool| {
                     serde_json::json!({
@@ -328,13 +412,13 @@ impl Provider for OpenAIProvider {
                 .collect::<Vec<_>>();
 
             let mut messages = Vec::new();
-            if let Some(system) = request.system {
+            if let Some(system) = system {
                 messages.push(serde_json::json!({
                     "role": "system",
                     "content": system
                 }));
             }
-            for msg in request.messages {
+            for msg in request_messages {
                 match msg.role {
                     ProviderMessageRole::Tool => {
                         let Some(call_id) = msg.tool_call_id else {
@@ -392,21 +476,26 @@ impl Provider for OpenAIProvider {
                 }
             }
 
-            let payload = serde_json::json!({
-                "model": request.model,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": "auto",
-                "stream": true,
-                "stream_options": { "include_usage": true }
-            });
+            let mut payload_map = serde_json::Map::new();
+            payload_map.insert("model".to_string(), serde_json::json!(model));
+            payload_map.insert("messages".to_string(), serde_json::json!(messages));
+            payload_map.insert("tools".to_string(), serde_json::json!(tools));
+            payload_map.insert("tool_choice".to_string(), serde_json::json!("auto"));
+            payload_map.insert("stream".to_string(), serde_json::json!(true));
+            payload_map.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
+            );
+            insert_optional_u32(&mut payload_map, "max_tokens", max_tokens);
+            insert_optional_f32(&mut payload_map, "temperature", temperature);
+            insert_optional_f32(&mut payload_map, "top_p", top_p);
+            insert_optional_u32(&mut payload_map, "top_k", top_k);
+            let mut payload = JsonValue::Object(payload_map);
+            merge_payload_options(&mut payload, provider_options);
 
-            let response = client
-                .post(url)
-                .bearer_auth(api_key)
-                .json(&payload)
-                .send()
-                .await;
+            let request = client.post(url).bearer_auth(api_key);
+            let request = apply_headers(request, &headers);
+            let response = request.json(&payload).send().await;
             let response = match response {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -585,10 +674,22 @@ impl Provider for AnthropicProvider {
             return Err(ZeroBotError::Provider("Anthropic API Key 为空".to_string()));
         }
 
+        let ProviderRequest {
+            model,
+            system,
+            messages: request_messages,
+            tools: request_tools,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            headers,
+            provider_options,
+        } = request;
+
         let url = format!("{}/messages", self.base_url);
 
-        let tools = request
-            .tools
+        let tools = request_tools
             .into_iter()
             .map(|tool| {
                 serde_json::json!({
@@ -600,7 +701,7 @@ impl Provider for AnthropicProvider {
             .collect::<Vec<_>>();
 
         let mut messages = Vec::new();
-        for msg in request.messages {
+        for msg in request_messages {
             match msg.role {
                 ProviderMessageRole::Tool => {
                     messages.push(serde_json::json!({
@@ -631,22 +732,28 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let payload = serde_json::json!({
-            "model": request.model,
-            "max_tokens": request.max_tokens.unwrap_or(1024),
-            "system": request.system,
-            "messages": messages,
-            "tools": tools,
-        });
+        let mut payload_map = serde_json::Map::new();
+        payload_map.insert("model".to_string(), serde_json::json!(model));
+        payload_map.insert(
+            "max_tokens".to_string(),
+            serde_json::json!(max_tokens.unwrap_or(1024)),
+        );
+        payload_map.insert("system".to_string(), serde_json::json!(system));
+        payload_map.insert("messages".to_string(), serde_json::json!(messages));
+        payload_map.insert("tools".to_string(), serde_json::json!(tools));
+        insert_optional_f32(&mut payload_map, "temperature", temperature);
+        insert_optional_f32(&mut payload_map, "top_p", top_p);
+        insert_optional_u32(&mut payload_map, "top_k", top_k);
+        let mut payload = JsonValue::Object(payload_map);
+        merge_payload_options(&mut payload, provider_options);
 
-        let response = self
+        let request = self
             .client
             .post(url)
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .send()
-            .await?;
+            .header("anthropic-version", "2023-06-01");
+        let request = apply_headers(request, &headers);
+        let response = request.json(&payload).send().await?;
 
         let status = response.status();
         let text = response.text().await?;
@@ -721,9 +828,21 @@ impl Provider for AnthropicProvider {
                 return;
             }
 
+            let ProviderRequest {
+                model,
+                system,
+                messages: request_messages,
+                tools: request_tools,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                headers,
+                provider_options,
+            } = request;
+
             let url = format!("{}/messages", base_url);
-            let tools = request
-                .tools
+            let tools = request_tools
                 .into_iter()
                 .map(|tool| {
                     serde_json::json!({
@@ -735,7 +854,7 @@ impl Provider for AnthropicProvider {
                 .collect::<Vec<_>>();
 
             let mut messages = Vec::new();
-            for msg in request.messages {
+            for msg in request_messages {
                 match msg.role {
                     ProviderMessageRole::Tool => {
                         messages.push(serde_json::json!({
@@ -764,22 +883,28 @@ impl Provider for AnthropicProvider {
                 }
             }
 
-            let payload = serde_json::json!({
-                "model": request.model,
-                "max_tokens": request.max_tokens.unwrap_or(1024),
-                "system": request.system,
-                "messages": messages,
-                "tools": tools,
-                "stream": true,
-            });
+            let mut payload_map = serde_json::Map::new();
+            payload_map.insert("model".to_string(), serde_json::json!(model));
+            payload_map.insert(
+                "max_tokens".to_string(),
+                serde_json::json!(max_tokens.unwrap_or(1024)),
+            );
+            payload_map.insert("system".to_string(), serde_json::json!(system));
+            payload_map.insert("messages".to_string(), serde_json::json!(messages));
+            payload_map.insert("tools".to_string(), serde_json::json!(tools));
+            payload_map.insert("stream".to_string(), serde_json::json!(true));
+            insert_optional_f32(&mut payload_map, "temperature", temperature);
+            insert_optional_f32(&mut payload_map, "top_p", top_p);
+            insert_optional_u32(&mut payload_map, "top_k", top_k);
+            let mut payload = JsonValue::Object(payload_map);
+            merge_payload_options(&mut payload, provider_options);
 
-            let response = client
+            let request = client
                 .post(url)
                 .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&payload)
-                .send()
-                .await;
+                .header("anthropic-version", "2023-06-01");
+            let request = apply_headers(request, &headers);
+            let response = request.json(&payload).send().await;
             let response = match response {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -1082,6 +1207,11 @@ mod tests {
                 }],
                 tools: vec![],
                 max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                headers: HashMap::new(),
+                provider_options: serde_json::json!({}),
             })
             .await
             .unwrap();
@@ -1118,6 +1248,11 @@ mod tests {
                 }],
                 tools: vec![],
                 max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                headers: HashMap::new(),
+                provider_options: serde_json::json!({}),
             })
             .await
             .unwrap();

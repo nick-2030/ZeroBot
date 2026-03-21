@@ -5,6 +5,7 @@ use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::events::AgentEvent;
 use crate::hooks::{HookAction, HookEvent, HookManager};
 use crate::interaction::{InteractionHandler, ToolApprovalDecision, ToolApprovalRequest};
+use crate::plugin::{PluginHookWarning, PluginManager};
 use crate::provider::{Provider, ProviderEvent, ProviderRequest, ToolCall};
 use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
 use crate::skills::{format_skill_stack, SkillInfo};
@@ -43,6 +44,7 @@ pub struct Agent {
     cwd: std::path::PathBuf,
     hooks: HookManager,
     interaction: Option<Arc<dyn InteractionHandler>>,
+    plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<RwLock<HashSet<String>>>,
     tool_route: Option<ToolRouteContext>,
     outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
@@ -58,6 +60,7 @@ impl Agent {
         cwd: std::path::PathBuf,
         hooks: HookManager,
         interaction: Option<Arc<dyn InteractionHandler>>,
+        plugins: Option<Arc<PluginManager>>,
         tool_approvals: Arc<RwLock<HashSet<String>>>,
         tool_route: Option<ToolRouteContext>,
         outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
@@ -71,6 +74,7 @@ impl Agent {
             cwd,
             hooks,
             interaction,
+            plugins,
             tool_approvals,
             tool_route,
             outbound,
@@ -115,6 +119,25 @@ impl Agent {
         }
         if let Some(prompt) = decision.payload.get("prompt").and_then(|v| v.as_str()) {
             input_text = prompt.to_string();
+        }
+        if let Some(plugins) = &self.plugins {
+            let (output, warnings) = plugins
+                .run_hook_with_warnings(
+                    "chat.message",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "agent": "primary",
+                        "model": self.model.clone(),
+                    }),
+                    serde_json::json!({
+                        "prompt": input_text.clone(),
+                    }),
+                )
+                .await?;
+            self.emit_plugin_warnings(&events, warnings);
+            if let Some(prompt) = output.get("prompt").and_then(|v| v.as_str()) {
+                input_text = prompt.to_string();
+            }
         }
 
         let _ = self
@@ -196,6 +219,50 @@ impl Agent {
                 context.context_limit,
             );
 
+            if let Some(plugins) = &self.plugins {
+                let (output, warnings) = plugins
+                    .run_hook_with_warnings(
+                        "experimental.chat.system.transform",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "model": self.model.clone(),
+                        }),
+                        serde_json::json!({
+                            "system": system,
+                        }),
+                    )
+                    .await?;
+                self.emit_plugin_warnings(&events, warnings);
+                if let Some(updated) = output.get("system").and_then(|v| v.as_str()) {
+                    system = updated.to_string();
+                }
+            }
+
+            let mut provider_messages = context.messages;
+            if let Some(plugins) = &self.plugins {
+                let (output, warnings) = plugins
+                    .run_hook_with_warnings(
+                        "experimental.chat.messages.transform",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "model": self.model.clone(),
+                        }),
+                        serde_json::json!({
+                            "messages": provider_messages,
+                        }),
+                    )
+                    .await?;
+                self.emit_plugin_warnings(&events, warnings);
+                if let Ok(updated) = serde_json::from_value::<Vec<crate::provider::ProviderMessage>>(
+                    output
+                        .get("messages")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                ) {
+                    provider_messages = updated;
+                }
+            }
+
             let mut enabled = self.settings.tools.enabled.clone();
             if self.settings.skills.enabled && !enabled.iter().any(|t| t == "skill") {
                 enabled.push("skill".to_string());
@@ -207,7 +274,46 @@ impl Agent {
                     }
                 }
             }
-            let tool_specs = self.tools.specs(&enabled);
+            if self.settings.plugins.auto_enable_tools {
+                if let Some(plugins) = &self.plugins {
+                    for tool in plugins.tools() {
+                        if !enabled.contains(&tool.name) {
+                            enabled.push(tool.name);
+                        }
+                    }
+                }
+            }
+            let mut tool_specs = self.tools.specs(&enabled);
+            if let Some(plugins) = &self.plugins {
+                let mut updated_specs = Vec::with_capacity(tool_specs.len());
+                for spec in tool_specs {
+                    let (output, warnings) = plugins
+                        .run_hook_with_warnings(
+                            "tool.definition",
+                            serde_json::json!({
+                                "tool_id": spec.name,
+                            }),
+                            serde_json::json!({
+                                "description": spec.description,
+                                "parameters": spec.parameters,
+                            }),
+                        )
+                        .await?;
+                    self.emit_plugin_warnings(&events, warnings);
+                    let description = output
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                        .unwrap_or(spec.description);
+                    let parameters = output.get("parameters").cloned().unwrap_or(spec.parameters);
+                    updated_specs.push(crate::provider::ToolSpec {
+                        name: spec.name,
+                        description,
+                        parameters,
+                    });
+                }
+                tool_specs = updated_specs;
+            }
             let mut request = ProviderRequest {
                 model: self.model.clone(),
                 system: if system.trim().is_empty() {
@@ -215,10 +321,80 @@ impl Agent {
                 } else {
                     Some(system)
                 },
-                messages: context.messages,
+                messages: provider_messages,
                 tools: tool_specs,
                 max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                headers: std::collections::HashMap::new(),
+                provider_options: serde_json::json!({}),
             };
+
+            if let Some(plugins) = &self.plugins {
+                let provider_options = plugins
+                    .provider_options(self.provider.id(), &self.model)
+                    .await?;
+                request.provider_options = provider_options;
+
+                let (params_output, warnings) = plugins
+                    .run_hook_with_warnings(
+                        "chat.params",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "provider_id": self.provider.id(),
+                            "model": self.model.clone(),
+                        }),
+                        serde_json::json!({
+                            "temperature": request.temperature,
+                            "top_p": request.top_p,
+                            "top_k": request.top_k,
+                            "provider_options": request.provider_options.clone(),
+                        }),
+                    )
+                    .await?;
+                self.emit_plugin_warnings(&events, warnings);
+                request.temperature = params_output
+                    .get("temperature")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32);
+                request.top_p = params_output
+                    .get("top_p")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32);
+                request.top_k = params_output
+                    .get("top_k")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                request.provider_options = params_output
+                    .get("provider_options")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+
+                let (headers_output, warnings) = plugins
+                    .run_hook_with_warnings(
+                        "chat.headers",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "provider_id": self.provider.id(),
+                            "model": self.model.clone(),
+                        }),
+                        serde_json::json!({
+                            "headers": request.headers.clone(),
+                        }),
+                    )
+                    .await?;
+                self.emit_plugin_warnings(&events, warnings);
+                if let Some(map) = headers_output.get("headers").and_then(|v| v.as_object()) {
+                    let mut headers = std::collections::HashMap::new();
+                    for (k, v) in map {
+                        if let Some(value) = v.as_str() {
+                            headers.insert(k.clone(), value.to_string());
+                        }
+                    }
+                    request.headers = headers;
+                }
+            }
 
             let skill_hooks = self.load_skill_hooks(session_id).await?;
             let decision = self
@@ -463,11 +639,11 @@ impl Agent {
     }
 
     async fn compact_session(&self, session_id: &str, history: &[Message]) -> ZeroBotResult<()> {
-        let messages = Self::build_compaction_messages(history);
+        let mut messages = Self::build_compaction_messages(history);
         if messages.is_empty() {
             return Ok(());
         }
-        let model = self
+        let mut model = self
             .settings
             .context
             .compaction
@@ -475,12 +651,52 @@ impl Agent {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| self.model.clone());
+        let mut system_prompt = COMPACTION_PROMPT.to_string();
+
+        if let Some(plugins) = &self.plugins {
+            let output = plugins
+                .run_hook(
+                    "experimental.session.compacting",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "phase": "before",
+                    }),
+                    serde_json::json!({
+                        "model": model.clone(),
+                        "system": system_prompt.clone(),
+                        "messages": messages.clone(),
+                    }),
+                )
+                .await?;
+            if let Some(updated) = output.get("model").and_then(|v| v.as_str()) {
+                model = updated.to_string();
+            }
+            if let Some(updated) = output.get("system").and_then(|v| v.as_str()) {
+                system_prompt = updated.to_string();
+            }
+            if let Some(updated_messages) = output.get("messages") {
+                if let Ok(parsed) = serde_json::from_value::<Vec<crate::provider::ProviderMessage>>(
+                    updated_messages.clone(),
+                ) {
+                    messages = parsed;
+                }
+            }
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+
         let request = ProviderRequest {
             model,
-            system: Some(COMPACTION_PROMPT.to_string()),
+            system: Some(system_prompt),
             messages,
             tools: Vec::new(),
             max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            headers: std::collections::HashMap::new(),
+            provider_options: serde_json::json!({}),
         };
         let mut content = String::new();
         let mut stream = self.provider.stream(request);
@@ -492,7 +708,24 @@ impl Agent {
                 ProviderEvent::Done => {}
             }
         }
-        let summary = content.trim().to_string();
+        let mut summary = content.trim().to_string();
+        if let Some(plugins) = &self.plugins {
+            let output = plugins
+                .run_hook(
+                    "experimental.session.compacting",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "phase": "after",
+                    }),
+                    serde_json::json!({
+                        "summary": summary.clone(),
+                    }),
+                )
+                .await?;
+            if let Some(updated) = output.get("summary").and_then(|v| v.as_str()) {
+                summary = updated.to_string();
+            }
+        }
         if summary.is_empty() {
             return Err(ZeroBotError::Agent("上下文压缩失败：摘要为空".to_string()));
         }
@@ -645,11 +878,13 @@ impl Agent {
         call: ToolCall,
         events: &Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> ZeroBotResult<()> {
+        let tool_name = call.name.clone();
+        let tool_call_external_id = call.id.clone();
         let mut args = call.arguments.clone();
 
         let pre_payload = serde_json::json!({
-            "tool_name": call.name,
-            "tool_input": args,
+            "tool_name": tool_name.clone(),
+            "tool_input": args.clone(),
         });
         let skill_hooks = self.load_skill_hooks(session_id).await?;
         let decision = self
@@ -663,16 +898,16 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolCallStarted {
-                    name: call.name.clone(),
+                    name: tool_name.clone(),
                     input: call.arguments.to_string(),
                 },
             );
             let tool_call_id = self
                 .store
                 .record_tool_call(
-                    &call.id,
+                    &tool_call_external_id,
                     session_id,
-                    &call.name,
+                    &tool_name,
                     &call.arguments.to_string(),
                 )
                 .await?;
@@ -696,7 +931,7 @@ impl Agent {
                     HookEvent::PostToolUseFailure,
                     session_id,
                     serde_json::json!({
-                        "tool_name": call.name,
+                        "tool_name": tool_name.clone(),
                         "tool_input": call.arguments,
                         "tool_output": message,
                         "ok": false,
@@ -707,7 +942,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolCallFinished {
-                    name: call.name,
+                    name: tool_name,
                     output: message,
                     ok: false,
                 },
@@ -718,9 +953,30 @@ impl Agent {
         if let Some(updated_args) = decision.payload.get("tool_input") {
             args = updated_args.clone();
         }
-        let approval_key = approval_key(&call.name, &args);
-        let mut approval_mode = self.settings.tools.approval.mode_for(&call.name);
-        if is_bash_tool(&call.name) {
+
+        if let Some(plugins) = &self.plugins {
+            let (output, warnings) = plugins
+                .run_hook_with_warnings(
+                    "tool.execute.before",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "tool_name": tool_name.clone(),
+                        "tool_call_id": tool_call_external_id.clone(),
+                    }),
+                    serde_json::json!({
+                        "tool_input": args.clone(),
+                    }),
+                )
+                .await?;
+            self.emit_plugin_warnings(events, warnings);
+            if let Some(updated_args) = output.get("tool_input") {
+                args = updated_args.clone();
+            }
+        }
+
+        let approval_key = approval_key(&tool_name, &args);
+        let mut approval_mode = self.settings.tools.approval.mode_for(&tool_name);
+        if is_bash_tool(&tool_name) {
             if let Some(command) = bash_command_from_args(&args) {
                 if let Some(mode) = self.settings.tools.approval.bash_mode_for(command) {
                     approval_mode = mode;
@@ -737,14 +993,14 @@ impl Agent {
         let mut deny_message: Option<String> = None;
         if approval_mode == ToolApprovalMode::Prompt {
             if let Some(handler) = self.interaction.clone() {
-                let reason = if is_bash_tool(&call.name) {
+                let reason = if is_bash_tool(&tool_name) {
                     bash_command_from_args(&args).map(|cmd| format!("bash 命令: {cmd}"))
                 } else {
                     None
                 };
                 let response = handler
                     .request_tool_approval(ToolApprovalRequest {
-                        tool_name: call.name.clone(),
+                        tool_name: tool_name.clone(),
                         arguments: args.clone(),
                         reason,
                     })
@@ -781,14 +1037,19 @@ impl Agent {
         self.emit(
             events,
             AgentEvent::ToolCallStarted {
-                name: call.name.clone(),
+                name: tool_name.clone(),
                 input: args.to_string(),
             },
         );
 
         let tool_call_id = self
             .store
-            .record_tool_call(&call.id, session_id, &call.name, &args.to_string())
+            .record_tool_call(
+                &tool_call_external_id,
+                session_id,
+                &tool_name,
+                &args.to_string(),
+            )
             .await?;
 
         if !approved {
@@ -813,8 +1074,8 @@ impl Agent {
                     HookEvent::PostToolUseFailure,
                     session_id,
                     serde_json::json!({
-                        "tool_name": call.name,
-                        "tool_input": args,
+                        "tool_name": tool_name.clone(),
+                        "tool_input": args.clone(),
                         "tool_output": message,
                         "ok": false,
                     }),
@@ -824,7 +1085,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolCallFinished {
-                    name: call.name,
+                    name: tool_name,
                     output: message,
                     ok: false,
                 },
@@ -844,21 +1105,22 @@ impl Agent {
             Some(self.store.clone()),
             self.interaction.clone(),
         )
+        .with_plugins(self.plugins.clone())
         .with_route(self.tool_route.clone())
         .with_outbound(self.outbound.clone());
 
         match self
             .tools
-            .run_with_settings(&ctx, &call.name, args.clone(), &self.settings.tools.output)
+            .run_with_settings(&ctx, &tool_name, args.clone(), &self.settings.tools.output)
             .await
         {
             Ok(output) => {
                 let mut output_content = output.content.clone();
                 let mut ok = true;
                 let post_payload = serde_json::json!({
-                    "tool_name": call.name,
-                    "tool_input": args,
-                    "tool_output": output_content,
+                    "tool_name": tool_name.clone(),
+                    "tool_input": args.clone(),
+                    "tool_output": output_content.clone(),
                     "ok": ok,
                 });
                 let skill_hooks = self.load_skill_hooks(session_id).await?;
@@ -883,6 +1145,28 @@ impl Agent {
                 {
                     output_content = updated.to_string();
                 }
+                if let Some(plugins) = &self.plugins {
+                    let (output, warnings) = plugins
+                        .run_hook_with_warnings(
+                            "tool.execute.after",
+                            serde_json::json!({
+                                "session_id": session_id,
+                                "tool_name": tool_name.clone(),
+                                "tool_call_id": tool_call_external_id.clone(),
+                            }),
+                            serde_json::json!({
+                                "tool_input": args.clone(),
+                                "tool_output": output_content.clone(),
+                                "ok": ok,
+                            }),
+                        )
+                        .await?;
+                    self.emit_plugin_warnings(events, warnings);
+                    if let Some(updated) = output.get("tool_output").and_then(|v| v.as_str()) {
+                        output_content = updated.to_string();
+                    }
+                    ok = output.get("ok").and_then(|v| v.as_bool()).unwrap_or(ok);
+                }
 
                 self.store
                     .record_tool_output(&tool_call_id, &output_content)
@@ -903,7 +1187,7 @@ impl Agent {
                 self.emit(
                     events,
                     AgentEvent::ToolCallFinished {
-                        name: call.name,
+                        name: tool_name,
                         output: output_content,
                         ok,
                     },
@@ -921,9 +1205,9 @@ impl Agent {
                         HookEvent::PostToolUseFailure,
                         session_id,
                         serde_json::json!({
-                            "tool_name": call.name,
-                            "tool_input": args,
-                            "tool_output": output_content,
+                            "tool_name": tool_name.clone(),
+                            "tool_input": args.clone(),
+                            "tool_output": output_content.clone(),
                             "ok": false,
                         }),
                         &skill_hooks,
@@ -939,6 +1223,27 @@ impl Agent {
                     .and_then(|v| v.as_str())
                 {
                     output_content = updated.to_string();
+                }
+                if let Some(plugins) = &self.plugins {
+                    let (output, warnings) = plugins
+                        .run_hook_with_warnings(
+                            "tool.execute.after",
+                            serde_json::json!({
+                                "session_id": session_id,
+                                "tool_name": tool_name.clone(),
+                                "tool_call_id": tool_call_external_id,
+                            }),
+                            serde_json::json!({
+                                "tool_input": args.clone(),
+                                "tool_output": output_content.clone(),
+                                "ok": false,
+                            }),
+                        )
+                        .await?;
+                    self.emit_plugin_warnings(events, warnings);
+                    if let Some(updated) = output.get("tool_output").and_then(|v| v.as_str()) {
+                        output_content = updated.to_string();
+                    }
                 }
                 let _ = self
                     .store
@@ -960,7 +1265,7 @@ impl Agent {
                 self.emit(
                     events,
                     AgentEvent::ToolCallFinished {
-                        name: call.name,
+                        name: tool_name,
                         output: output_content,
                         ok: false,
                     },
@@ -974,6 +1279,24 @@ impl Agent {
     fn emit(&self, events: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
         if let Some(tx) = events {
             let _ = tx.send(event);
+        }
+    }
+
+    fn emit_plugin_warnings(
+        &self,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        warnings: Vec<PluginHookWarning>,
+    ) {
+        for warning in warnings {
+            self.emit(
+                events,
+                AgentEvent::PluginWarning {
+                    plugin: warning.plugin,
+                    hook: warning.hook,
+                    message: warning.message,
+                    degraded: warning.degraded,
+                },
+            );
         }
     }
 

@@ -8,6 +8,7 @@ use crate::hooks::HookManager;
 use crate::instruction;
 use crate::interaction::{InteractionHandler, UserInputRequest, UserInputResponse};
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
+use crate::plugin::PluginManager;
 use crate::provider::ProviderFactory;
 use crate::session::{FileReadRecord, SessionKind, SessionStore, TodoItem};
 use crate::skills::{SkillAction, SkillContent, SkillManager, SkillStackEntry};
@@ -35,6 +36,7 @@ pub struct ToolContext {
     pub session_id: String,
     pub store: Option<Arc<dyn SessionStore>>,
     pub interaction: Option<Arc<dyn InteractionHandler>>,
+    pub plugins: Option<Arc<PluginManager>>,
     pub route: Option<ToolRouteContext>,
     pub outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
 }
@@ -60,9 +62,15 @@ impl ToolContext {
             session_id: session_id.into(),
             store,
             interaction,
+            plugins: None,
             route: None,
             outbound: None,
         }
+    }
+
+    pub fn with_plugins(mut self, plugins: Option<Arc<PluginManager>>) -> Self {
+        self.plugins = plugins;
+        self
     }
 
     pub fn with_route(mut self, route: Option<ToolRouteContext>) -> Self {
@@ -106,6 +114,10 @@ impl ToolContext {
 
     pub fn interaction(&self) -> Option<Arc<dyn InteractionHandler>> {
         self.interaction.clone()
+    }
+
+    pub fn plugins(&self) -> Option<Arc<PluginManager>> {
+        self.plugins.clone()
     }
 }
 
@@ -231,12 +243,14 @@ pub trait Tool: Send + Sync {
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    plugins: Option<Arc<PluginManager>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            plugins: None,
         }
     }
 
@@ -312,8 +326,10 @@ impl ToolRegistry {
         settings: &crate::config::Settings,
         cwd: &std::path::Path,
         store: Option<Arc<dyn SessionStore>>,
+        plugins: Option<Arc<PluginManager>>,
     ) -> ZeroBotResult<Self> {
         let mut registry = Self::with_builtin();
+        registry.plugins = plugins.clone();
 
         if settings.skills.enabled {
             let store =
@@ -351,6 +367,18 @@ impl ToolRegistry {
                         manager: Arc::clone(&mcp),
                         full_name: name,
                         tool,
+                    }),
+                );
+            }
+        }
+
+        if let Some(manager) = plugins {
+            for tool in manager.tools() {
+                registry.tools.insert(
+                    tool.name.clone(),
+                    Arc::new(PluginToolAdapter {
+                        manager: manager.clone(),
+                        info: tool,
                     }),
                 );
             }
@@ -504,6 +532,7 @@ impl Tool for SubagentTool {
             self.cwd.clone(),
             hooks.clone(),
             self.interaction.clone(),
+            ctx.plugins(),
             self.tool_approvals.clone(),
             ctx.route.clone(),
             ctx.outbound.clone(),
@@ -625,6 +654,11 @@ struct McpToolAdapter {
     tool: McpToolInfo,
 }
 
+struct PluginToolAdapter {
+    manager: Arc<PluginManager>,
+    info: crate::plugin::PluginToolInfo,
+}
+
 #[async_trait]
 impl Tool for McpToolAdapter {
     fn name(&self) -> &str {
@@ -645,6 +679,62 @@ impl Tool for McpToolAdapter {
             .call_tool(&self.tool.server, &self.tool.name, args)
             .await?;
         Ok(ToolOutput::new(format_tool_output(result)))
+    }
+}
+
+#[async_trait]
+impl Tool for PluginToolAdapter {
+    fn name(&self) -> &str {
+        &self.info.name
+    }
+
+    fn description(&self) -> &str {
+        &self.info.description
+    }
+
+    fn parameters(&self) -> JsonValue {
+        self.info.parameters.clone()
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let result = self
+            .manager
+            .call_tool(
+                &self.info.plugin,
+                &self.info.name,
+                args,
+                json!({
+                    "session_id": ctx.session_id,
+                    "cwd": ctx.cwd.to_string_lossy(),
+                    "allow_paths": ctx
+                        .allow_paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect::<Vec<_>>(),
+                }),
+            )
+            .await?;
+        let content = result
+            .get("output")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if result.is_string() {
+                    result.as_str().unwrap_or_default().to_string()
+                } else {
+                    result.to_string()
+                }
+            });
+        let title = result
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        let metadata = result.get("metadata").cloned().unwrap_or_else(|| json!({}));
+        let mut output = ToolOutput::new(content).with_metadata(metadata);
+        if let Some(title) = title {
+            output = output.with_title(title);
+        }
+        Ok(output)
     }
 }
 
@@ -2063,13 +2153,33 @@ async fn run_bash_command(
         ctx.cwd.clone()
     };
     let timeout_ms = timeout_ms.unwrap_or(120_000);
+    let mut plugin_env = HashMap::new();
+    if let Some(plugins) = ctx.plugins() {
+        let out = plugins
+            .run_hook(
+                "shell.env",
+                json!({
+                    "cwd": dir.to_string_lossy(),
+                    "session_id": ctx.session_id,
+                }),
+                json!({ "env": {} }),
+            )
+            .await?;
+        if let Some(map) = out.get("env").and_then(|v| v.as_object()) {
+            for (k, v) in map {
+                if let Some(value) = v.as_str() {
+                    plugin_env.insert(k.clone(), value.to_string());
+                }
+            }
+        }
+    }
     let output = timeout(Duration::from_millis(timeout_ms), async {
-        Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(dir)
-            .output()
-            .await
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-lc").arg(command).current_dir(dir);
+        if !plugin_env.is_empty() {
+            cmd.envs(plugin_env);
+        }
+        cmd.output().await
     })
     .await;
     let (stdout, stderr, exit_code) = match output {
@@ -2702,7 +2812,7 @@ mod tests {
             enabled: Some(true),
         }];
         let registry =
-            ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."), None)
+            ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."), None, None)
                 .await
                 .unwrap();
         let tool_name = "mcp__remote-one__echo";

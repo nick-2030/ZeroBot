@@ -34,6 +34,7 @@ use zerobot_core::interaction::{
     InteractionHandler, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
     UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
+use zerobot_core::plugin::PluginManager;
 use zerobot_core::provider::{ProviderFactory, TokenUsage};
 use zerobot_core::session::{
     create_session_with_hooks, MessageRole, Session, SessionKind, SessionStore, TodoItem,
@@ -47,6 +48,7 @@ use zerobot_core::ZeroBotError;
 enum DotColor {
     White,
     Green,
+    Yellow,
     Red,
 }
 
@@ -922,6 +924,7 @@ pub async fn run_tui(
     resume: bool,
     use_alt_screen: bool,
     provider_state: Arc<StdRwLock<String>>,
+    plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
 ) -> Result<String> {
     enable_raw_mode()?;
@@ -945,6 +948,7 @@ pub async fn run_tui(
         hooks,
         resume,
         provider_state,
+        plugins,
         tool_approvals,
     )
     .await;
@@ -975,6 +979,7 @@ async fn run_tui_inner(
     hooks: HookManager,
     resume: bool,
     provider_state: Arc<StdRwLock<String>>,
+    plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
 ) -> Result<String> {
     let slash = SlashRegistry::extended();
@@ -1038,6 +1043,7 @@ async fn run_tui_inner(
                             &hooks,
                             &interaction,
                             &provider_state,
+                            &plugins,
                             &tool_approvals,
                             &ui_tx,
                             &tx,
@@ -1095,6 +1101,7 @@ async fn run_tui_inner(
                             &hooks,
                             &interaction,
                             &provider_state,
+                            &plugins,
                             &tool_approvals,
                             &ui_tx,
                             &tx,
@@ -1134,6 +1141,7 @@ async fn handle_event(
     hooks: &HookManager,
     interaction: &Arc<dyn InteractionHandler>,
     provider_state: &Arc<StdRwLock<String>>,
+    plugins: &Option<Arc<PluginManager>>,
     tool_approvals: &Arc<TokioRwLock<HashSet<String>>>,
     ui_tx: &mpsc::UnboundedSender<UiRequest>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
@@ -1285,6 +1293,7 @@ async fn handle_event(
                                     cwd.clone(),
                                     hooks.clone(),
                                     Some(interaction.clone()),
+                                    plugins.clone(),
                                     tool_approvals.clone(),
                                     None,
                                     None,
@@ -1580,6 +1589,7 @@ async fn handle_event(
                                 let session_id = app.session_id.clone();
                                 let interaction = interaction.clone();
                                 let tool_approvals = tool_approvals.clone();
+                                let plugins = plugins.clone();
                                 let tx_clone = tx.clone();
                                 tokio::spawn(async move {
                                     let result = (|| async {
@@ -1593,6 +1603,7 @@ async fn handle_event(
                                             cwd,
                                             hooks,
                                             Some(interaction),
+                                            plugins,
                                             tool_approvals,
                                             None,
                                             None,
@@ -1642,6 +1653,7 @@ async fn handle_event(
                         cwd.clone(),
                         hooks.clone(),
                         Some(interaction.clone()),
+                        plugins.clone(),
                         tool_approvals.clone(),
                         None,
                         None,
@@ -1859,6 +1871,19 @@ async fn handle_agent_event(
             app.finalize_stream();
             app.status = Status::Error(message.clone());
             app.push_block(DotColor::Red, &message);
+        }
+        AgentEvent::PluginWarning {
+            plugin,
+            hook,
+            message,
+            degraded,
+        } => {
+            let text = if degraded {
+                format!("插件降级继续: plugin={plugin}, hook={hook}, message={message}")
+            } else {
+                format!("插件告警: plugin={plugin}, hook={hook}, message={message}")
+            };
+            app.push_block(DotColor::Yellow, &text);
         }
         AgentEvent::Done => {
             app.finalize_stream();
@@ -3178,6 +3203,7 @@ fn dot_span(color: DotColor) -> Span<'static> {
     let fg = match color {
         DotColor::White => COLOR_ACCENT,
         DotColor::Green => COLOR_SUCCESS,
+        DotColor::Yellow => COLOR_WARN,
         DotColor::Red => COLOR_ERROR,
     };
     Span::styled("●", Style::default().fg(fg))
@@ -3187,6 +3213,7 @@ fn tool_dot_span(color: DotColor) -> Span<'static> {
     let fg = match color {
         DotColor::White => COLOR_ACCENT,
         DotColor::Green => COLOR_SUCCESS,
+        DotColor::Yellow => COLOR_WARN,
         DotColor::Red => COLOR_ERROR,
     };
     Span::styled("⏺", Style::default().fg(fg))

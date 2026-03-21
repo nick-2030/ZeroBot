@@ -15,6 +15,7 @@ pub mod instruction;
 pub mod interaction;
 pub mod logging;
 pub mod mcp;
+pub mod plugin;
 pub mod prompt;
 pub mod provider;
 pub mod session;
@@ -43,6 +44,10 @@ pub use interaction::{
     UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
 pub use logging::{init_logging, init_logging_with_stdout, LogGuard};
+pub use plugin::{
+    PluginAuthAuthorizeResult, PluginAuthCallbackResult, PluginAuthMethod, PluginHookWarning,
+    PluginManager, PluginToolInfo,
+};
 pub use provider::{
     Provider, ProviderEvent, ProviderRequest, ProviderResponse, TokenUsage, ToolSpec,
 };

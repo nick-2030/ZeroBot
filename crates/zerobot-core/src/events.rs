@@ -34,5 +34,11 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    PluginWarning {
+        plugin: String,
+        hook: String,
+        message: String,
+        degraded: bool,
+    },
     Done,
 }
