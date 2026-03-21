@@ -6,6 +6,7 @@ use crate::session::{Message, MessageRole, StoredToolCall};
 use crate::skills::{format_skill_index, SkillInfo};
 use crate::workspace::resolve_workspace_root;
 use chrono::Local;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub struct ContextBuild {
@@ -141,6 +142,21 @@ impl ContextManager {
             } else {
                 normal_messages.push(message);
             }
+        }
+
+        let before_sanitize_count = normal_messages.len();
+        let before_sanitize_chars = normal_messages
+            .iter()
+            .map(|msg| msg.content.chars().count())
+            .sum::<usize>();
+        let normal_messages = sanitize_tool_sequences(normal_messages);
+        if normal_messages.len() < before_sanitize_count {
+            dropped_messages += before_sanitize_count - normal_messages.len();
+            let after_sanitize_chars = normal_messages
+                .iter()
+                .map(|msg| msg.content.chars().count())
+                .sum::<usize>();
+            dropped_chars += before_sanitize_chars.saturating_sub(after_sanitize_chars);
         }
 
         let messages = normal_messages
@@ -282,6 +298,72 @@ fn message_to_provider(message: Message) -> ProviderMessage {
     }
 }
 
+fn sanitize_tool_sequences(messages: Vec<Message>) -> Vec<Message> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut idx = 0usize;
+
+    while idx < messages.len() {
+        let message = messages[idx].clone();
+        match message.role {
+            MessageRole::Assistant => {
+                let calls = message.tool_calls.clone().unwrap_or_default();
+                if calls.is_empty() {
+                    let mut cleaned = message;
+                    cleaned.tool_calls = None;
+                    out.push(cleaned);
+                    idx += 1;
+                    continue;
+                }
+
+                let has_invalid_call_id = calls.iter().any(|call| call.id.trim().is_empty());
+                if has_invalid_call_id {
+                    let mut stripped = message;
+                    stripped.tool_calls = None;
+                    out.push(stripped);
+                    idx += 1;
+                    continue;
+                }
+
+                let expected_ids: HashSet<String> =
+                    calls.iter().map(|call| call.id.clone()).collect();
+                let mut next = idx + 1;
+                let mut returned_ids = HashSet::new();
+                while next < messages.len() && matches!(messages[next].role, MessageRole::Tool) {
+                    if let Some(tool_call_id) = messages[next].tool_call_id.as_ref() {
+                        returned_ids.insert(tool_call_id.clone());
+                    }
+                    next += 1;
+                }
+
+                if expected_ids.iter().all(|id| returned_ids.contains(id)) {
+                    out.push(message);
+                    for tool_message in &messages[idx + 1..next] {
+                        if let Some(tool_call_id) = tool_message.tool_call_id.as_ref() {
+                            if expected_ids.contains(tool_call_id) {
+                                out.push(tool_message.clone());
+                            }
+                        }
+                    }
+                } else {
+                    let mut stripped = message;
+                    stripped.tool_calls = None;
+                    out.push(stripped);
+                }
+                idx = next;
+            }
+            MessageRole::Tool => {
+                idx += 1;
+            }
+            _ => {
+                out.push(message);
+                idx += 1;
+            }
+        }
+    }
+
+    out
+}
+
 fn build_environment_block(model: &str, cwd: &Path) -> String {
     let workspace = resolve_workspace_root(cwd);
     let git_repo = workspace.join(".git").exists();
@@ -318,6 +400,36 @@ mod tests {
             content: content.to_string(),
             summary: false,
             tool_call_id: None,
+            tool_calls: None,
+            created_at: 0,
+        }
+    }
+
+    fn assistant_with_tool_call(call_id: &str, content: &str) -> Message {
+        Message {
+            id: "assistant-with-call".to_string(),
+            session_id: "s1".to_string(),
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            summary: false,
+            tool_call_id: None,
+            tool_calls: Some(vec![StoredToolCall {
+                id: call_id.to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"filePath": "demo.txt"}),
+            }]),
+            created_at: 0,
+        }
+    }
+
+    fn tool_with_call_id(call_id: &str, content: &str) -> Message {
+        Message {
+            id: "tool-msg".to_string(),
+            session_id: "s1".to_string(),
+            role: MessageRole::Tool,
+            content: content.to_string(),
+            summary: false,
+            tool_call_id: Some(call_id.to_string()),
             tool_calls: None,
             created_at: 0,
         }
@@ -387,5 +499,58 @@ mod tests {
         ];
         let result = manager.build("test-model", &history);
         assert_eq!(result.messages.first().unwrap().content, "summary");
+    }
+
+    #[test]
+    fn strips_orphaned_assistant_tool_calls_after_trim() {
+        let mut settings = Settings::default();
+        settings.context.max_messages = 0;
+        settings.context.max_chars = 10;
+        let manager = ContextManager::new(&settings, PathBuf::from("."));
+        let history = vec![
+            msg(MessageRole::User, "hi"),
+            assistant_with_tool_call("call-1", "do"),
+            tool_with_call_id("call-1", &"x".repeat(50)),
+            msg(MessageRole::User, "next"),
+        ];
+        let result = manager.build("test-model", &history);
+        assert!(result.messages.iter().all(|m| {
+            !matches!(m.role, ProviderMessageRole::Assistant)
+                || m.tool_calls.as_ref().is_none_or(|calls| calls.is_empty())
+        }));
+        assert!(result
+            .messages
+            .iter()
+            .all(|m| !matches!(m.role, ProviderMessageRole::Tool)));
+    }
+
+    #[test]
+    fn keeps_complete_assistant_tool_sequence() {
+        let mut settings = Settings::default();
+        settings.context.max_messages = 0;
+        settings.context.max_chars = 1000;
+        let manager = ContextManager::new(&settings, PathBuf::from("."));
+        let history = vec![
+            msg(MessageRole::User, "hi"),
+            assistant_with_tool_call("call-2", "run"),
+            tool_with_call_id("call-2", "ok"),
+            msg(MessageRole::User, "continue"),
+        ];
+        let result = manager.build("test-model", &history);
+        let assistant = result
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, ProviderMessageRole::Assistant) && m.content == "run")
+            .expect("assistant with tool call should remain");
+        let calls = assistant
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should be preserved");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call-2");
+        assert!(result.messages.iter().any(|m| {
+            matches!(m.role, ProviderMessageRole::Tool)
+                && m.tool_call_id.as_deref() == Some("call-2")
+        }));
     }
 }
