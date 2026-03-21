@@ -1098,7 +1098,11 @@ impl Agent {
         {
             Ok(output) => {
                 let mut output_content = output.content.clone();
-                let mut ok = true;
+                let mut ok = output
+                    .metadata
+                    .get("ok")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let post_payload = serde_json::json!({
                     "tool_name": tool_name.clone(),
                     "tool_input": args.clone(),
