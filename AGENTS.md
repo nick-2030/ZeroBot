@@ -1,44 +1,62 @@
-# 项目知识库
+# PROJECT KNOWLEDGE BASE
 
-**生成时间:** 2026-03-20
-**提交:** N/A
-**分支:** N/A
+**Generated:** 2026-03-20 22:25:37 CST  
+**Commit:** `30ecbfd`  
+**Branch:** `main`
 
-## 概述
-ZeroBot 是一个基于 Rust 的 AI Agent 系统，提供 CLI（`zerobot-cli`）和核心编排库（`zerobot-core`），以及 SDK（`zerobot-sdk`）。它管理会话、工具和 Agent 交互。
+## OVERVIEW
+ZeroBot 是 Rust 工作区项目：`zerobot-core` 负责 Agent 编排与工具执行，`zerobot-cli` 提供交互入口与 TUI，`zerobot-sdk` 提供嵌入式调用接口。
 
-## 结构
-```
+## STRUCTURE
+```text
 .
 ├── crates/
-│   ├── zerobot-core/   # 核心逻辑、Agent编排、会话、配置、MCP
-│   ├── zerobot-cli/    # 主入口和 TUI
-│   └── zerobot-sdk/    # 集成用 SDK
-├── config/             # 配置示例
-└── target/             # 构建输出
+│   ├── zerobot-core/      # 编排核心（会话、工具、provider、hooks、MCP）
+│   │   ├── AGENTS.md
+│   │   ├── src/AGENTS.md
+│   │   └── prompts/AGENTS.md
+│   ├── zerobot-cli/       # CLI 与终端 UI
+│   │   └── AGENTS.md
+│   └── zerobot-sdk/       # 对外 SDK 封装
+│       └── AGENTS.md
+├── config/                # 配置示例（模板）
+└── docs/                  # 静态说明文档
 ```
 
-## 查找位置
-| 任务 | 位置 | 备注 |
-|------|------|------|
-| Agent 编排 | `crates/zerobot-core/src/agent.rs` | 核心 Agent 定义 |
-| 会话状态 | `crates/zerobot-core/src/session.rs` | 对话状态管理 |
-| 工具执行 | `crates/zerobot-core/src/tool.rs` | 工具定义和处理 |
-| 配置加载 | `crates/zerobot-core/src/config.rs` | 设置加载 |
-| 日志初始化 | `crates/zerobot-core/src/logging.rs` | 日志初始化与路径规则 |
-| CLI 入口 | `crates/zerobot-cli/src/main.rs` | CLI 解析和初始化 |
-| TUI 渲染 | `crates/zerobot-cli/src/tui.rs` | 终端界面 |
-| MCP 集成 | `crates/zerobot-core/src/mcp.rs` | 模型上下文协议 |
+## WHERE TO LOOK
+| Task | Location | Notes |
+|------|----------|-------|
+| 主循环/工具调用编排 | `crates/zerobot-core/src/agent.rs` | `Agent::run_turn` 驱动 provider↔tool 循环 |
+| 工具注册与执行 | `crates/zerobot-core/src/tool.rs` | 内置工具 + Subagent + Skill + MCP 适配 |
+| 会话持久化 | `crates/zerobot-core/src/session.rs` | `SqliteSessionStore` 与消息/审批/todo 存储 |
+| 配置加载与优先级 | `crates/zerobot-core/src/config.rs` | `CLI > Managed > Local > Project > User > Defaults` |
+| Provider 抽象 | `crates/zerobot-core/src/provider.rs` | OpenAI/Anthropic 统一接口 |
+| MCP 接入 | `crates/zerobot-core/src/mcp.rs` | local(stdio)/remote(http) JSON-RPC |
+| CLI 入口 | `crates/zerobot-cli/src/main.rs` | 命令解析、会话恢复、provider 选择 |
+| TUI 渲染 | `crates/zerobot-cli/src/tui.rs` | 事件循环、流式输出、用户交互覆盖层 |
+| SDK 会话调用 | `crates/zerobot-sdk/src/lib.rs` | `ZeroBot` 与 `SessionHandle` |
 
-## 约定
-- **语言:** Rust 2021 版本。
-- **配置:** YAML 格式（`.zerobot/settings.local.yaml`、`config/example.settings.yaml`）。
-- **依赖:** 使用 `tokio` 异步 runtime，`tracing` 日志。
-- **日志路径:** 按天单文件写入，位于 `~/.zerobot/logs/YYYY-MM-DD.log`。
+## CONVENTIONS (PROJECT-SPECIFIC)
+- Rust workspace，统一依赖在根 `Cargo.toml` 的 `[workspace.dependencies]`。
+- 测试以 **inline `#[cfg(test)] mod tests`** 为主，无 `tests/` 集成测试目录。
+- 日志按天写入 `~/.zerobot/logs/YYYY-MM-DD.log`。
+- 指令文件就近生效：`AGENTS.md` / `CLAUDE.md` / `CONTEXT.md`。
 
-## 命令
+## ANTI-PATTERNS (THIS PROJECT)
+- 未经用户明确要求，不创建文档、不提交代码、不推送变更。
+- 不用 `bash` 代替专用工具（read/write/edit/grep/glob 等）。
+- 工具被拒绝后不重复同一调用；Hook 返回 `modify` 必须用修改后 payload。
+- plan 模式只读：禁止创建/修改/删除/移动文件。
+
+## COMMANDS
 ```bash
-cargo build      # 构建工作区
-cargo test       # 运行测试
-cargo run -p zerobot-cli  # 运行 CLI
+cargo build
+cargo test
+cargo test -p zerobot-core
+cargo run -p zerobot-cli
+cargo run -p zerobot-cli -- exec "你好"
 ```
+
+## NOTES
+- `tmp/` 下包含外部镜像/临时内容，不作为项目主代码边界。
+- `docs/` 与 `config/` 属静态文档/模板域，不单独拆 AGENTS 子文档。

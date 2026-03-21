@@ -1,28 +1,48 @@
 # zerobot-core
 
-## 概述
-ZeroBot 的核心编排引擎，管理 Agent、会话、Provider、工具和模型上下文协议（MCP）。
+## OVERVIEW
+核心编排库：把 provider、tools、session、hooks、skills、instructions 串成一个可迭代回合循环。
 
-## 结构
-```
+## STRUCTURE
+```text
 .
-├── agent.rs       # Agent 生命周期和决策循环
-├── session.rs     # 对话历史和状态
-├── tool.rs        # 工具模式定义和执行
-├── mcp.rs         # 模型上下文协议集成
-├── provider.rs    # LLM Provider 抽象
-├── prompt.rs      # 系统提示词生成
-├── skills.rs      # Agent 技能
-├── hooks.rs       # 执行钩子
-├── config.rs      # 设置和配置
-├── logging.rs     # 追踪和日志设置
-└── events.rs      # 事件系统
+├── src/            # 运行时代码（含核心状态机）
+├── prompts/        # 系统提示词分片（system + modes）
+├── AGENTS.md
+├── src/AGENTS.md
+└── prompts/AGENTS.md
 ```
 
-## 查找位置
-| 任务 | 位置 | 备注 |
-|------|------|------|
-| Agent 逻辑 | `agent.rs` | AI 编排的核心 |
-| MCP 工具 | `mcp.rs` | 与 MCP 服务器交互 |
-| 会话存储 | `session.rs` | 保存/加载历史 |
-| LLM 后端 | `provider.rs` | 切换 AI 模型 |
+## WHERE TO LOOK
+| Task | Location | Notes |
+|------|----------|-------|
+| Agent 回合循环 | `src/agent.rs` | 包含上下文构建、provider 流式消费、tool 调用 |
+| 工具系统 | `src/tool.rs` | `ToolRegistry` + 内置工具 + Subagent/Skill/MCP 入口 |
+| 会话与存储 | `src/session.rs` | `SessionStore` trait 与 `SqliteSessionStore` |
+| 配置与策略 | `src/config.rs` | 多层配置合并与工具审批策略 |
+| Provider 实现 | `src/provider.rs` | OpenAI/Anthropic 请求与流事件适配 |
+| Hook 执行链 | `src/hooks.rs` | event matcher、allow/deny/modify 协议 |
+| Prompt 组装 | `src/prompt.rs` + `prompts/` | 模块化拼接系统提示词 |
+| MCP 集成 | `src/mcp.rs` | 本地/远程 MCP 客户端管理 |
+
+## CONVENTIONS
+- 对外 API 统一由 `src/lib.rs` re-export。
+- `Settings`/`LoadedConfig` 作为跨模块配置载体，避免散落读取配置文件。
+- Hook 事件是软约束链：失败记录 warning，不阻塞主流程；明确 deny 才中断。
+- Tool 输出统一走 `render_tool_output`，截断规则由 `tools.output` 配置控制。
+
+## ANTI-PATTERNS
+- 在 `agent.rs` 里绕过 Hook 或审批检查直接执行工具。
+- 在 `tool.rs` 新增写文件能力时跳过 “read-before-write” 校验逻辑。
+- 在 `session.rs` 改 schema 但不同时维护初始化 SQL 与读取逻辑。
+
+## TEST PATTERNS
+- 以 inline `#[cfg(test)] mod tests` 为主。
+- IO/配置用 `tempfile::TempDir`；网络用 `httpmock`；异步用 `#[tokio::test]`。
+
+## COMMANDS
+```bash
+cargo test -p zerobot-core
+cargo test -p zerobot-core context::tests
+cargo test -p zerobot-core -- --nocapture
+```
