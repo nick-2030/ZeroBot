@@ -29,7 +29,6 @@ use zerobot_core::agent::Agent;
 use zerobot_core::config::Settings;
 use zerobot_core::events::AgentEvent;
 use zerobot_core::hooks::HookManager;
-use zerobot_core::init_prompt;
 use zerobot_core::interaction::{
     InteractionHandler, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
     UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
@@ -43,6 +42,7 @@ use zerobot_core::session::{
 use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
+use zerobot_core::{discover_template_commands, init_prompt, render_template_prompt};
 
 #[derive(Copy, Clone)]
 enum DotColor {
@@ -982,8 +982,23 @@ async fn run_tui_inner(
     plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
 ) -> Result<String> {
-    let slash = SlashRegistry::extended();
+    let plugin_assets = plugins
+        .as_ref()
+        .map(|manager| manager.asset_roots())
+        .unwrap_or_default();
+    let (dynamic_commands, slash_warning) =
+        match discover_template_commands(&settings, &cwd, &plugin_assets) {
+            Ok(list) => (list, None),
+            Err(err) => (
+                Vec::new(),
+                Some(format!("加载动态斜杠命令失败，已降级为内置命令: {err}")),
+            ),
+        };
+    let slash = SlashRegistry::extended(dynamic_commands);
     let mut app = App::new(session_id.clone(), provider_id.clone(), model.clone());
+    if let Some(message) = slash_warning {
+        app.push_block(DotColor::Yellow, &message);
+    }
     app.slash_hint = slash.hint(6);
     app.refresh_slash(&slash);
     let (cols, _rows) = crossterm::terminal::size().unwrap_or((120, 0));
@@ -1194,49 +1209,99 @@ async fn handle_event(
                             app.push_block(DotColor::Red, "请输入命令，使用 /help 查看可用命令");
                             return Ok(true);
                         }
-                        let Some(spec) = slash.find(&command) else {
+                        let Some(spec) = slash.find(&command).cloned() else {
                             app.push_block(
                                 DotColor::Red,
                                 &format!("未知命令: /{command}（输入 /help 查看）"),
                             );
                             return Ok(true);
                         };
-                        match spec.name {
-                            "clear" => {
-                                app.output.clear();
-                                app.stream_buffer.clear();
-                                app.streaming = false;
-                                app.scroll = 0;
-                                app.stick_to_bottom = true;
-                                app.input.clear();
-                                app.cursor = 0;
-                                app.refresh_slash(slash);
-                                return Ok(true);
-                            }
-                            "exit" => {
-                                app.push_line(user_input_line(&raw_input));
-                                *should_quit = true;
-                                return Ok(true);
-                            }
-                            _ => {
-                                app.push_line(user_input_line(&raw_input));
-                            }
+                        if spec.is_builtin("clear") {
+                            app.output.clear();
+                            app.stream_buffer.clear();
+                            app.streaming = false;
+                            app.scroll = 0;
+                            app.stick_to_bottom = true;
+                            app.input.clear();
+                            app.cursor = 0;
+                            app.refresh_slash(slash);
+                            return Ok(true);
+                        }
+                        if spec.is_builtin("exit") {
+                            app.push_line(user_input_line(&raw_input));
+                            *should_quit = true;
+                            return Ok(true);
                         }
 
-                        match spec.name {
+                        app.push_line(user_input_line(&raw_input));
+
+                        if let Some(template_command) = spec.template().cloned() {
+                            let prompt = match render_template_prompt(&template_command, &args, cwd)
+                                .await
+                            {
+                                Ok(prompt) => prompt,
+                                Err(err) => {
+                                    app.push_block(DotColor::Red, &format!("命令执行失败: {err}"));
+                                    app.input.clear();
+                                    app.cursor = 0;
+                                    app.refresh_slash(slash);
+                                    return Ok(true);
+                                }
+                            };
+
+                            app.input.clear();
+                            app.cursor = 0;
+                            app.refresh_slash(slash);
+                            app.status = Status::Thinking;
+                            app.blink_on = true;
+                            app.last_blink = Instant::now();
+
+                            let provider = (provider_factory)()?;
+                            let agent = Agent::new(
+                                provider,
+                                app.model.clone(),
+                                settings.clone(),
+                                store.clone(),
+                                tools.clone(),
+                                cwd.clone(),
+                                hooks.clone(),
+                                Some(interaction.clone()),
+                                plugins.clone(),
+                                tool_approvals.clone(),
+                                None,
+                                None,
+                            );
+                            let session_id = app.session_id.clone();
+                            let tx_clone = tx.clone();
+                            *runner = Some(tokio::spawn(async move {
+                                agent.run_turn(&session_id, &prompt, Some(tx_clone)).await
+                            }));
+                            return Ok(true);
+                        }
+
+                        match spec.name.as_str() {
                             "help" => {
                                 let target = args.split_whitespace().next().unwrap_or("");
                                 let message = if target.is_empty() {
                                     let mut lines = Vec::new();
                                     lines.push("可用命令:".to_string());
                                     for cmd in slash.commands() {
-                                        lines
-                                            .push(format!("  {} - {}", cmd.usage, cmd.description));
+                                        lines.push(format!(
+                                            "  {} [{}] - {}",
+                                            cmd.usage,
+                                            cmd.source_tag(),
+                                            cmd.description
+                                        ));
                                     }
                                     lines.push("输入 /help <命令> 查看用法".to_string());
                                     lines.join("\n")
                                 } else if let Some(cmd) = slash.find(target) {
-                                    format!("{} - {}", cmd.usage, cmd.description)
+                                    format!(
+                                        "{} [{}] - {}",
+                                        cmd.usage,
+                                        cmd.source_tag(),
+                                        cmd.description
+                                    )
                                 } else {
                                     format!("未知命令: /{target}（输入 /help 查看）")
                                 };

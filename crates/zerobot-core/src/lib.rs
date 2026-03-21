@@ -27,7 +27,10 @@ pub use agent::Agent;
 pub use agents::{AgentDefinition, AgentManager};
 pub use bus::{InboundMessage, MessageBus, OutboundMessage};
 pub use channel::{build_channel_manager, ChannelManager, ChatChannel};
-pub use commands::init_prompt;
+pub use commands::{
+    discover_template_commands, init_prompt, render_template_prompt, TemplateCommand,
+    TemplateCommandSource,
+};
 pub use config::{ConfigLayer, ConfigLoader, ConfigScope, LoadedConfig, Settings};
 pub use context::{ContextBuild, ContextManager};
 pub use cron::{
@@ -45,8 +48,8 @@ pub use interaction::{
 };
 pub use logging::{init_logging, init_logging_with_stdout, LogGuard};
 pub use plugin::{
-    PluginAuthAuthorizeResult, PluginAuthCallbackResult, PluginAuthMethod, PluginHookWarning,
-    PluginManager, PluginToolInfo,
+    PluginAssetRoot, PluginAuthAuthorizeResult, PluginAuthCallbackResult, PluginAuthMethod,
+    PluginHookWarning, PluginManager, PluginToolInfo,
 };
 pub use provider::{
     Provider, ProviderEvent, ProviderRequest, ProviderResponse, TokenUsage, ToolSpec,

@@ -1,16 +1,56 @@
+use std::collections::BTreeMap;
+use zerobot_core::commands::{TemplateCommand, TemplateCommandSource};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlashCommandOrigin {
+    Builtin,
+    Command,
+    Skill,
+    Plugin,
+}
+
+#[derive(Clone, Debug)]
+pub enum SlashCommandKind {
+    Builtin,
+    Template(TemplateCommand),
+}
+
 #[derive(Clone, Debug)]
 pub struct SlashCommandSpec {
-    pub name: &'static str,
-    pub aliases: &'static [&'static str],
-    pub description: &'static str,
-    pub usage: &'static str,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub description: String,
+    pub usage: String,
+    pub origin: SlashCommandOrigin,
+    pub kind: SlashCommandKind,
+}
+
+impl SlashCommandSpec {
+    pub fn source_tag(&self) -> &'static str {
+        match self.origin {
+            SlashCommandOrigin::Builtin => "builtin",
+            SlashCommandOrigin::Command => "command",
+            SlashCommandOrigin::Skill => "skill",
+            SlashCommandOrigin::Plugin => "plugin",
+        }
+    }
+
+    pub fn is_builtin(&self, name: &str) -> bool {
+        matches!(self.kind, SlashCommandKind::Builtin) && self.name == name
+    }
+
+    pub fn template(&self) -> Option<&TemplateCommand> {
+        match &self.kind {
+            SlashCommandKind::Builtin => None,
+            SlashCommandKind::Template(cmd) => Some(cmd),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct SlashMatch {
     pub name: String,
     pub description: String,
-    pub usage: String,
 }
 
 #[derive(Clone, Debug)]
@@ -19,82 +59,30 @@ pub struct SlashRegistry {
 }
 
 impl SlashRegistry {
-    pub fn extended() -> Self {
+    pub fn extended(dynamic: Vec<TemplateCommand>) -> Self {
+        let mut merged = BTreeMap::<String, SlashCommandSpec>::new();
+        for cmd in builtin_commands() {
+            merged.insert(cmd.name.clone(), cmd);
+        }
+        for cmd in dynamic {
+            merged.insert(
+                cmd.name.clone(),
+                SlashCommandSpec {
+                    name: cmd.name.clone(),
+                    aliases: Vec::new(),
+                    description: cmd.description.clone(),
+                    usage: cmd.usage.clone(),
+                    origin: match cmd.source {
+                        TemplateCommandSource::Command => SlashCommandOrigin::Command,
+                        TemplateCommandSource::Skill => SlashCommandOrigin::Skill,
+                        TemplateCommandSource::Plugin => SlashCommandOrigin::Plugin,
+                    },
+                    kind: SlashCommandKind::Template(cmd),
+                },
+            );
+        }
         Self {
-            commands: vec![
-                SlashCommandSpec {
-                    name: "help",
-                    aliases: &[],
-                    description: "显示命令列表或命令用法",
-                    usage: "/help [command]",
-                },
-                SlashCommandSpec {
-                    name: "clear",
-                    aliases: &[],
-                    description: "清空输出",
-                    usage: "/clear",
-                },
-                SlashCommandSpec {
-                    name: "exit",
-                    aliases: &["quit", "q"],
-                    description: "退出",
-                    usage: "/exit",
-                },
-                SlashCommandSpec {
-                    name: "copy",
-                    aliases: &[],
-                    description: "复制最近一次回复",
-                    usage: "/copy",
-                },
-                SlashCommandSpec {
-                    name: "tools",
-                    aliases: &[],
-                    description: "列出可用工具",
-                    usage: "/tools",
-                },
-                SlashCommandSpec {
-                    name: "init",
-                    aliases: &[],
-                    description: "分析项目并创建/更新 AGENTS.md",
-                    usage: "/init [extra requirements]",
-                },
-                SlashCommandSpec {
-                    name: "model",
-                    aliases: &[],
-                    description: "查看或设置模型",
-                    usage: "/model [list|name]",
-                },
-                SlashCommandSpec {
-                    name: "provider",
-                    aliases: &[],
-                    description: "查看或切换提供商",
-                    usage: "/provider [list|id]",
-                },
-                SlashCommandSpec {
-                    name: "config",
-                    aliases: &[],
-                    description: "查看配置摘要",
-                    usage: "/config show",
-                },
-                SlashCommandSpec {
-                    name: "session",
-                    aliases: &[],
-                    description: "会话管理",
-                    usage: "/session list|new [title]|show <id>",
-                },
-                SlashCommandSpec {
-                    name: "resume",
-                    aliases: &[],
-                    description: "恢复历史会话",
-                    usage: "/resume [id]",
-                },
-                SlashCommandSpec {
-                    name: "compact",
-                    aliases: &[],
-                    description: "压缩当前会话上下文",
-                    usage: "/compact",
-                },
-            ],
+            commands: merged.into_values().collect(),
         }
     }
 
@@ -130,9 +118,8 @@ impl SlashRegistry {
                 cmd.aliases.iter().any(|alias| alias.starts_with(&q))
             })
             .map(|cmd| SlashMatch {
-                name: cmd.name.to_string(),
-                description: cmd.description.to_string(),
-                usage: cmd.usage.to_string(),
+                name: cmd.name.clone(),
+                description: cmd.description.clone(),
             })
             .collect();
         results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -151,5 +138,160 @@ impl SlashRegistry {
             names.push("...".to_string());
         }
         names.join(" ")
+    }
+}
+
+fn builtin_commands() -> Vec<SlashCommandSpec> {
+    vec![
+        SlashCommandSpec {
+            name: "help".to_string(),
+            aliases: vec![],
+            description: "显示命令列表或命令用法".to_string(),
+            usage: "/help [command]".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "clear".to_string(),
+            aliases: vec![],
+            description: "清空输出".to_string(),
+            usage: "/clear".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "exit".to_string(),
+            aliases: vec!["quit".to_string(), "q".to_string()],
+            description: "退出".to_string(),
+            usage: "/exit".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "copy".to_string(),
+            aliases: vec![],
+            description: "复制最近一次回复".to_string(),
+            usage: "/copy".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "tools".to_string(),
+            aliases: vec![],
+            description: "列出可用工具".to_string(),
+            usage: "/tools".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "init".to_string(),
+            aliases: vec![],
+            description: "分析项目并创建/更新 AGENTS.md".to_string(),
+            usage: "/init [extra requirements]".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "model".to_string(),
+            aliases: vec![],
+            description: "查看或设置模型".to_string(),
+            usage: "/model [list|name]".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "provider".to_string(),
+            aliases: vec![],
+            description: "查看或切换提供商".to_string(),
+            usage: "/provider [list|id]".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "config".to_string(),
+            aliases: vec![],
+            description: "查看配置摘要".to_string(),
+            usage: "/config show".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "session".to_string(),
+            aliases: vec![],
+            description: "会话管理".to_string(),
+            usage: "/session list|new [title]|show <id>".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "resume".to_string(),
+            aliases: vec![],
+            description: "恢复历史会话".to_string(),
+            usage: "/resume [id]".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+        SlashCommandSpec {
+            name: "compact".to_string(),
+            aliases: vec![],
+            description: "压缩当前会话上下文".to_string(),
+            usage: "/compact".to_string(),
+            origin: SlashCommandOrigin::Builtin,
+            kind: SlashCommandKind::Builtin,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dynamic_command(name: &str, source: TemplateCommandSource) -> TemplateCommand {
+        TemplateCommand {
+            name: name.to_string(),
+            description: format!("desc {name}"),
+            template: "template".to_string(),
+            source,
+            usage: format!("/{name} [args]"),
+        }
+    }
+
+    #[test]
+    fn custom_command_overrides_builtin() {
+        let registry = SlashRegistry::extended(vec![dynamic_command(
+            "init",
+            TemplateCommandSource::Command,
+        )]);
+        let cmd = registry.find("init").unwrap();
+        assert!(matches!(cmd.kind, SlashCommandKind::Template(_)));
+        assert_eq!(cmd.source_tag(), "command");
+    }
+
+    #[test]
+    fn skill_does_not_override_existing_command() {
+        let mut map = BTreeMap::<String, TemplateCommand>::new();
+        map.insert(
+            "review".to_string(),
+            dynamic_command("review", TemplateCommandSource::Command),
+        );
+        map.entry("review".to_string())
+            .or_insert_with(|| dynamic_command("review", TemplateCommandSource::Skill));
+
+        let registry = SlashRegistry::extended(map.into_values().collect());
+        let cmd = registry.find("review").unwrap();
+        assert_eq!(cmd.source_tag(), "command");
+    }
+
+    #[test]
+    fn plugin_command_supported_in_find_and_matches() {
+        let registry = SlashRegistry::extended(vec![dynamic_command(
+            "demo:run",
+            TemplateCommandSource::Plugin,
+        )]);
+        let found = registry.find("demo:run").unwrap();
+        assert_eq!(found.source_tag(), "plugin");
+
+        let list = registry.matches("demo:");
+        assert!(list.iter().any(|item| item.name == "demo:run"));
     }
 }

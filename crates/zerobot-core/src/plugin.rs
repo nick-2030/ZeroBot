@@ -27,6 +27,12 @@ pub struct PluginToolInfo {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginAssetRoot {
+    pub plugin: String,
+    pub root: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginHookWarning {
     pub plugin: String,
@@ -90,6 +96,7 @@ struct PluginRuntimeConfig {
     name: String,
     command: Vec<String>,
     env: HashMap<String, String>,
+    asset_root: Option<PathBuf>,
     hook_timeout_ms: u64,
     tool_timeout_ms: u64,
     failure_mode: PluginFailureMode,
@@ -190,6 +197,20 @@ impl PluginManager {
 
     pub fn tools(&self) -> Vec<PluginToolInfo> {
         self.tools.values().cloned().collect()
+    }
+
+    pub fn asset_roots(&self) -> Vec<PluginAssetRoot> {
+        let mut out = Vec::new();
+        for client in &self.clients {
+            let Some(root) = &client.cfg.asset_root else {
+                continue;
+            };
+            out.push(PluginAssetRoot {
+                plugin: client.cfg.name.clone(),
+                root: root.clone(),
+            });
+        }
+        out
     }
 
     pub async fn shutdown(&self) {
@@ -738,14 +759,15 @@ fn resolve_entries(settings: &Settings, cwd: &Path) -> ZeroBotResult<Vec<PluginR
     let mut entries = Vec::new();
     let workspace = resolve_workspace_root(cwd);
 
-    entries.extend(
-        settings
-            .plugins
-            .entries
-            .iter()
-            .filter(|entry| entry.enabled.unwrap_or(true))
-            .cloned(),
-    );
+    entries.extend(settings.plugins.entries.iter().filter_map(|entry| {
+        if !entry.enabled.unwrap_or(true) {
+            return None;
+        }
+        Some(ResolvedPluginEntry {
+            entry: entry.clone(),
+            asset_root: None,
+        })
+    }));
 
     let mut dirs = Vec::new();
     dirs.push(home_dir().join(".zerobot").join("plugins"));
@@ -761,7 +783,8 @@ fn resolve_entries(settings: &Settings, cwd: &Path) -> ZeroBotResult<Vec<PluginR
 
     let deduped = deduplicate_entries(entries);
     let mut out = Vec::new();
-    for entry in deduped {
+    for resolved in deduped {
+        let entry = resolved.entry;
         if entry.command.is_empty() {
             return Err(ZeroBotError::Config(format!(
                 "插件 command 为空: {}",
@@ -772,6 +795,7 @@ fn resolve_entries(settings: &Settings, cwd: &Path) -> ZeroBotResult<Vec<PluginR
             name: entry.name,
             command: entry.command,
             env: entry.env,
+            asset_root: resolved.asset_root,
             hook_timeout_ms: entry
                 .hook_timeout_ms
                 .unwrap_or(settings.plugins.default_hook_timeout_ms),
@@ -785,7 +809,13 @@ fn resolve_entries(settings: &Settings, cwd: &Path) -> ZeroBotResult<Vec<PluginR
     Ok(out)
 }
 
-fn load_manifest_entries(dir: &Path) -> ZeroBotResult<Vec<PluginEntryConfig>> {
+#[derive(Debug, Clone)]
+struct ResolvedPluginEntry {
+    entry: PluginEntryConfig,
+    asset_root: Option<PathBuf>,
+}
+
+fn load_manifest_entries(dir: &Path) -> ZeroBotResult<Vec<ResolvedPluginEntry>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -827,17 +857,21 @@ fn load_manifest_entries(dir: &Path) -> ZeroBotResult<Vec<PluginEntryConfig>> {
         if !entry.enabled.unwrap_or(true) {
             continue;
         }
-        out.push(entry);
+        let asset_root = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|stem| dir.join(stem));
+        out.push(ResolvedPluginEntry { entry, asset_root });
     }
 
     Ok(out)
 }
 
-fn deduplicate_entries(entries: Vec<PluginEntryConfig>) -> Vec<PluginEntryConfig> {
+fn deduplicate_entries(entries: Vec<ResolvedPluginEntry>) -> Vec<ResolvedPluginEntry> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for entry in entries.into_iter().rev() {
-        if seen.insert(entry.name.clone()) {
+        if seen.insert(entry.entry.name.clone()) {
             out.push(entry);
         }
     }
@@ -906,32 +940,62 @@ async fn save_auth_store(path: &Path, store: &PluginAuthStore) -> ZeroBotResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn deduplicate_keeps_last() {
         let list = vec![
-            PluginEntryConfig {
-                name: "a".to_string(),
-                command: vec!["echo".to_string(), "1".to_string()],
-                env: HashMap::new(),
-                enabled: Some(true),
-                hook_timeout_ms: None,
-                tool_timeout_ms: None,
-                failure_mode: None,
+            ResolvedPluginEntry {
+                entry: PluginEntryConfig {
+                    name: "a".to_string(),
+                    command: vec!["echo".to_string(), "1".to_string()],
+                    env: HashMap::new(),
+                    enabled: Some(true),
+                    hook_timeout_ms: None,
+                    tool_timeout_ms: None,
+                    failure_mode: None,
+                },
+                asset_root: Some(PathBuf::from("/tmp/one")),
             },
-            PluginEntryConfig {
-                name: "a".to_string(),
-                command: vec!["echo".to_string(), "2".to_string()],
-                env: HashMap::new(),
-                enabled: Some(true),
-                hook_timeout_ms: None,
-                tool_timeout_ms: None,
-                failure_mode: None,
+            ResolvedPluginEntry {
+                entry: PluginEntryConfig {
+                    name: "a".to_string(),
+                    command: vec!["echo".to_string(), "2".to_string()],
+                    env: HashMap::new(),
+                    enabled: Some(true),
+                    hook_timeout_ms: None,
+                    tool_timeout_ms: None,
+                    failure_mode: None,
+                },
+                asset_root: Some(PathBuf::from("/tmp/two")),
             },
         ];
         let out = deduplicate_entries(list);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].command[1], "2");
+        assert_eq!(out[0].entry.command[1], "2");
+        assert_eq!(out[0].asset_root, Some(PathBuf::from("/tmp/two")));
+    }
+
+    #[test]
+    fn resolve_entries_picks_manifest_asset_root() {
+        let dir = TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("demo.yaml"),
+            r#"
+name: demo
+command: ["echo", "ok"]
+"#,
+        )
+        .unwrap();
+
+        let mut settings = Settings::default();
+        settings.plugins.paths = vec![plugin_dir.to_string_lossy().to_string()];
+        let out = resolve_entries(&settings, dir.path()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "demo");
+        assert_eq!(out[0].asset_root, Some(plugin_dir.join("demo")));
     }
 
     #[test]
