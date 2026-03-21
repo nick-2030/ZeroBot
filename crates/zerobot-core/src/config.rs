@@ -111,6 +111,8 @@ pub struct ToolApprovalSettings {
     pub per_tool: HashMap<String, ToolApprovalMode>,
     #[serde(default)]
     pub bash: CommandApprovalSettings,
+    #[serde(default)]
+    pub skill: CommandApprovalSettings,
 }
 
 fn default_tool_approval_mode() -> ToolApprovalMode {
@@ -135,6 +137,10 @@ impl ToolApprovalSettings {
 
     pub fn bash_mode_for(&self, command: &str) -> Option<ToolApprovalMode> {
         self.bash.mode_for(command)
+    }
+
+    pub fn skill_mode_for(&self, skill_name: &str) -> Option<ToolApprovalMode> {
+        self.skill.mode_for(skill_name)
     }
 }
 
@@ -404,6 +410,14 @@ pub struct SkillsSettings {
     pub enabled: bool,
     #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default = "default_skills_import_external")]
+    pub import_external: bool,
+}
+
+fn default_skills_import_external() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -601,6 +615,7 @@ impl Default for ToolApprovalSettings {
             default: default_tool_approval_mode(),
             per_tool: default_tool_approval_overrides(),
             bash: CommandApprovalSettings::default(),
+            skill: CommandApprovalSettings::default(),
         }
     }
 }
@@ -728,6 +743,8 @@ impl Default for SkillsSettings {
         Self {
             enabled: false,
             paths: Vec::new(),
+            urls: Vec::new(),
+            import_external: default_skills_import_external(),
         }
     }
 }
@@ -1121,6 +1138,9 @@ skills:
   enabled: true
   paths:
     - "/tmp/skills"
+  urls:
+    - "https://example.com/.well-known/skills/"
+  import_external: false
 "#,
         );
         let loader = ConfigLoader::new(cwd.to_path_buf());
@@ -1131,6 +1151,30 @@ skills:
         assert_eq!(loaded.settings.mcp.servers[1].name(), "remote-one");
         assert!(loaded.settings.skills.enabled);
         assert_eq!(loaded.settings.skills.paths.len(), 1);
+        assert_eq!(loaded.settings.skills.urls.len(), 1);
+        assert!(!loaded.settings.skills.import_external);
+    }
+
+    #[test]
+    fn skill_approval_rules_match_name_pattern() {
+        let mut approval = ToolApprovalSettings::default();
+        approval.skill.allow = vec!["safe-*".to_string()];
+        approval.skill.ask = vec!["review-*".to_string()];
+        approval.skill.deny = vec!["danger-*".to_string()];
+
+        assert_eq!(
+            approval.skill_mode_for("safe-build"),
+            Some(ToolApprovalMode::Auto)
+        );
+        assert_eq!(
+            approval.skill_mode_for("review-plan"),
+            Some(ToolApprovalMode::Prompt)
+        );
+        assert_eq!(
+            approval.skill_mode_for("danger-delete"),
+            Some(ToolApprovalMode::Deny)
+        );
+        assert_eq!(approval.skill_mode_for("other"), None);
     }
 
     #[test]

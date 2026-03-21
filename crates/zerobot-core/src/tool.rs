@@ -596,7 +596,7 @@ impl Tool for SkillTool {
         })
     }
 
-    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: SkillArgs =
             serde_json::from_value(args).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         let SkillContent { info, body } = match self.manager.load(&args.name) {
@@ -627,6 +627,8 @@ impl Tool for SkillTool {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        let skill_name = info.name.clone();
+        let skill_path = info.path.clone();
         let base = Url::from_directory_path(&dir)
             .map(|url| url.to_string())
             .unwrap_or_else(|_| format!("file://{}", dir.display()));
@@ -636,9 +638,24 @@ impl Tool for SkillTool {
             .collect::<Vec<_>>()
             .join("\n");
 
+        if let Some(plugins) = ctx.plugins() {
+            let _ = plugins
+                .run_hook(
+                    "skill.loaded",
+                    json!({
+                        "session_id": ctx.session_id,
+                        "skill_name": skill_name.clone(),
+                        "skill_path": skill_path.to_string_lossy().to_string(),
+                        "skill_dir": dir.to_string_lossy().to_string(),
+                    }),
+                    json!({}),
+                )
+                .await;
+        }
+
         let output = [
-            format!("<skill_content name=\"{}\">", info.name),
-            format!("# Skill: {}", info.name),
+            format!("<skill_content name=\"{}\">", skill_name),
+            format!("# Skill: {}", skill_name),
             String::new(),
             body.trim().to_string(),
             String::new(),
@@ -654,9 +671,9 @@ impl Tool for SkillTool {
         .join("\n");
 
         Ok(ToolOutput::new(output)
-            .with_title(format!("Loaded skill: {}", info.name))
+            .with_title(format!("Loaded skill: {}", skill_name))
             .with_metadata(json!({
-                "name": info.name,
+                "name": skill_name,
                 "dir": dir.to_string_lossy().to_string(),
             })))
     }
@@ -2980,9 +2997,13 @@ Use demo skill.
 
         let mut settings = Settings::default();
         settings.skills.enabled = true;
-        let registry = ToolRegistry::with_builtin_async(&settings, dir.path(), None, None)
-            .await
-            .unwrap();
+        settings.skills.import_external = false;
+        let manager = Arc::new(SkillManager::new(&settings, dir.path()));
+        let mut registry = ToolRegistry::with_builtin();
+        registry.register(SkillTool {
+            manager,
+            description: "加载指定 Skill 的内容".to_string(),
+        });
         let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
         let output = registry
             .run(&ctx, "skill", serde_json::json!({"name": "demo"}))
@@ -3014,9 +3035,13 @@ content
 
         let mut settings = Settings::default();
         settings.skills.enabled = true;
-        let registry = ToolRegistry::with_builtin_async(&settings, dir.path(), None, None)
-            .await
-            .unwrap();
+        settings.skills.import_external = false;
+        let manager = Arc::new(SkillManager::new(&settings, dir.path()));
+        let mut registry = ToolRegistry::with_builtin();
+        registry.register(SkillTool {
+            manager,
+            description: "加载指定 Skill 的内容".to_string(),
+        });
         let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
         let err = registry
             .run(&ctx, "skill", serde_json::json!({"name": "missing"}))

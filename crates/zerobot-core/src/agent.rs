@@ -956,6 +956,12 @@ impl Agent {
                     approval_mode = mode;
                 }
             }
+        } else if tool_name == "skill" {
+            if let Some(skill_name) = skill_name_from_args(&args) {
+                if let Some(mode) = self.settings.tools.approval.skill_mode_for(skill_name) {
+                    approval_mode = mode;
+                }
+            }
         }
         if approval_mode != ToolApprovalMode::Deny
             && self.tool_approvals.read().await.contains(&approval_key)
@@ -969,6 +975,8 @@ impl Agent {
             if let Some(handler) = self.interaction.clone() {
                 let reason = if is_bash_tool(&tool_name) {
                     bash_command_from_args(&args).map(|cmd| format!("bash 命令: {cmd}"))
+                } else if tool_name == "skill" {
+                    skill_name_from_args(&args).map(|name| format!("skill: {name}"))
                 } else {
                     None
                 };
@@ -1322,11 +1330,30 @@ fn bash_command_from_args(args: &JsonValue) -> Option<&str> {
     args.get("command").and_then(|v| v.as_str())
 }
 
+fn skill_name_from_args(args: &JsonValue) -> Option<&str> {
+    args.get("name").and_then(|v| v.as_str())
+}
+
 fn approval_key(tool_name: &str, args: &JsonValue) -> String {
     if is_bash_tool(tool_name) {
         if let Some(command) = bash_command_from_args(args) {
             return format!("{tool_name}:{command}");
         }
+    } else if tool_name == "skill" {
+        if let Some(name) = skill_name_from_args(args) {
+            return format!("{tool_name}:{name}");
+        }
     }
     tool_name.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_key_uses_skill_name() {
+        let key = approval_key("skill", &serde_json::json!({ "name": "deploy-prod" }));
+        assert_eq!(key, "skill:deploy-prod");
+    }
 }
