@@ -1,7 +1,7 @@
 use crate::config::Settings;
 use crate::error::{ZeroBotError, ZeroBotResult};
 use serde::Deserialize;
-use serde::{Serialize};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::path::Path;
@@ -136,7 +136,10 @@ pub struct HookManager {
 
 impl HookManager {
     pub fn new(agent_hooks: Vec<HookDefinition>, dir_hooks: Vec<HookDefinition>) -> Self {
-        Self { agent_hooks, dir_hooks }
+        Self {
+            agent_hooks,
+            dir_hooks,
+        }
     }
 
     pub fn empty() -> Self {
@@ -171,7 +174,11 @@ impl HookManager {
         payload: JsonValue,
         skill_hooks: &[HookDefinition],
     ) -> ZeroBotResult<HookDecision> {
-        let hooks = merge_hooks(self.agent_hooks.clone(), skill_hooks.to_vec(), self.dir_hooks.clone());
+        let hooks = merge_hooks(
+            self.agent_hooks.clone(),
+            skill_hooks.to_vec(),
+            self.dir_hooks.clone(),
+        );
         let mut current = payload;
         for hook in &hooks {
             if !hook.enabled() || !hook.matches(event, &current) {
@@ -264,8 +271,7 @@ async fn execute_hook(
         "session_id": session_id,
         "payload": payload,
     });
-    let input = serde_json::to_vec(&request)
-        .map_err(|err| ZeroBotError::Agent(err.to_string()))?;
+    let input = serde_json::to_vec(&request).map_err(|err| ZeroBotError::Agent(err.to_string()))?;
 
     let mut cmd = Command::new(&hook.command[0]);
     if hook.command.len() > 1 {
@@ -275,7 +281,9 @@ async fn execute_hook(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|err| ZeroBotError::Agent(err.to_string()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| ZeroBotError::Agent(err.to_string()))?;
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin.write_all(&input).await?;

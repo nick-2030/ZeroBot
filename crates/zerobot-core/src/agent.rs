@@ -1,3 +1,4 @@
+use crate::bus::OutboundMessage;
 use crate::config::{Settings, ToolApprovalMode};
 use crate::context::ContextManager;
 use crate::error::{ZeroBotError, ZeroBotResult};
@@ -6,17 +7,17 @@ use crate::hooks::{HookAction, HookEvent, HookManager};
 use crate::interaction::{InteractionHandler, ToolApprovalDecision, ToolApprovalRequest};
 use crate::provider::{Provider, ProviderEvent, ProviderRequest, ToolCall};
 use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
-use crate::tool::{ToolContext, ToolRegistry};
+use crate::skills::{format_skill_stack, SkillInfo};
+use crate::tool::{ToolContext, ToolRegistry, ToolRouteContext};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
-use crate::skills::{format_skill_stack, SkillInfo};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
-use uuid::Uuid;
 use tracing::warn;
+use uuid::Uuid;
 
 const COMPACTION_PROMPT: &str = r#"请根据以下对话内容生成一份“可继续执行任务”的摘要。
 
@@ -43,6 +44,8 @@ pub struct Agent {
     hooks: HookManager,
     interaction: Option<Arc<dyn InteractionHandler>>,
     tool_approvals: Arc<RwLock<HashSet<String>>>,
+    tool_route: Option<ToolRouteContext>,
+    outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
 }
 
 impl Agent {
@@ -56,6 +59,8 @@ impl Agent {
         hooks: HookManager,
         interaction: Option<Arc<dyn InteractionHandler>>,
         tool_approvals: Arc<RwLock<HashSet<String>>>,
+        tool_route: Option<ToolRouteContext>,
+        outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
     ) -> Self {
         Self {
             provider,
@@ -67,6 +72,8 @@ impl Agent {
             hooks,
             interaction,
             tool_approvals,
+            tool_route,
+            outbound,
         }
     }
 
@@ -76,7 +83,12 @@ impl Agent {
         input: &str,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> ZeroBotResult<String> {
-        self.emit(&events, AgentEvent::UserMessage { content: input.to_string() });
+        self.emit(
+            &events,
+            AgentEvent::UserMessage {
+                content: input.to_string(),
+            },
+        );
 
         let mut input_text = input.to_string();
         let skill_hooks = self.load_skill_hooks(session_id).await?;
@@ -93,7 +105,12 @@ impl Agent {
             let message = decision
                 .message
                 .unwrap_or_else(|| "输入被 Hook 拒绝".to_string());
-            self.emit(&events, AgentEvent::Error { message: message.clone() });
+            self.emit(
+                &events,
+                AgentEvent::Error {
+                    message: message.clone(),
+                },
+            );
             return Err(ZeroBotError::Agent(message));
         }
         if let Some(prompt) = decision.payload.get("prompt").and_then(|v| v.as_str()) {
@@ -117,7 +134,8 @@ impl Agent {
             .await?;
 
         let instruction_sources = crate::instruction::system_sources(&self.settings, &self.cwd);
-        let url_instructions = crate::instruction::fetch_url_instructions(&instruction_sources.urls).await;
+        let url_instructions =
+            crate::instruction::fetch_url_instructions(&instruction_sources.urls).await;
         let url_instruction_text = url_instructions
             .into_iter()
             .map(|item| item.content)
@@ -192,7 +210,11 @@ impl Agent {
             let tool_specs = self.tools.specs(&enabled);
             let mut request = ProviderRequest {
                 model: self.model.clone(),
-                system: if system.trim().is_empty() { None } else { Some(system) },
+                system: if system.trim().is_empty() {
+                    None
+                } else {
+                    Some(system)
+                },
                 messages: context.messages,
                 tools: tool_specs,
                 max_tokens: None,
@@ -213,11 +235,18 @@ impl Agent {
                 let message = decision
                     .message
                     .unwrap_or_else(|| "提供商调用被 Hook 拒绝".to_string());
-                self.emit(&events, AgentEvent::Error { message: message.clone() });
+                self.emit(
+                    &events,
+                    AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                );
                 return Err(ZeroBotError::Agent(message));
             }
             if decision.payload != JsonValue::Null {
-                if let Ok(updated) = serde_json::from_value::<ProviderRequest>(decision.payload.clone()) {
+                if let Ok(updated) =
+                    serde_json::from_value::<ProviderRequest>(decision.payload.clone())
+                {
                     request = updated;
                 }
             }
@@ -230,24 +259,19 @@ impl Agent {
             while let Some(event) = stream.next().await {
                 match event {
                     Ok(event) => match event {
-                    ProviderEvent::TextDelta(text) => {
-                        content.push_str(&text);
-                        had_delta = true;
-                        self.emit(
-                            &events,
-                            AgentEvent::AssistantDelta {
-                                content: text,
-                            },
-                        );
-                    }
-                    ProviderEvent::ToolCall(call) => {
-                        tool_calls.push(call);
-                    }
-                    ProviderEvent::Usage(usage) => {
-                        self.emit(&events, AgentEvent::Usage { usage });
-                    }
-                    ProviderEvent::Done => {}
-                },
+                        ProviderEvent::TextDelta(text) => {
+                            content.push_str(&text);
+                            had_delta = true;
+                            self.emit(&events, AgentEvent::AssistantDelta { content: text });
+                        }
+                        ProviderEvent::ToolCall(call) => {
+                            tool_calls.push(call);
+                        }
+                        ProviderEvent::Usage(usage) => {
+                            self.emit(&events, AgentEvent::Usage { usage });
+                        }
+                        ProviderEvent::Done => {}
+                    },
                     Err(err) => {
                         stream_error = Some(err);
                         break;
@@ -274,16 +298,30 @@ impl Agent {
             let skill_hooks = self.load_skill_hooks(session_id).await?;
             let post_decision = self
                 .hooks
-                .apply_event(HookEvent::PostProvider, session_id, post_payload, &skill_hooks)
+                .apply_event(
+                    HookEvent::PostProvider,
+                    session_id,
+                    post_payload,
+                    &skill_hooks,
+                )
                 .await?;
             if matches!(post_decision.action, HookAction::Deny) {
                 let message = post_decision
                     .message
                     .unwrap_or_else(|| "提供商输出被 Hook 拒绝".to_string());
-                self.emit(&events, AgentEvent::Error { message: message.clone() });
+                self.emit(
+                    &events,
+                    AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                );
                 return Err(ZeroBotError::Agent(message));
             }
-            if let Some(updated_content) = post_decision.payload.get("content").and_then(|v| v.as_str()) {
+            if let Some(updated_content) = post_decision
+                .payload
+                .get("content")
+                .and_then(|v| v.as_str())
+            {
                 content = updated_content.to_string();
             }
             if let Some(updated_calls) = post_decision.payload.get("tool_calls") {
@@ -319,8 +357,13 @@ impl Agent {
                         );
                     }
                 }
-                self.emit_context_usage(session_id, &events, skill_list.as_deref(), Some(&url_instruction_text))
-                    .await;
+                self.emit_context_usage(
+                    session_id,
+                    &events,
+                    skill_list.as_deref(),
+                    Some(&url_instruction_text),
+                )
+                .await;
                 let skill_stack = self.store.get_skill_stack(session_id).await?;
                 if !skill_stack.is_empty() {
                     let notice = format_skill_stack(&skill_stack);
@@ -378,8 +421,13 @@ impl Agent {
 
             for call in tool_calls {
                 self.handle_tool_call(session_id, call, &events).await?;
-                self.emit_context_usage(session_id, &events, skill_list.as_deref(), Some(&url_instruction_text))
-                    .await;
+                self.emit_context_usage(
+                    session_id,
+                    &events,
+                    skill_list.as_deref(),
+                    Some(&url_instruction_text),
+                )
+                .await;
             }
         }
 
@@ -507,7 +555,12 @@ impl Agent {
         });
         let decision = self
             .hooks
-            .apply_event(HookEvent::MessageAppend, &message.session_id, payload, &skill_hooks)
+            .apply_event(
+                HookEvent::MessageAppend,
+                &message.session_id,
+                payload,
+                &skill_hooks,
+            )
             .await?;
         if matches!(decision.action, HookAction::Deny) {
             let message = decision
@@ -552,11 +605,7 @@ impl Agent {
 
         if first_ai.is_some() || summary.is_some() {
             self.store
-                .update_session_brief(
-                    session_id,
-                    first_ai.as_deref(),
-                    summary.as_deref(),
-                )
+                .update_session_brief(session_id, first_ai.as_deref(), summary.as_deref())
                 .await?;
         }
 
@@ -620,7 +669,12 @@ impl Agent {
             );
             let tool_call_id = self
                 .store
-                .record_tool_call(&call.id, session_id, &call.name, &call.arguments.to_string())
+                .record_tool_call(
+                    &call.id,
+                    session_id,
+                    &call.name,
+                    &call.arguments.to_string(),
+                )
                 .await?;
             let _ = self.store.record_tool_output(&tool_call_id, &message).await;
             let _ = self
@@ -684,8 +738,7 @@ impl Agent {
         if approval_mode == ToolApprovalMode::Prompt {
             if let Some(handler) = self.interaction.clone() {
                 let reason = if is_bash_tool(&call.name) {
-                    bash_command_from_args(&args)
-                        .map(|cmd| format!("bash 命令: {cmd}"))
+                    bash_command_from_args(&args).map(|cmd| format!("bash 命令: {cmd}"))
                 } else {
                     None
                 };
@@ -699,10 +752,16 @@ impl Agent {
                 match response.decision {
                     ToolApprovalDecision::AllowOnce => {}
                     ToolApprovalDecision::AllowSession => {
-                        self.tool_approvals.write().await.insert(approval_key.clone());
+                        self.tool_approvals
+                            .write()
+                            .await
+                            .insert(approval_key.clone());
                     }
                     ToolApprovalDecision::AllowWorkspace => {
-                        self.tool_approvals.write().await.insert(approval_key.clone());
+                        self.tool_approvals
+                            .write()
+                            .await
+                            .insert(approval_key.clone());
                         self.store.insert_tool_approval(&approval_key).await?;
                     }
                     ToolApprovalDecision::Deny => {
@@ -775,11 +834,18 @@ impl Agent {
 
         let ctx = ToolContext::new(
             self.cwd.clone(),
-            self.settings.tools.allow_paths.iter().map(std::path::PathBuf::from).collect(),
+            self.settings
+                .tools
+                .allow_paths
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
             session_id,
             Some(self.store.clone()),
             self.interaction.clone(),
-        );
+        )
+        .with_route(self.tool_route.clone())
+        .with_outbound(self.outbound.clone());
 
         match self
             .tools
@@ -798,7 +864,12 @@ impl Agent {
                 let skill_hooks = self.load_skill_hooks(session_id).await?;
                 let post_decision = self
                     .hooks
-                    .apply_event(HookEvent::PostToolUse, session_id, post_payload, &skill_hooks)
+                    .apply_event(
+                        HookEvent::PostToolUse,
+                        session_id,
+                        post_payload,
+                        &skill_hooks,
+                    )
                     .await?;
                 if matches!(post_decision.action, HookAction::Deny) {
                     ok = false;

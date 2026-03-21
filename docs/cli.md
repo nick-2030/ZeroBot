@@ -55,6 +55,36 @@ zerobot config layers
 zerobot provider list
 ```
 
+## Gateway 常驻模式
+
+```
+zerobot gateway
+```
+
+- 启动后台 runtime，统一承载 channels / cron / heartbeat。
+- 该模式下工具审批固定为 `auto`。
+
+## Cron 管理
+
+```
+zerobot cron list --all
+zerobot cron add daily-report --message "生成日报" --cron-expr "0 0 9 * * * *" --tz "Asia/Shanghai" --deliver --channel feishu --to oc_xxx
+zerobot cron add remind --message "站会提醒" --every-seconds 1800
+zerobot cron run <job_id> --force
+zerobot cron enable <job_id>
+zerobot cron disable <job_id>
+zerobot cron remove <job_id>
+zerobot cron status
+zerobot cron export
+```
+
+## Heartbeat 管理
+
+```
+zerobot heartbeat status
+zerobot heartbeat trigger
+```
+
 ## CLI 覆盖
 
 ```

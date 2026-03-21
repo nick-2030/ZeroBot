@@ -1,16 +1,18 @@
 use crate::agent::Agent;
 use crate::agents::AgentManager;
+use crate::bus::OutboundMessage;
 use crate::config::{Settings, ToolOutputDirection, ToolOutputSettings};
+use crate::cron::{CronPayload, CronSchedule, CronScheduleKind, CronService};
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookManager;
-use crate::interaction::{InteractionHandler, UserInputRequest, UserInputResponse};
 use crate::instruction;
+use crate::interaction::{InteractionHandler, UserInputRequest, UserInputResponse};
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
 use crate::provider::ProviderFactory;
 use crate::session::{FileReadRecord, SessionKind, SessionStore, TodoItem};
-use crate::skills::{SkillAction, SkillManager, SkillContent, SkillStackEntry};
+use crate::skills::{SkillAction, SkillContent, SkillManager, SkillStackEntry};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use diffy::{create_patch, Patch};
 use regex::Regex;
 use serde::Deserialize;
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -33,6 +35,15 @@ pub struct ToolContext {
     pub session_id: String,
     pub store: Option<Arc<dyn SessionStore>>,
     pub interaction: Option<Arc<dyn InteractionHandler>>,
+    pub route: Option<ToolRouteContext>,
+    pub outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolRouteContext {
+    pub channel: String,
+    pub chat_id: String,
+    pub message_id: Option<String>,
 }
 
 impl ToolContext {
@@ -49,7 +60,22 @@ impl ToolContext {
             session_id: session_id.into(),
             store,
             interaction,
+            route: None,
+            outbound: None,
         }
+    }
+
+    pub fn with_route(mut self, route: Option<ToolRouteContext>) -> Self {
+        self.route = route;
+        self
+    }
+
+    pub fn with_outbound(
+        mut self,
+        outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    ) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     pub fn resolve_path(&self, input: &str) -> ZeroBotResult<PathBuf> {
@@ -59,9 +85,7 @@ impl ToolContext {
         } else {
             self.cwd.join(path)
         };
-        let full = full
-            .canonicalize()
-            .unwrap_or_else(|_| full.clone());
+        let full = full.canonicalize().unwrap_or_else(|_| full.clone());
 
         if self.allow_paths.is_empty() {
             return Ok(full);
@@ -125,7 +149,10 @@ async fn record_file_read(ctx: &ToolContext, path: &Path) -> ZeroBotResult<()> {
     Ok(())
 }
 
-async fn ensure_read_before_write(ctx: &ToolContext, path: &Path) -> ZeroBotResult<Option<FileReadRecord>> {
+async fn ensure_read_before_write(
+    ctx: &ToolContext,
+    path: &Path,
+) -> ZeroBotResult<Option<FileReadRecord>> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -145,7 +172,9 @@ async fn ensure_read_before_write(ctx: &ToolContext, path: &Path) -> ZeroBotResu
         .get_file_read(&ctx.session_id, &path.to_string_lossy())
         .await?;
     let Some(record) = record else {
-        return Err(ZeroBotError::Tool("写入前请先使用 read 读取目标文件".to_string()));
+        return Err(ZeroBotError::Tool(
+            "写入前请先使用 read 读取目标文件".to_string(),
+        ));
     };
     if record.mtime != current_mtime {
         return Err(ZeroBotError::Tool(
@@ -206,7 +235,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
@@ -273,6 +304,7 @@ impl ToolRegistry {
         registry.register(TodoReadTool);
         registry.register(TodoWriteTool);
         registry.register(RequestUserInputTool);
+        registry.register(MessageTool);
         registry
     }
 
@@ -284,10 +316,30 @@ impl ToolRegistry {
         let mut registry = Self::with_builtin();
 
         if settings.skills.enabled {
-            let store = store.ok_or_else(|| ZeroBotError::Tool("Skill 需要 SessionStore".to_string()))?;
+            let store =
+                store.ok_or_else(|| ZeroBotError::Tool("Skill 需要 SessionStore".to_string()))?;
             let manager = Arc::new(SkillManager::new(settings, cwd));
             registry.register(SkillTool { manager, store });
         }
+
+        let workspace_root = crate::workspace::resolve_workspace_root(cwd);
+        let db_path = crate::workspace::resolve_session_db_path(&workspace_root);
+        let cron_export_path = settings
+            .gateway
+            .cron
+            .export_json
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| Some(workspace_root.join(".zerobot").join("cron-jobs.json")));
+        let cron_service = Arc::new(
+            CronService::new(
+                db_path,
+                cron_export_path,
+                settings.gateway.cron.run_history_limit,
+            )
+            .await?,
+        );
+        registry.register(CronTool::new(cron_service));
 
         if let Some(mcp) = McpManager::new(settings, cwd).await? {
             let mcp = Arc::new(mcp);
@@ -374,8 +426,8 @@ impl Tool for SubagentTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: SubagentArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: SubagentArgs =
+            serde_json::from_value(args).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
 
         let manager = AgentManager::new(&self.cwd);
         let def = manager.load(&args.name)?;
@@ -453,6 +505,8 @@ impl Tool for SubagentTool {
             hooks.clone(),
             self.interaction.clone(),
             self.tool_approvals.clone(),
+            ctx.route.clone(),
+            ctx.outbound.clone(),
         );
 
         let result = agent.run_turn(&session.id, &args.prompt, None).await;
@@ -512,8 +566,8 @@ impl Tool for SkillTool {
     }
 
     async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: SkillArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: SkillArgs =
+            serde_json::from_value(args).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         let action = args.action.unwrap_or(SkillAction::Start);
         match action {
             SkillAction::Start => {
@@ -824,9 +878,10 @@ impl Tool for ReadTool {
                 .map_err(|err| io_error("读取目录项", &path, &err))?
             {
                 let name = entry.file_name().to_string_lossy().to_string();
-                let file_type = entry.file_type().await.map_err(|err| {
-                    io_error("读取目录项", &entry.path(), &err)
-                })?;
+                let file_type = entry
+                    .file_type()
+                    .await
+                    .map_err(|err| io_error("读取目录项", &entry.path(), &err))?;
                 if file_type.is_dir() {
                     entries.push(format!("{name}/"));
                 } else {
@@ -872,18 +927,16 @@ impl Tool for ReadTool {
             body.push_str("\n</entries>\n");
             body.push_str(&format!("<summary>{summary}</summary>"));
 
-            return Ok(
-                ToolOutput::new(body)
-                    .with_title(title)
-                    .with_metadata(json!({
-                        "path": path.to_string_lossy(),
-                        "type": "directory",
-                        "offset": offset,
-                        "limit": limit,
-                        "total_entries": entries.len(),
-                        "truncated": truncated
-                    })),
-            );
+            return Ok(ToolOutput::new(body)
+                .with_title(title)
+                .with_metadata(json!({
+                    "path": path.to_string_lossy(),
+                    "type": "directory",
+                    "offset": offset,
+                    "limit": limit,
+                    "total_entries": entries.len(),
+                    "truncated": truncated
+                })));
         }
 
         let content = match tokio::fs::read_to_string(&path).await {
@@ -957,18 +1010,16 @@ impl Tool for ReadTool {
 
         record_file_read(ctx, &path).await?;
 
-        Ok(
-            ToolOutput::new(body)
-                .with_title(title)
-                .with_metadata(json!({
-                    "path": path.to_string_lossy(),
-                    "type": "file",
-                    "offset": offset,
-                    "limit": limit,
-                    "total_lines": lines.len(),
-                    "truncated": truncated
-                })),
-        )
+        Ok(ToolOutput::new(body)
+            .with_title(title)
+            .with_metadata(json!({
+                "path": path.to_string_lossy(),
+                "type": "file",
+                "offset": offset,
+                "limit": limit,
+                "total_lines": lines.len(),
+                "truncated": truncated
+            })))
     }
 }
 
@@ -1017,9 +1068,7 @@ impl Tool for WriteTool {
             let _ = ensure_read_before_write(ctx, &path).await?;
         }
         let before = if existed {
-            tokio::fs::read_to_string(&path)
-                .await
-                .unwrap_or_default()
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
         } else {
             String::new()
         };
@@ -1043,19 +1092,17 @@ impl Tool for WriteTool {
             summary,
             diff.trim_end()
         );
-        Ok(
-            ToolOutput::new(body)
-                .with_title(
-                    path.strip_prefix(&ctx.cwd)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string(),
-                )
-                .with_metadata(json!({
-                    "path": path.to_string_lossy(),
-                    "existed": existed
-                })),
-        )
+        Ok(ToolOutput::new(body)
+            .with_title(
+                path.strip_prefix(&ctx.cwd)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .with_metadata(json!({
+                "path": path.to_string_lossy(),
+                "existed": existed
+            })))
     }
 }
 
@@ -1114,11 +1161,23 @@ impl Tool for EditTool {
         }
 
         let original = content.clone();
-        let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+        let line_ending = if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
         let old = args.old_string.replace("\r\n", "\n").replace('\r', "\n");
         let new = args.new_string.replace("\r\n", "\n").replace('\r', "\n");
-        let old = if line_ending == "\n" { old } else { old.replace('\n', "\r\n") };
-        let new = if line_ending == "\n" { new } else { new.replace('\n', "\r\n") };
+        let old = if line_ending == "\n" {
+            old
+        } else {
+            old.replace('\n', "\r\n")
+        };
+        let new = if line_ending == "\n" {
+            new
+        } else {
+            new.replace('\n', "\r\n")
+        };
 
         let count = content.matches(&old).count();
         if count == 0 {
@@ -1145,19 +1204,17 @@ impl Tool for EditTool {
             path.display(),
             diff.trim_end()
         );
-        Ok(
-            ToolOutput::new(body)
-                .with_title(
-                    path.strip_prefix(&ctx.cwd)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string(),
-                )
-                .with_metadata(json!({
-                    "path": path.to_string_lossy(),
-                    "replaced": count
-                })),
-        )
+        Ok(ToolOutput::new(body)
+            .with_title(
+                path.strip_prefix(&ctx.cwd)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .with_metadata(json!({
+                "path": path.to_string_lossy(),
+                "replaced": count
+            })))
     }
 }
 
@@ -1243,13 +1300,18 @@ impl Tool for PatchTool {
 
 #[derive(Debug)]
 enum ApplyPatchOp {
-    Add { path: String, content: String },
+    Add {
+        path: String,
+        content: String,
+    },
     Update {
         path: String,
         move_to: Option<String>,
         hunks: Vec<ApplyPatchHunk>,
     },
-    Delete { path: String },
+    Delete {
+        path: String,
+    },
 }
 
 #[derive(Debug)]
@@ -1377,15 +1439,13 @@ async fn apply_patch_text(ctx: &ToolContext, patch_text: &str) -> ZeroBotResult<
     body.push_str(&diffs.join("\n\n"));
     body.push_str("\n</diff>");
 
-    Ok(
-        ToolOutput::new(body)
-            .with_title("apply_patch")
-            .with_metadata(json!({
-                "files_changed": files.len(),
-                "additions": additions,
-                "deletions": deletions
-            })),
-    )
+    Ok(ToolOutput::new(body)
+        .with_title("apply_patch")
+        .with_metadata(json!({
+            "files_changed": files.len(),
+            "additions": additions,
+            "deletions": deletions
+        })))
 }
 
 async fn apply_legacy_patch(
@@ -1399,8 +1459,8 @@ async fn apply_legacy_patch(
         .await
         .map_err(|err| io_error("读取文件", &full, &err))?;
     let patch = Patch::from_str(patch_text).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
-    let updated = diffy::apply(&content, &patch)
-        .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+    let updated =
+        diffy::apply(&content, &patch).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
     tokio::fs::write(&full, &updated)
         .await
         .map_err(|err| io_error("写入文件", &full, &err))?;
@@ -1410,15 +1470,13 @@ async fn apply_legacy_patch(
         "<summary>Applied legacy patch.</summary>\n<diff>\n{}\n</diff>",
         diff.trim_end()
     );
-    Ok(
-        ToolOutput::new(body)
-            .with_title("patch")
-            .with_metadata(json!({
-                "path": full.to_string_lossy(),
-                "additions": additions,
-                "deletions": deletions
-            })),
-    )
+    Ok(ToolOutput::new(body)
+        .with_title("patch")
+        .with_metadata(json!({
+            "path": full.to_string_lossy(),
+            "additions": additions,
+            "deletions": deletions
+        })))
 }
 
 fn parse_apply_patch(patch: &str) -> ZeroBotResult<Vec<ApplyPatchOp>> {
@@ -1520,19 +1578,15 @@ fn parse_apply_patch(patch: &str) -> ZeroBotResult<Vec<ApplyPatchOp>> {
                         continue;
                     }
                     let mut chars = line.chars();
-                    let prefix = chars.next().ok_or_else(|| {
-                        ZeroBotError::Tool("空行不符合补丁格式".to_string())
-                    })?;
+                    let prefix = chars
+                        .next()
+                        .ok_or_else(|| ZeroBotError::Tool("空行不符合补丁格式".to_string()))?;
                     let rest = chars.collect::<String>();
                     match prefix {
                         ' ' => hunk_lines.push(ApplyPatchLine::Context(rest)),
                         '+' => hunk_lines.push(ApplyPatchLine::Add(rest)),
                         '-' => hunk_lines.push(ApplyPatchLine::Remove(rest)),
-                        _ => {
-                            return Err(ZeroBotError::Tool(format!(
-                                "无效的补丁行前缀: {prefix}"
-                            )))
-                        }
+                        _ => return Err(ZeroBotError::Tool(format!("无效的补丁行前缀: {prefix}"))),
                     }
                     i += 1;
                 }
@@ -1552,15 +1606,17 @@ fn parse_apply_patch(patch: &str) -> ZeroBotResult<Vec<ApplyPatchOp>> {
             continue;
         }
 
-        return Err(ZeroBotError::Tool(format!(
-            "未知补丁头: {line}"
-        )));
+        return Err(ZeroBotError::Tool(format!("未知补丁头: {line}")));
     }
     Ok(ops)
 }
 
 fn apply_hunks(content: &str, hunks: &[ApplyPatchHunk]) -> ZeroBotResult<String> {
-    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let normalized = content.replace("\r\n", "\n");
     let ends_with_newline = normalized.ends_with('\n');
     let mut lines: Vec<String> = if normalized.is_empty() {
@@ -1606,18 +1662,14 @@ fn apply_hunks(content: &str, hunks: &[ApplyPatchHunk]) -> ZeroBotResult<String>
             match line {
                 ApplyPatchLine::Context(text) => {
                     if lines.get(cursor).map(|s| s.as_str()) != Some(text.as_str()) {
-                        return Err(ZeroBotError::Tool(
-                            "hunk 内容与文件不匹配".to_string(),
-                        ));
+                        return Err(ZeroBotError::Tool("hunk 内容与文件不匹配".to_string()));
                     }
                     replacement.push(text.clone());
                     cursor += 1;
                 }
                 ApplyPatchLine::Remove(text) => {
                     if lines.get(cursor).map(|s| s.as_str()) != Some(text.as_str()) {
-                        return Err(ZeroBotError::Tool(
-                            "hunk 内容与文件不匹配".to_string(),
-                        ));
+                        return Err(ZeroBotError::Tool("hunk 内容与文件不匹配".to_string()));
                     }
                     cursor += 1;
                 }
@@ -1711,10 +1763,7 @@ impl Tool for GlobTool {
         {
             if let Ok(path) = entry {
                 if let Ok(meta) = tokio::fs::metadata(&path).await {
-                    let mtime = meta
-                        .modified()
-                        .map(system_time_to_ts)
-                        .unwrap_or_default();
+                    let mtime = meta.modified().map(system_time_to_ts).unwrap_or_default();
                     results.push((path, mtime));
                 }
             }
@@ -1734,11 +1783,7 @@ impl Tool for GlobTool {
         let summary = if output_lines.is_empty() {
             "No files found".to_string()
         } else if truncated {
-            format!(
-                "Found {} files (showing first {}).",
-                results.len(),
-                limit
-            )
+            format!("Found {} files (showing first {}).", results.len(), limit)
         } else {
             format!("Found {} files.", results.len())
         };
@@ -1746,20 +1791,18 @@ impl Tool for GlobTool {
             "<summary>{summary}</summary>\n<results>\n{}\n</results>",
             output_lines.join("\n")
         );
-        Ok(
-            ToolOutput::new(body)
-                .with_title(
-                    root.strip_prefix(&ctx.cwd)
-                        .unwrap_or(&root)
-                        .to_string_lossy()
-                        .to_string(),
-                )
-                .with_metadata(json!({
-                    "path": root.to_string_lossy(),
-                    "count": results.len(),
-                    "truncated": truncated
-                })),
-        )
+        Ok(ToolOutput::new(body)
+            .with_title(
+                root.strip_prefix(&ctx.cwd)
+                    .unwrap_or(&root)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .with_metadata(json!({
+                "path": root.to_string_lossy(),
+                "count": results.len(),
+                "truncated": truncated
+            })))
     }
 }
 
@@ -1803,8 +1846,7 @@ impl Tool for GrepTool {
         } else {
             ctx.cwd.clone()
         };
-        let regex = Regex::new(&args.pattern)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let regex = Regex::new(&args.pattern).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         if !root.exists() {
             return Err(ZeroBotError::Tool(format!(
                 "搜索路径不存在: {}",
@@ -1843,11 +1885,7 @@ impl Tool for GrepTool {
                         let mut text = line.to_string();
                         const MAX_LINE_LENGTH: usize = 2000;
                         if text.chars().count() > MAX_LINE_LENGTH {
-                            text = text
-                                .chars()
-                                .take(MAX_LINE_LENGTH)
-                                .collect::<String>()
-                                + "...";
+                            text = text.chars().take(MAX_LINE_LENGTH).collect::<String>() + "...";
                         }
                         entry.push((idx + 1, text));
                     }
@@ -1912,20 +1950,18 @@ impl Tool for GrepTool {
             "<summary>{summary}</summary>\n<results>\n{}\n</results>",
             results.join("\n")
         );
-        Ok(
-            ToolOutput::new(body)
-                .with_title(
-                    root.strip_prefix(&ctx.cwd)
-                        .unwrap_or(&root)
-                        .to_string_lossy()
-                        .to_string(),
-                )
-                .with_metadata(json!({
-                    "path": root.to_string_lossy(),
-                    "matches": total_matches,
-                    "truncated": truncated
-                })),
-        )
+        Ok(ToolOutput::new(body)
+            .with_title(
+                root.strip_prefix(&ctx.cwd)
+                    .unwrap_or(&root)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .with_metadata(json!({
+                "path": root.to_string_lossy(),
+                "matches": total_matches,
+                "truncated": truncated
+            })))
     }
 }
 
@@ -1967,7 +2003,14 @@ impl Tool for BashTool {
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
         let args: BashArgs = serde_json::from_value(args).map_err(param_error)?;
-        run_bash_command(ctx, &args.command, args.workdir.as_deref(), args.timeout_ms, args.description.as_deref()).await
+        run_bash_command(
+            ctx,
+            &args.command,
+            args.workdir.as_deref(),
+            args.timeout_ms,
+            args.description.as_deref(),
+        )
+        .await
     }
 }
 
@@ -2046,18 +2089,16 @@ async fn run_bash_command(
                 command,
                 msg
             );
-            return Ok(
-                ToolOutput::new(body)
-                    .with_title("bash")
-                    .with_metadata(json!({
-                        "command": command,
-                        "workdir": workdir,
-                        "timeout_ms": timeout_ms,
-                        "description": description,
-                        "exit_code": -1,
-                        "ok": false
-                    })),
-            );
+            return Ok(ToolOutput::new(body)
+                .with_title("bash")
+                .with_metadata(json!({
+                    "command": command,
+                    "workdir": workdir,
+                    "timeout_ms": timeout_ms,
+                    "description": description,
+                    "exit_code": -1,
+                    "ok": false
+                })));
         }
     };
 
@@ -2068,18 +2109,16 @@ async fn run_bash_command(
         stdout.trim_end(),
         stderr.trim_end()
     );
-    Ok(
-        ToolOutput::new(body)
-            .with_title("bash")
-            .with_metadata(json!({
-                "command": command,
-                "workdir": workdir,
-                "timeout_ms": timeout_ms,
-                "description": description,
-                "exit_code": exit_code,
-                "ok": exit_code == 0
-            })),
-    )
+    Ok(ToolOutput::new(body)
+        .with_title("bash")
+        .with_metadata(json!({
+            "command": command,
+            "workdir": workdir,
+            "timeout_ms": timeout_ms,
+            "description": description,
+            "exit_code": exit_code,
+            "ok": exit_code == 0
+        })))
 }
 
 struct TodoReadTool;
@@ -2153,8 +2192,8 @@ impl Tool for TodoWriteTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: TodoWriteArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: TodoWriteArgs =
+            serde_json::from_value(args).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         let store = ctx
             .store()
             .ok_or_else(|| ZeroBotError::Tool("Todo 工具需要 SessionStore".to_string()))?;
@@ -2163,6 +2202,304 @@ impl Tool for TodoWriteTool {
             .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         Ok(ToolOutput::new(content))
     }
+}
+
+struct MessageTool;
+
+#[derive(Deserialize)]
+struct MessageArgs {
+    content: String,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    media: Option<Vec<String>>,
+}
+
+#[async_trait]
+impl Tool for MessageTool {
+    fn name(&self) -> &str {
+        "message"
+    }
+
+    fn description(&self) -> &str {
+        "向指定通道发送消息；未显式指定 channel/chat_id 时默认回复当前通道上下文。"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "content": {"type":"string", "description":"消息正文"},
+                "channel": {"type":"string", "description":"目标通道，如 feishu"},
+                "chat_id": {"type":"string", "description":"目标会话 ID"},
+                "message_id": {"type":"string", "description":"可选，目标消息 ID（用于回复）"},
+                "media": {"type":"array", "items":{"type":"string"}, "description":"可选，本地文件路径列表"}
+            },
+            "required": ["content"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: MessageArgs = serde_json::from_value(args).map_err(param_error)?;
+        let sender = ctx
+            .outbound
+            .as_ref()
+            .ok_or_else(|| ZeroBotError::Tool("message 工具仅在 gateway 运行时可用".to_string()))?;
+
+        let route = ctx.route.clone();
+        let channel = args
+            .channel
+            .or_else(|| route.as_ref().map(|r| r.channel.clone()))
+            .ok_or_else(|| ZeroBotError::Tool("message 缺少 channel".to_string()))?;
+        let chat_id = args
+            .chat_id
+            .or_else(|| route.as_ref().map(|r| r.chat_id.clone()))
+            .ok_or_else(|| ZeroBotError::Tool("message 缺少 chat_id".to_string()))?;
+        let message_id = args.message_id.or_else(|| route.and_then(|r| r.message_id));
+
+        let mut metadata = json!({});
+        if let Some(mid) = message_id {
+            metadata["message_id"] = JsonValue::String(mid);
+        }
+        let msg = OutboundMessage {
+            channel,
+            chat_id,
+            content: args.content,
+            media: args.media.unwrap_or_default(),
+            metadata,
+        };
+        sender
+            .send(msg)
+            .map_err(|err| ZeroBotError::Tool(format!("message 发送失败: {err}")))?;
+        Ok(ToolOutput::new("message queued"))
+    }
+}
+
+struct CronTool {
+    service: Arc<CronService>,
+}
+
+impl CronTool {
+    fn new(service: Arc<CronService>) -> Self {
+        Self { service }
+    }
+}
+
+#[derive(Deserialize)]
+struct CronToolArgs {
+    action: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    every_seconds: Option<i64>,
+    #[serde(default)]
+    cron_expr: Option<String>,
+    #[serde(default)]
+    tz: Option<String>,
+    #[serde(default)]
+    at: Option<String>,
+    #[serde(default)]
+    job_id: Option<String>,
+    #[serde(default)]
+    deliver: Option<bool>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    delete_after_run: Option<bool>,
+    #[serde(default)]
+    force: Option<bool>,
+}
+
+#[async_trait]
+impl Tool for CronTool {
+    fn name(&self) -> &str {
+        "cron"
+    }
+
+    fn description(&self) -> &str {
+        "管理计划任务。actions: add/list/remove/enable/disable/run/status/export"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["add","list","remove","enable","disable","run","status","export"]},
+                "name":{"type":"string"},
+                "message":{"type":"string"},
+                "every_seconds":{"type":"integer"},
+                "cron_expr":{"type":"string"},
+                "tz":{"type":"string"},
+                "at":{"type":"string","description":"ISO datetime 或 unix 毫秒字符串"},
+                "job_id":{"type":"string"},
+                "deliver":{"type":"boolean"},
+                "channel":{"type":"string"},
+                "to":{"type":"string"},
+                "delete_after_run":{"type":"boolean"},
+                "force":{"type":"boolean"}
+            },
+            "required":["action"]
+        })
+    }
+
+    async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: CronToolArgs = serde_json::from_value(args).map_err(param_error)?;
+        match args.action.as_str() {
+            "add" => {
+                let message = args
+                    .message
+                    .ok_or_else(|| ZeroBotError::Tool("cron add 缺少 message".to_string()))?;
+                let schedule = if let Some(sec) = args.every_seconds {
+                    CronSchedule {
+                        kind: CronScheduleKind::Every,
+                        at_ms: None,
+                        every_ms: Some(sec.saturating_mul(1000)),
+                        expr: None,
+                        tz: None,
+                    }
+                } else if let Some(expr) = args.cron_expr {
+                    CronSchedule {
+                        kind: CronScheduleKind::Cron,
+                        at_ms: None,
+                        every_ms: None,
+                        expr: Some(expr),
+                        tz: args.tz,
+                    }
+                } else if let Some(at) = args.at {
+                    let at_ms = parse_at_to_millis(&at)?;
+                    CronSchedule {
+                        kind: CronScheduleKind::At,
+                        at_ms: Some(at_ms),
+                        every_ms: None,
+                        expr: None,
+                        tz: None,
+                    }
+                } else {
+                    return Err(ZeroBotError::Tool(
+                        "cron add 需要 every_seconds / cron_expr / at 之一".to_string(),
+                    ));
+                };
+
+                let route = ctx.route.clone();
+                let payload = CronPayload {
+                    kind: "agent_turn".to_string(),
+                    message: message.clone(),
+                    deliver: args.deliver.unwrap_or(false),
+                    channel: args
+                        .channel
+                        .or_else(|| route.as_ref().map(|r| r.channel.clone())),
+                    to: args
+                        .to
+                        .or_else(|| route.as_ref().map(|r| r.chat_id.clone())),
+                };
+                let name = args
+                    .name
+                    .unwrap_or_else(|| message.chars().take(30).collect::<String>());
+                let job = self
+                    .service
+                    .add_job(
+                        name,
+                        schedule,
+                        payload,
+                        args.delete_after_run.unwrap_or(false),
+                    )
+                    .await?;
+                let rendered = serde_json::to_string_pretty(&job)
+                    .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+                Ok(ToolOutput::new(rendered))
+            }
+            "list" => {
+                let jobs = self.service.list_jobs(false).await?;
+                let rendered = serde_json::to_string_pretty(&jobs)
+                    .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+                Ok(ToolOutput::new(rendered))
+            }
+            "remove" => {
+                let id = args
+                    .job_id
+                    .ok_or_else(|| ZeroBotError::Tool("cron remove 缺少 job_id".to_string()))?;
+                let removed = self.service.remove_job(&id).await?;
+                Ok(ToolOutput::new(if removed {
+                    "removed"
+                } else {
+                    "not_found"
+                }))
+            }
+            "enable" => {
+                let id = args
+                    .job_id
+                    .ok_or_else(|| ZeroBotError::Tool("cron enable 缺少 job_id".to_string()))?;
+                let job = self.service.enable_job(&id, true).await?;
+                let rendered = serde_json::to_string_pretty(&job)
+                    .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+                Ok(ToolOutput::new(rendered))
+            }
+            "disable" => {
+                let id = args
+                    .job_id
+                    .ok_or_else(|| ZeroBotError::Tool("cron disable 缺少 job_id".to_string()))?;
+                let job = self.service.enable_job(&id, false).await?;
+                let rendered = serde_json::to_string_pretty(&job)
+                    .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+                Ok(ToolOutput::new(rendered))
+            }
+            "run" => {
+                let id = args
+                    .job_id
+                    .ok_or_else(|| ZeroBotError::Tool("cron run 缺少 job_id".to_string()))?;
+                let ok = self
+                    .service
+                    .run_job(&id, args.force.unwrap_or(false))
+                    .await?;
+                Ok(ToolOutput::new(if ok {
+                    "ok"
+                } else {
+                    "not_found_or_disabled"
+                }))
+            }
+            "status" => {
+                let status = self.service.status().await?;
+                let rendered = serde_json::to_string_pretty(&status)
+                    .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+                Ok(ToolOutput::new(rendered))
+            }
+            "export" => {
+                let path = self.service.export_snapshot().await?;
+                let body = path
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "disabled".to_string());
+                Ok(ToolOutput::new(body))
+            }
+            _ => Err(ZeroBotError::Tool("未知 cron action".to_string())),
+        }
+    }
+}
+
+fn parse_at_to_millis(value: &str) -> ZeroBotResult<i64> {
+    if let Ok(ms) = value.parse::<i64>() {
+        return Ok(ms);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.timestamp_millis());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S") {
+        let local = chrono::Local
+            .from_local_datetime(&dt)
+            .single()
+            .ok_or_else(|| ZeroBotError::Tool("at 时间非法".to_string()))?;
+        return Ok(local.timestamp_millis());
+    }
+    Err(ZeroBotError::Tool(
+        "at 格式非法，支持 RFC3339 或毫秒时间戳".to_string(),
+    ))
 }
 
 struct RequestUserInputTool;
@@ -2235,8 +2572,8 @@ impl Tool for RequestUserInputTool {
     }
 
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
-        let args: RequestUserInputArgs = serde_json::from_value(args)
-            .map_err(|err| ZeroBotError::Tool(err.to_string()))?;
+        let args: RequestUserInputArgs =
+            serde_json::from_value(args).map_err(|err| ZeroBotError::Tool(err.to_string()))?;
         let interaction = ctx
             .interaction()
             .ok_or_else(|| ZeroBotError::Tool("需要用户输入，但当前无交互处理器".to_string()))?;
@@ -2270,16 +2607,16 @@ impl Tool for RequestUserInputTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-    use httpmock::Method::POST;
-    use httpmock::MockServer;
-    use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use crate::interaction::{InteractionHandler, UserInputAnswer};
     use crate::provider::{Provider, ProviderFactory, ProviderRequest, ProviderResponse};
     use crate::session::{SessionKind, SqliteSessionStore};
     use async_trait::async_trait;
-    use crate::interaction::{InteractionHandler, UserInputAnswer};
+    use httpmock::Method::POST;
+    use httpmock::MockServer;
+    use pretty_assertions::assert_eq;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn extract_tag(content: &str, tag: &str) -> Option<String> {
         let start_tag = format!("<{tag}>");
@@ -2309,9 +2646,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], "s1", None, None);
         let content = "line1\nline2\nline3\nline4";
-        let output = truncate_tool_content(&ctx, content, &settings).await.unwrap();
+        let output = truncate_tool_content(&ctx, content, &settings)
+            .await
+            .unwrap();
         assert!(output.truncated);
-        assert!(output.summary.unwrap_or_default().contains("输出过长已截断"));
+        assert!(output
+            .summary
+            .unwrap_or_default()
+            .contains("输出过长已截断"));
         let path = output.output_path.unwrap();
         assert!(tokio::fs::metadata(path).await.is_ok());
     }
@@ -2359,9 +2701,10 @@ mod tests {
             timeout_ms: Some(5000),
             enabled: Some(true),
         }];
-        let registry = ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."), None)
-            .await
-            .unwrap();
+        let registry =
+            ToolRegistry::with_builtin_async(&settings, &std::path::PathBuf::from("."), None)
+                .await
+                .unwrap();
         let tool_name = "mcp__remote-one__echo";
         assert!(registry.get(tool_name).is_some());
 
@@ -2377,7 +2720,9 @@ mod tests {
     #[tokio::test]
     async fn todo_tools_read_write() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let session = store.create_session("test".to_string()).await.unwrap();
         let store = Arc::new(store);
@@ -2401,7 +2746,10 @@ mod tests {
         let inner = extract_tag(&output.content, "content").unwrap_or_default();
         assert!(inner.contains("第一步"));
 
-        let output = registry.run(&ctx, "todoread", serde_json::json!({})).await.unwrap();
+        let output = registry
+            .run(&ctx, "todoread", serde_json::json!({}))
+            .await
+            .unwrap();
         let inner = extract_tag(&output.content, "content").unwrap_or_default();
         assert!(inner.contains("第二步"));
     }
@@ -2409,7 +2757,9 @@ mod tests {
     #[tokio::test]
     async fn todo_tools_reject_invalid_status() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let session = store.create_session("test".to_string()).await.unwrap();
         let store = Arc::new(store);
@@ -2434,7 +2784,9 @@ mod tests {
     #[tokio::test]
     async fn write_requires_prior_read() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let session = store.create_session("test".to_string()).await.unwrap();
         let store = Arc::new(store);
@@ -2501,7 +2853,9 @@ mod tests {
             )]),
             cancelled: false,
         };
-        let interaction = Arc::new(MockInteraction { response: response.clone() });
+        let interaction = Arc::new(MockInteraction {
+            response: response.clone(),
+        });
         let ctx = ToolContext::new(
             dir.path().to_path_buf(),
             vec![],
@@ -2566,7 +2920,9 @@ description: 示例
         )
         .unwrap();
 
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let parent = store
             .create_session_with_parent("主会话".to_string(), None, SessionKind::Main)
@@ -2590,9 +2946,19 @@ description: 示例
             Arc::new(RwLock::new(HashSet::new())),
         ));
 
-        let ctx = ToolContext::new(dir.path().to_path_buf(), vec![], parent.id.clone(), None, None);
+        let ctx = ToolContext::new(
+            dir.path().to_path_buf(),
+            vec![],
+            parent.id.clone(),
+            None,
+            None,
+        );
         let output = registry
-            .run(&ctx, "subagent", serde_json::json!({"name":"demo","prompt":"hi"}))
+            .run(
+                &ctx,
+                "subagent",
+                serde_json::json!({"name":"demo","prompt":"hi"}),
+            )
             .await
             .unwrap();
         let inner = extract_tag(&output.content, "content").unwrap_or_default();

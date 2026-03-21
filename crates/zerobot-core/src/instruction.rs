@@ -77,12 +77,18 @@ pub async fn fetch_url_instructions(urls: &[String]) -> Vec<Instruction> {
             });
             continue;
         }
-        let fetched = timeout(Duration::from_secs(URL_TIMEOUT_SECS), client.get(url).send()).await;
+        let fetched = timeout(
+            Duration::from_secs(URL_TIMEOUT_SECS),
+            client.get(url).send(),
+        )
+        .await;
         let Ok(Ok(resp)) = fetched else { continue };
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(text) = resp.text().await else { continue };
+        let Ok(text) = resp.text().await else {
+            continue;
+        };
         let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;

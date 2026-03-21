@@ -1,4 +1,6 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::hooks::HookManager;
+use crate::skills::SkillStackEntry;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -7,8 +9,6 @@ use sqlx::{Pool, Sqlite};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
-use crate::hooks::HookManager;
-use crate::skills::SkillStackEntry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -118,23 +118,16 @@ pub trait SessionStore: Send + Sync {
         arguments: &str,
     ) -> ZeroBotResult<String>;
     async fn record_tool_output(&self, tool_call_id: &str, content: &str) -> ZeroBotResult<()>;
-    async fn record_file_read(
-        &self,
-        session_id: &str,
-        path: &str,
-        mtime: i64,
-    ) -> ZeroBotResult<()>;
+    async fn record_file_read(&self, session_id: &str, path: &str, mtime: i64)
+        -> ZeroBotResult<()>;
     async fn get_file_read(
         &self,
         session_id: &str,
         path: &str,
     ) -> ZeroBotResult<Option<FileReadRecord>>;
     async fn get_skill_stack(&self, session_id: &str) -> ZeroBotResult<Vec<SkillStackEntry>>;
-    async fn push_skill_stack(
-        &self,
-        session_id: &str,
-        entry: SkillStackEntry,
-    ) -> ZeroBotResult<()>;
+    async fn push_skill_stack(&self, session_id: &str, entry: SkillStackEntry)
+        -> ZeroBotResult<()>;
     async fn pop_skill_stack(&self, session_id: &str) -> ZeroBotResult<Option<SkillStackEntry>>;
     async fn clear_skill_stack(&self, session_id: &str) -> ZeroBotResult<()>;
     async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>>;
@@ -416,9 +409,10 @@ impl SessionStore for SqliteSessionStore {
 
     async fn append_message(&self, message: Message) -> ZeroBotResult<()> {
         let tool_calls_json = match &message.tool_calls {
-            Some(calls) => Some(serde_json::to_string(calls).map_err(|err| {
-                ZeroBotError::SessionStore(err.to_string())
-            })?),
+            Some(calls) => Some(
+                serde_json::to_string(calls)
+                    .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?,
+            ),
             None => None,
         };
         sqlx::query(
@@ -539,12 +533,14 @@ impl SessionStore for SqliteSessionStore {
         .bind(path)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(record.map(|(session_id, path, mtime, read_at)| FileReadRecord {
-            session_id,
-            path,
-            mtime,
-            read_at,
-        }))
+        Ok(
+            record.map(|(session_id, path, mtime, read_at)| FileReadRecord {
+                session_id,
+                path,
+                mtime,
+                read_at,
+            }),
+        )
     }
 
     async fn get_skill_stack(&self, session_id: &str) -> ZeroBotResult<Vec<SkillStackEntry>> {
@@ -555,8 +551,8 @@ impl SessionStore for SqliteSessionStore {
         .fetch_optional(&self.pool)
         .await?;
         if let Some(row) = row {
-            let stack: Vec<SkillStackEntry> =
-                serde_json::from_str(&row.0).map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
+            let stack: Vec<SkillStackEntry> = serde_json::from_str(&row.0)
+                .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
             Ok(stack)
         } else {
             Ok(Vec::new())
@@ -572,13 +568,11 @@ impl SessionStore for SqliteSessionStore {
         stack.push(entry);
         let json = serde_json::to_string(&stack)
             .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
-        sqlx::query(
-            "INSERT OR REPLACE INTO skill_stack (session_id, stack_json) VALUES (?, ?)",
-        )
-        .bind(session_id)
-        .bind(json)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT OR REPLACE INTO skill_stack (session_id, stack_json) VALUES (?, ?)")
+            .bind(session_id)
+            .bind(json)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -587,13 +581,11 @@ impl SessionStore for SqliteSessionStore {
         let popped = stack.pop();
         let json = serde_json::to_string(&stack)
             .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
-        sqlx::query(
-            "INSERT OR REPLACE INTO skill_stack (session_id, stack_json) VALUES (?, ?)",
-        )
-        .bind(session_id)
-        .bind(json)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT OR REPLACE INTO skill_stack (session_id, stack_json) VALUES (?, ?)")
+            .bind(session_id)
+            .bind(json)
+            .execute(&self.pool)
+            .await?;
         Ok(popped)
     }
 
@@ -669,11 +661,13 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn insert_tool_approval(&self, key: &str) -> ZeroBotResult<()> {
-        sqlx::query("INSERT OR IGNORE INTO tool_approvals (approval_key, created_at) VALUES (?, ?)")
-            .bind(key)
-            .bind(Utc::now().timestamp())
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO tool_approvals (approval_key, created_at) VALUES (?, ?)",
+        )
+        .bind(key)
+        .bind(Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -788,10 +782,7 @@ pub async fn create_session_with_hooks(
     Ok(session)
 }
 
-pub async fn end_session_with_hooks(
-    hooks: &HookManager,
-    session_id: &str,
-) {
+pub async fn end_session_with_hooks(hooks: &HookManager, session_id: &str) {
     hooks.run_session_end(session_id).await;
 }
 
@@ -804,7 +795,9 @@ mod tests {
     #[tokio::test]
     async fn sqlite_store_creates_and_reads_session() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let session = store.create_session("test".to_string()).await.unwrap();
         let fetched = store.get_session(&session.id).await.unwrap().unwrap();
@@ -815,11 +808,17 @@ mod tests {
     #[tokio::test]
     async fn sqlite_store_creates_child_session() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let parent = store.create_session("parent".to_string()).await.unwrap();
         let child = store
-            .create_session_with_parent("child".to_string(), Some(parent.id.clone()), SessionKind::Sub)
+            .create_session_with_parent(
+                "child".to_string(),
+                Some(parent.id.clone()),
+                SessionKind::Sub,
+            )
             .await
             .unwrap();
         assert_eq!(child.parent_id, Some(parent.id));
@@ -829,7 +828,9 @@ mod tests {
     #[tokio::test]
     async fn skill_stack_push_pop() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let session = store.create_session("test".to_string()).await.unwrap();
         let entry = SkillStackEntry {
@@ -839,7 +840,10 @@ mod tests {
             hooks: Vec::new(),
             started_at: 0,
         };
-        store.push_skill_stack(&session.id, entry.clone()).await.unwrap();
+        store
+            .push_skill_stack(&session.id, entry.clone())
+            .await
+            .unwrap();
         let stack = store.get_skill_stack(&session.id).await.unwrap();
         assert_eq!(stack.len(), 1);
         let popped = store.pop_skill_stack(&session.id).await.unwrap().unwrap();
@@ -851,7 +855,9 @@ mod tests {
     #[tokio::test]
     async fn todo_set_and_get() {
         let dir = TempDir::new().unwrap();
-        let store = SqliteSessionStore::new(dir.path().join("test.db")).await.unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
         store.init().await.unwrap();
         let session = store.create_session("test".to_string()).await.unwrap();
 

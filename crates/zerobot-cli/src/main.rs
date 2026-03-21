@@ -1,26 +1,32 @@
 use anyhow::Result;
+use chrono::TimeZone;
 use clap::{Parser, Subcommand};
 use console::style;
+use futures::FutureExt;
+use serde_json::json;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
+use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;
 use zerobot_core::agent::Agent;
+use zerobot_core::bus::OutboundMessage;
+use zerobot_core::channel::{feishu::FeishuChannel, ChatChannel};
 use zerobot_core::config::{ConfigLoader, Settings};
+use zerobot_core::cron::{CronPayload, CronSchedule, CronScheduleKind, CronService};
+use zerobot_core::gateway::GatewayRuntime;
+use zerobot_core::heartbeat::HeartbeatService;
 use zerobot_core::logging::{init_logging, init_logging_with_stdout};
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
 use zerobot_core::session::{
-    create_session_with_hooks,
-    end_session_with_hooks,
-    SessionStore,
-    SqliteSessionStore,
+    create_session_with_hooks, end_session_with_hooks, SessionStore, SqliteSessionStore,
 };
 use zerobot_core::tool::{SubagentTool, ToolRegistry};
-use zerobot_core::ZeroBotError;
 use zerobot_core::workspace::{resolve_session_db_path, resolve_workspace_root};
+use zerobot_core::ZeroBotError;
 
-mod tui;
 mod slash;
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "zerobot")]
@@ -44,10 +50,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Exec { prompt: String },
-    Session { #[command(subcommand)] cmd: SessionCmd },
-    Config { #[command(subcommand)] cmd: ConfigCmd },
-    Provider { #[command(subcommand)] cmd: ProviderCmd },
+    Exec {
+        prompt: String,
+    },
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    Provider {
+        #[command(subcommand)]
+        cmd: ProviderCmd,
+    },
+    Gateway,
+    Cron {
+        #[command(subcommand)]
+        cmd: CronCmd,
+    },
+    Heartbeat {
+        #[command(subcommand)]
+        cmd: HeartbeatCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,6 +92,57 @@ enum ConfigCmd {
 #[derive(Subcommand)]
 enum ProviderCmd {
     List,
+}
+
+#[derive(Subcommand)]
+enum CronCmd {
+    List {
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    Add {
+        name: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        every_seconds: Option<i64>,
+        #[arg(long)]
+        cron_expr: Option<String>,
+        #[arg(long)]
+        tz: Option<String>,
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long, default_value_t = false)]
+        deliver: bool,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value_t = false)]
+        delete_after_run: bool,
+    },
+    Remove {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Run {
+        id: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    Status,
+    Export,
+}
+
+#[derive(Subcommand)]
+enum HeartbeatCmd {
+    Trigger,
+    Status,
 }
 
 #[tokio::main]
@@ -104,6 +181,15 @@ async fn main() -> Result<()> {
         Some(Command::Provider { cmd }) => {
             handle_provider_cmd(&settings, cmd)?;
         }
+        Some(Command::Gateway) => {
+            run_gateway(&settings, &cwd, cli.provider, cli.model).await?;
+        }
+        Some(Command::Cron { cmd }) => {
+            handle_cron_cmd(&settings, &cwd, cmd).await?;
+        }
+        Some(Command::Heartbeat { cmd }) => {
+            handle_heartbeat_cmd(&settings, &cwd, cli.provider, cli.model, cmd).await?;
+        }
         None => {
             run_repl(
                 &settings,
@@ -132,7 +218,7 @@ fn parse_overrides(values: Vec<String>) -> Result<Vec<(String, String)>> {
     Ok(overrides)
 }
 
-async fn handle_session_cmd(settings: &Settings, cwd: &PathBuf, cmd: SessionCmd) -> Result<()> {
+async fn handle_session_cmd(_settings: &Settings, cwd: &PathBuf, cmd: SessionCmd) -> Result<()> {
     let workspace_root = resolve_workspace_root(cwd);
     let db_path = resolve_session_db_path(&workspace_root);
     let store = SqliteSessionStore::new(db_path).await?;
@@ -225,7 +311,11 @@ async fn run_exec(
     .await?;
     let _log_guard = init_logging(settings, Some(&session.id))?;
 
-    let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
+    let model = resolve_model(
+        settings,
+        provider_override.as_deref(),
+        model_override.as_deref(),
+    )?;
     let approvals = store.list_tool_approvals().await.unwrap_or_default();
     let store = Arc::new(store);
     let provider_factory = {
@@ -263,6 +353,8 @@ async fn run_exec(
         hooks.clone(),
         None,
         tool_approvals.clone(),
+        None,
+        None,
     );
 
     let result = agent.run_turn(&session.id, prompt, None).await;
@@ -304,7 +396,11 @@ async fn run_repl(
     };
     let _log_guard = init_logging_with_stdout(settings, Some(&session_id), false)?;
 
-    let model = resolve_model(settings, provider_override.as_deref(), model_override.as_deref())?;
+    let model = resolve_model(
+        settings,
+        provider_override.as_deref(),
+        model_override.as_deref(),
+    )?;
     let approvals = store.list_tool_approvals().await.unwrap_or_default();
     let store = Arc::new(store);
     let provider_state = Arc::new(StdRwLock::new(resolve_provider_id(
@@ -319,7 +415,8 @@ async fn run_repl(
                 .read()
                 .map_err(|_| ZeroBotError::Provider("provider 状态锁已损坏".to_string()))?
                 .clone();
-            build_provider(&settings, Some(&current)).map_err(|err| ZeroBotError::Provider(err.to_string()))
+            build_provider(&settings, Some(&current))
+                .map_err(|err| ZeroBotError::Provider(err.to_string()))
         })
     };
     let tool_approvals = Arc::new(TokioRwLock::new(
@@ -362,6 +459,387 @@ async fn run_repl(
     } else {
         end_session_with_hooks(&hooks, &final_session_id).await;
         println!("恢复本会话: zerobot --resume {}", final_session_id);
+    }
+    Ok(())
+}
+
+async fn run_gateway(
+    settings: &Settings,
+    cwd: &PathBuf,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+) -> Result<()> {
+    let _log_guard = init_logging_with_stdout(settings, Some("gateway"), true)?;
+    tracing::info!("gateway 启动中, cwd={}", cwd.display());
+
+    let workspace_root = resolve_workspace_root(cwd);
+    let db_path = resolve_session_db_path(&workspace_root);
+    let store = SqliteSessionStore::new(db_path).await?;
+    store.init().await?;
+    let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
+
+    let model = resolve_model(
+        settings,
+        provider_override.as_deref(),
+        model_override.as_deref(),
+    )?;
+    let approvals = store.list_tool_approvals().await.unwrap_or_default();
+    let store = Arc::new(store);
+    let provider_factory = {
+        let settings = settings.clone();
+        let provider_override = provider_override.clone();
+        Arc::new(move || {
+            build_provider(&settings, provider_override.as_deref())
+                .map_err(|err| ZeroBotError::Provider(err.to_string()))
+        })
+    };
+    let tool_approvals = Arc::new(TokioRwLock::new(
+        approvals.into_iter().collect::<HashSet<_>>(),
+    ));
+    let mut tools = ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
+    let subagent_tools = tools.clone();
+    tools.register(SubagentTool::new(
+        settings.clone(),
+        store.clone(),
+        subagent_tools,
+        cwd.clone(),
+        provider_factory.clone(),
+        model.clone(),
+        hooks.clone(),
+        None,
+        tool_approvals.clone(),
+    ));
+
+    let mut runtime = GatewayRuntime::new(
+        settings.clone(),
+        cwd.clone(),
+        store,
+        tools,
+        hooks,
+        provider_factory,
+        model,
+        tool_approvals,
+    )
+    .await?;
+
+    tracing::info!("gateway 启动完成，进入事件循环");
+    println!("{}", style("gateway 已启动，按 Ctrl+C 结束").green());
+    runtime.run().await?;
+    tracing::info!("gateway 事件循环已退出");
+    Ok(())
+}
+
+async fn build_cron_service(settings: &Settings, cwd: &PathBuf) -> Result<CronService> {
+    let workspace_root = resolve_workspace_root(cwd);
+    let db_path = resolve_session_db_path(&workspace_root);
+    let export_path = settings
+        .gateway
+        .cron
+        .export_json
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| Some(workspace_root.join(".zerobot").join("cron-jobs.json")));
+    let service = CronService::new(
+        db_path,
+        export_path,
+        settings.gateway.cron.run_history_limit,
+    )
+    .await?;
+    Ok(service)
+}
+
+async fn handle_cron_cmd(settings: &Settings, cwd: &PathBuf, cmd: CronCmd) -> Result<()> {
+    let service = build_cron_service(settings, cwd).await?;
+    match cmd {
+        CronCmd::List { all } => {
+            let jobs = service.list_jobs(all).await?;
+            println!("{}", serde_json::to_string_pretty(&jobs)?);
+        }
+        CronCmd::Add {
+            name,
+            message,
+            every_seconds,
+            cron_expr,
+            tz,
+            at,
+            deliver,
+            channel,
+            to,
+            delete_after_run,
+        } => {
+            let configured = usize::from(every_seconds.is_some())
+                + usize::from(cron_expr.is_some())
+                + usize::from(at.is_some());
+            if configured != 1 {
+                anyhow::bail!("cron add 需要且只能指定一种调度：every_seconds / cron_expr / at");
+            }
+
+            let schedule = if let Some(seconds) = every_seconds {
+                if seconds <= 0 {
+                    anyhow::bail!("every_seconds 必须大于 0");
+                }
+                CronSchedule {
+                    kind: CronScheduleKind::Every,
+                    at_ms: None,
+                    every_ms: Some(seconds.saturating_mul(1000)),
+                    expr: None,
+                    tz: None,
+                }
+            } else if let Some(expr) = cron_expr {
+                CronSchedule::cron(expr, tz)
+            } else {
+                CronSchedule::at(parse_at_to_millis(
+                    &at.ok_or_else(|| anyhow::anyhow!("cron add 缺少 at"))?,
+                )?)
+            };
+
+            let payload = CronPayload {
+                kind: "agent_turn".to_string(),
+                message,
+                deliver,
+                channel,
+                to,
+            };
+            let job = service
+                .add_job(name, schedule, payload, delete_after_run)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&job)?);
+        }
+        CronCmd::Remove { id } => {
+            let removed = service.remove_job(&id).await?;
+            println!("{}", if removed { "removed" } else { "not_found" });
+        }
+        CronCmd::Enable { id } => {
+            let job = service.enable_job(&id, true).await?;
+            println!("{}", serde_json::to_string_pretty(&job)?);
+        }
+        CronCmd::Disable { id } => {
+            let job = service.enable_job(&id, false).await?;
+            println!("{}", serde_json::to_string_pretty(&job)?);
+        }
+        CronCmd::Run { id, force } => {
+            let ok = service.run_job(&id, force).await?;
+            println!("{}", if ok { "ok" } else { "not_found_or_disabled" });
+        }
+        CronCmd::Status => {
+            let status = service.status().await?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        CronCmd::Export => {
+            let path = service.export_snapshot().await?;
+            println!(
+                "{}",
+                path.map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "disabled".to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_at_to_millis(raw: &str) -> Result<i64> {
+    if let Ok(ms) = raw.parse::<i64>() {
+        return Ok(ms);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.timestamp_millis());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
+        let local = chrono::Local
+            .from_local_datetime(&dt)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("at 时间非法"))?;
+        return Ok(local.timestamp_millis());
+    }
+    anyhow::bail!("at 格式非法，支持 RFC3339 或毫秒时间戳")
+}
+
+async fn send_channel_message(
+    settings: &Settings,
+    channel: &str,
+    chat_id: &str,
+    content: String,
+) -> Result<()> {
+    match channel {
+        "feishu" => {
+            if !settings.channels.feishu.enabled {
+                anyhow::bail!("channels.feishu.enabled=false，无法投递到飞书");
+            }
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let feishu = FeishuChannel::new(settings.channels.feishu.clone(), tx);
+            feishu
+                .send(OutboundMessage::new("feishu", chat_id.to_string(), content))
+                .await?;
+            Ok(())
+        }
+        _ => anyhow::bail!("不支持的 heartbeat 投递 channel: {channel}"),
+    }
+}
+
+async fn handle_heartbeat_cmd(
+    settings: &Settings,
+    cwd: &PathBuf,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    cmd: HeartbeatCmd,
+) -> Result<()> {
+    let heartbeat_cfg = settings.gateway.heartbeat.clone();
+    let heartbeat_file = {
+        let path = PathBuf::from(&heartbeat_cfg.file);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
+
+    match cmd {
+        HeartbeatCmd::Status => {
+            let status = json!({
+                "enabled": heartbeat_cfg.enabled,
+                "interval_s": heartbeat_cfg.interval_s,
+                "file": heartbeat_file,
+                "exists": heartbeat_file.exists(),
+                "target": heartbeat_cfg.target,
+            });
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        HeartbeatCmd::Trigger => {
+            let workspace_root = resolve_workspace_root(cwd);
+            let db_path = resolve_session_db_path(&workspace_root);
+            let store = SqliteSessionStore::new(db_path).await?;
+            store.init().await?;
+            let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
+            let model = resolve_model(
+                settings,
+                provider_override.as_deref(),
+                model_override.as_deref(),
+            )?;
+            let approvals = store.list_tool_approvals().await.unwrap_or_default();
+            let store = Arc::new(store);
+            let provider_factory = {
+                let settings = settings.clone();
+                let provider_override = provider_override.clone();
+                Arc::new(move || {
+                    build_provider(&settings, provider_override.as_deref())
+                        .map_err(|err| ZeroBotError::Provider(err.to_string()))
+                })
+            };
+            let tool_approvals = Arc::new(TokioRwLock::new(
+                approvals.into_iter().collect::<HashSet<_>>(),
+            ));
+            let mut tools =
+                ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone())).await?;
+            let subagent_tools = tools.clone();
+            tools.register(SubagentTool::new(
+                settings.clone(),
+                store.clone(),
+                subagent_tools,
+                cwd.clone(),
+                provider_factory.clone(),
+                model.clone(),
+                hooks.clone(),
+                None,
+                tool_approvals.clone(),
+            ));
+
+            let session_id_slot = Arc::new(TokioRwLock::new(None::<String>));
+            let route_target = heartbeat_cfg.target.clone();
+            let exec = {
+                let store = store.clone();
+                let tools = tools.clone();
+                let cwd = cwd.clone();
+                let hooks = hooks.clone();
+                let provider_factory = provider_factory.clone();
+                let model = model.clone();
+                let settings = settings.clone();
+                let tool_approvals = tool_approvals.clone();
+                let session_id_slot = session_id_slot.clone();
+                Arc::new(move |tasks: String| {
+                    let store = store.clone();
+                    let tools = tools.clone();
+                    let cwd = cwd.clone();
+                    let hooks = hooks.clone();
+                    let provider_factory = provider_factory.clone();
+                    let model = model.clone();
+                    let settings = settings.clone();
+                    let tool_approvals = tool_approvals.clone();
+                    let session_id_slot = session_id_slot.clone();
+                    let route =
+                        route_target
+                            .clone()
+                            .map(|target| zerobot_core::tool::ToolRouteContext {
+                                channel: target.channel,
+                                chat_id: target.chat_id,
+                                message_id: None,
+                            });
+                    async move {
+                        let session_id =
+                            if let Some(existing) = session_id_slot.read().await.clone() {
+                                existing
+                            } else {
+                                let session = create_session_with_hooks(
+                                    store.as_ref(),
+                                    &hooks,
+                                    "heartbeat".to_string(),
+                                    None,
+                                    zerobot_core::session::SessionKind::Main,
+                                )
+                                .await?;
+                                *session_id_slot.write().await = Some(session.id.clone());
+                                session.id
+                            };
+                        let provider = (provider_factory)()?;
+                        let agent = Agent::new(
+                            provider,
+                            model,
+                            settings,
+                            store,
+                            tools,
+                            cwd,
+                            hooks,
+                            None,
+                            tool_approvals,
+                            route,
+                            None,
+                        );
+                        agent.run_turn(&session_id, &tasks, None).await
+                    }
+                    .boxed()
+                })
+            };
+
+            let notify = heartbeat_cfg.target.clone().map(|target| {
+                let settings = settings.clone();
+                Arc::new(move |content: String| {
+                    let settings = settings.clone();
+                    let target = target.clone();
+                    async move {
+                        send_channel_message(&settings, &target.channel, &target.chat_id, content)
+                            .await
+                            .map_err(|err| ZeroBotError::Tool(err.to_string()))
+                    }
+                    .boxed()
+                }) as zerobot_core::heartbeat::HeartbeatNotifyHandler
+            });
+
+            let service = HeartbeatService::new(
+                cwd.clone(),
+                provider_factory,
+                model,
+                heartbeat_cfg.file.clone(),
+                heartbeat_cfg.interval_s,
+                true,
+                Some(exec),
+                notify,
+            );
+            let output = service.trigger_now().await?;
+            if let Some(content) = output {
+                println!("{content}");
+            } else {
+                println!("skip");
+            }
+        }
     }
     Ok(())
 }
@@ -428,7 +906,11 @@ fn resolve_provider_id(settings: &Settings, provider_override: Option<&str>) -> 
         .unwrap_or_else(|| "openai".to_string())
 }
 
-fn resolve_api_key(api_key: Option<String>, api_key_env: Option<String>, provider_id: &str) -> String {
+fn resolve_api_key(
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+    provider_id: &str,
+) -> String {
     if let Some(key) = api_key {
         return key;
     }
@@ -450,10 +932,10 @@ async fn session_summary_for_display(
     session: &zerobot_core::session::Session,
 ) -> String {
     if let Ok(messages) = store.list_messages(&session.id).await {
-        if let Some(first) = messages
-            .into_iter()
-            .find(|msg| matches!(msg.role, zerobot_core::session::MessageRole::User) && !msg.content.trim().is_empty())
-        {
+        if let Some(first) = messages.into_iter().find(|msg| {
+            matches!(msg.role, zerobot_core::session::MessageRole::User)
+                && !msg.content.trim().is_empty()
+        }) {
             return summarize_user_message(&first.content);
         }
     }

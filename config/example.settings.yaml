@@ -82,6 +82,9 @@ tools:
     - todowrite
     - request_user_input
     - subagent
+    # Gateway 模式常用（按需启用）
+    # - cron
+    # - message
   allow_paths: []
   output:
     # 工具输出的最大行数
@@ -197,6 +200,44 @@ agent:
 # 日志设置
 logging:
   level: "info"
+
+# Gateway（常驻后台模式）
+gateway:
+  heartbeat:
+    enabled: false
+    interval_s: 1800
+    file: "HEARTBEAT.md"
+    # 仅当设置 target 时才会投递结果
+    # target:
+    #   channel: "feishu"
+    #   chat_id: "oc_xxx"
+  cron:
+    run_history_limit: 20
+    # 留空则默认导出到 ./.zerobot/cron-jobs.json
+    export_json: ""
+
+# 通道配置
+channels:
+  send_progress: true
+  send_tool_hints: false
+  feishu:
+    enabled: false
+    app_id: ""
+    app_secret: ""
+    encrypt_key: ""
+    verification_token: ""
+    # 默认空列表表示拒绝所有来源；可配 * 放开
+    allow_from: []
+    # open | mention
+    group_policy: "mention"
+    # 是否优先按原消息 reply
+    reply_to_message: true
+    dedup_max_entries: 5000
+    # off | own | all
+    reaction_mode: "own"
+    # 可选
+    # base_url: "https://open.feishu.cn"
+    # bot_open_id: "ou_xxx"
 
 # MCP 配置
 mcp:

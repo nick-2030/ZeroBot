@@ -76,7 +76,11 @@ impl McpManager {
                     headers,
                     timeout_ms,
                     ..
-                } => Arc::new(RemoteMcpClient::new(url, headers, timeout_ms.unwrap_or(5000))),
+                } => Arc::new(RemoteMcpClient::new(
+                    url,
+                    headers,
+                    timeout_ms.unwrap_or(5000),
+                )),
             };
 
             if let Err(err) = client.initialize().await {
@@ -175,7 +179,11 @@ impl RemoteMcpClient {
             method,
             params,
         };
-        let mut builder = self.client.post(&self.url).json(&request).timeout(self.timeout);
+        let mut builder = self
+            .client
+            .post(&self.url)
+            .json(&request)
+            .timeout(self.timeout);
         if !self
             .headers
             .keys()
@@ -254,12 +262,14 @@ impl LocalMcpClient {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            ZeroBotError::Mcp("本地 MCP 子进程未打开 stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ZeroBotError::Mcp("本地 MCP 子进程未打开 stdout".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ZeroBotError::Mcp("本地 MCP 子进程未打开 stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ZeroBotError::Mcp("本地 MCP 子进程未打开 stdout".to_string()))?;
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -296,14 +306,17 @@ impl LocalMcpClient {
             method,
             params,
         };
-        let payload = serde_json::to_string(&request)
-            .map_err(|err| ZeroBotError::Mcp(err.to_string()))?;
+        let payload =
+            serde_json::to_string(&request).map_err(|err| ZeroBotError::Mcp(err.to_string()))?;
         {
             let mut stdin = self.stdin.lock().await;
             match self.protocol {
                 McpLocalProtocol::ContentLength => {
-                    let framed =
-                        format!("Content-Length: {}\r\n\r\n{}", payload.as_bytes().len(), payload);
+                    let framed = format!(
+                        "Content-Length: {}\r\n\r\n{}",
+                        payload.as_bytes().len(),
+                        payload
+                    );
                     stdin.write_all(framed.as_bytes()).await?;
                 }
                 McpLocalProtocol::Line => {
@@ -339,13 +352,16 @@ impl LocalMcpClient {
             method: "notifications/initialized",
             params: None,
         };
-        let payload = serde_json::to_string(&request)
-            .map_err(|err| ZeroBotError::Mcp(err.to_string()))?;
+        let payload =
+            serde_json::to_string(&request).map_err(|err| ZeroBotError::Mcp(err.to_string()))?;
         let mut stdin = self.stdin.lock().await;
         match self.protocol {
             McpLocalProtocol::ContentLength => {
-                let framed =
-                    format!("Content-Length: {}\r\n\r\n{}", payload.as_bytes().len(), payload);
+                let framed = format!(
+                    "Content-Length: {}\r\n\r\n{}",
+                    payload.as_bytes().len(),
+                    payload
+                );
                 stdin.write_all(framed.as_bytes()).await?;
             }
             McpLocalProtocol::Line => {
@@ -446,11 +462,7 @@ async fn read_jsonrpc_response(
 
         let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("content-length:") {
-            let value = trimmed
-                .splitn(2, ':')
-                .nth(1)
-                .unwrap_or("")
-                .trim();
+            let value = trimmed.splitn(2, ':').nth(1).unwrap_or("").trim();
             if let Ok(length) = value.parse::<usize>() {
                 content_length = Some(length);
             }
@@ -527,7 +539,10 @@ mod tests {
         client.initialize().await.unwrap();
         let tools = client.list_tools().await.unwrap();
         assert_eq!(tools[0].name, "echo");
-        let result = client.call_tool("echo", json!({"text":"hi"})).await.unwrap();
+        let result = client
+            .call_tool("echo", json!({"text":"hi"}))
+            .await
+            .unwrap();
         assert_eq!(format_tool_output(result), "ok");
 
         list_mock.assert_hits(1);

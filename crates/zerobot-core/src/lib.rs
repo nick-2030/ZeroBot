@@ -1,13 +1,18 @@
 pub mod agent;
 pub mod agents;
-pub mod context;
-pub mod config;
+pub mod bus;
+pub mod channel;
 pub mod commands;
+pub mod config;
+pub mod context;
+pub mod cron;
 pub mod error;
 pub mod events;
+pub mod gateway;
+pub mod heartbeat;
 pub mod hooks;
-pub mod interaction;
 pub mod instruction;
+pub mod interaction;
 pub mod logging;
 pub mod mcp;
 pub mod prompt;
@@ -19,42 +24,34 @@ pub mod workspace;
 
 pub use agent::Agent;
 pub use agents::{AgentDefinition, AgentManager};
-pub use context::{ContextBuild, ContextManager};
-pub use config::{ConfigLayer, ConfigLoader, ConfigScope, LoadedConfig, Settings};
+pub use bus::{InboundMessage, MessageBus, OutboundMessage};
+pub use channel::{build_channel_manager, ChannelManager, ChatChannel};
 pub use commands::init_prompt;
+pub use config::{ConfigLayer, ConfigLoader, ConfigScope, LoadedConfig, Settings};
+pub use context::{ContextBuild, ContextManager};
+pub use cron::{
+    CronJob, CronPayload, CronRunRecord, CronRunStatus, CronSchedule, CronScheduleKind,
+    CronService, CronServiceStatus,
+};
 pub use error::{ZeroBotError, ZeroBotResult};
 pub use events::AgentEvent;
+pub use gateway::GatewayRuntime;
+pub use heartbeat::{HeartbeatDecision, HeartbeatService};
 pub use hooks::{HookAction, HookDecision, HookDefinition, HookEvent, HookManager};
 pub use interaction::{
-    InteractionHandler,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolApprovalResponse,
-    UserInputAnswer,
-    UserInputOption,
-    UserInputQuestion,
-    UserInputRequest,
-    UserInputResponse,
+    InteractionHandler, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
+    UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
 pub use logging::{init_logging, init_logging_with_stdout, LogGuard};
 pub use provider::{
-    Provider,
-    ProviderEvent,
-    ProviderRequest,
-    ProviderResponse,
-    ToolSpec,
-    TokenUsage,
+    Provider, ProviderEvent, ProviderRequest, ProviderResponse, TokenUsage, ToolSpec,
 };
 pub use session::{
-    create_session_with_hooks,
-    end_session_with_hooks,
-    Message,
-    MessageRole,
-    Session,
-    SessionKind,
-    SessionStore,
-    SqliteSessionStore,
+    create_session_with_hooks, end_session_with_hooks, Message, MessageRole, Session, SessionKind,
+    SessionStore, SqliteSessionStore,
 };
-pub use skills::{format_skill_stack, SkillAction, SkillContent, SkillInfo, SkillManager, SkillStackEntry};
-pub use tool::{ToolContext, ToolRegistry};
+pub use skills::{
+    format_skill_stack, SkillAction, SkillContent, SkillInfo, SkillManager, SkillStackEntry,
+};
+pub use tool::{ToolContext, ToolRegistry, ToolRouteContext};
 pub use workspace::{resolve_session_db_path, resolve_workspace_root, workspace_key};

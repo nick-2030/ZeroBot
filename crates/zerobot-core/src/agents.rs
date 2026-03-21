@@ -245,7 +245,9 @@ fn builtin_agents() -> Vec<AgentDefinition> {
             ]),
             hooks: Vec::new(),
             path: PathBuf::from("<builtin:review>"),
-            body: include_str!("../prompts/modes/review.md").trim().to_string(),
+            body: include_str!("../prompts/modes/review.md")
+                .trim()
+                .to_string(),
         },
         AgentDefinition {
             name: "execute".to_string(),
@@ -254,7 +256,9 @@ fn builtin_agents() -> Vec<AgentDefinition> {
             tools: None,
             hooks: Vec::new(),
             path: PathBuf::from("<builtin:execute>"),
-            body: include_str!("../prompts/modes/execute.md").trim().to_string(),
+            body: include_str!("../prompts/modes/execute.md")
+                .trim()
+                .to_string(),
         },
     ]
 }

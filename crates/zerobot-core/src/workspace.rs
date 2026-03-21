@@ -122,8 +122,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::env;
+    use tempfile::TempDir;
 
     #[test]
     fn prefers_zerobot_over_git() {

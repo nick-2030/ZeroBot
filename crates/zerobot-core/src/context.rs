@@ -1,10 +1,10 @@
+use crate::agents::{format_agent_index, AgentManager};
 use crate::config::Settings;
-use crate::workspace::resolve_workspace_root;
 use crate::instruction;
 use crate::provider::{ProviderMessage, ProviderMessageRole};
 use crate::session::{Message, MessageRole, StoredToolCall};
-use crate::agents::{format_agent_index, AgentManager};
 use crate::skills::{format_skill_index, SkillInfo};
+use crate::workspace::resolve_workspace_root;
 use chrono::Local;
 use std::path::{Path, PathBuf};
 
@@ -175,10 +175,7 @@ impl ContextManager {
 
         let estimated_tokens = estimate_tokens(
             system.as_deref().unwrap_or_default().chars().count()
-                + messages
-                    .iter()
-                    .map(|msg| message_chars(msg))
-                    .sum::<usize>(),
+                + messages.iter().map(|msg| message_chars(msg)).sum::<usize>(),
         );
         let context_limit = resolve_context_limit(&self.settings, model);
 
@@ -216,13 +213,7 @@ impl ContextManager {
             }
         }
 
-        if self
-            .settings
-            .tools
-            .enabled
-            .iter()
-            .any(|t| t == "subagent")
-        {
+        if self.settings.tools.enabled.iter().any(|t| t == "subagent") {
             let manager = AgentManager::new(&self.cwd);
             if let Ok(list) = manager.discover() {
                 if !list.is_empty() {

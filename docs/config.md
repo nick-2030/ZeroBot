@@ -53,6 +53,23 @@
 - `agent.system_prompt`：系统提示词。默认由内置模块自动拼接生成，如需完全覆盖可直接设置此字段。
 - `agent.max_steps`：单次回合最大步骤数。
 - `logging.level`：日志级别。
+- `gateway.heartbeat.enabled`：是否启用 HEARTBEAT 定时扫描。
+- `gateway.heartbeat.interval_s`：HEARTBEAT 检查间隔（秒）。
+- `gateway.heartbeat.file`：HEARTBEAT 文件路径（相对路径相对于当前工作目录）。
+- `gateway.heartbeat.target`：heartbeat 投递目标（`channel` + `chat_id`）。未配置时只执行不投递。
+- `gateway.cron.run_history_limit`：cron 任务运行历史保留条数。
+- `gateway.cron.export_json`：cron 快照导出路径（可选，留空使用默认 `./.zerobot/cron-jobs.json`）。
+- `channels.send_progress`：通道是否发送阶段性进度消息。
+- `channels.send_tool_hints`：通道是否发送工具调用提示。
+- `channels.feishu.enabled`：是否启用飞书通道（WS-only）。
+- `channels.feishu.app_id/app_secret`：飞书应用凭据。
+- `channels.feishu.allow_from`：允许的发送者 open_id 列表，支持 `*`。
+- `channels.feishu.group_policy`：群聊策略（`open` 或 `mention`）。
+- `channels.feishu.reply_to_message`：出站消息是否按原 message_id 回复。
+- `channels.feishu.dedup_max_entries`：入站去重缓存上限。
+- `channels.feishu.reaction_mode`：reaction 入站策略（`off` / `own` / `all`）。
+- `channels.feishu.base_url`：飞书 API 基础地址（可选）。
+- `channels.feishu.bot_open_id`：机器人 open_id（用于 reaction 过滤，可选）。
 - `mcp.enabled`：是否启用 MCP。
 - `mcp.servers`：MCP 服务器列表。
   - `name`：服务器名称。

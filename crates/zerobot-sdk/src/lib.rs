@@ -8,15 +8,10 @@ use zerobot_core::agent::Agent;
 use zerobot_core::config::{ConfigLoader, Settings};
 use zerobot_core::events::AgentEvent;
 use zerobot_core::provider::{AnthropicProvider, OpenAIProvider, Provider};
-use zerobot_core::session::{
-    create_session_with_hooks,
-    Session,
-    SessionStore,
-    SqliteSessionStore,
-};
+use zerobot_core::session::{create_session_with_hooks, Session, SessionStore, SqliteSessionStore};
 use zerobot_core::tool::{SubagentTool, ToolRegistry};
-use zerobot_core::ZeroBotError;
 use zerobot_core::workspace::{resolve_session_db_path, resolve_workspace_root};
+use zerobot_core::ZeroBotError;
 
 pub struct ZeroBot {
     settings: Settings,
@@ -49,9 +44,7 @@ impl ZeroBot {
             hooks,
             cwd,
             model,
-            tool_approvals: Arc::new(RwLock::new(
-                approvals.into_iter().collect::<HashSet<_>>(),
-            )),
+            tool_approvals: Arc::new(RwLock::new(approvals.into_iter().collect::<HashSet<_>>())),
         })
     }
 
@@ -140,6 +133,8 @@ impl SessionHandle {
             self.hooks.clone(),
             None,
             self.tool_approvals.clone(),
+            None,
+            None,
         );
         let output = agent.run_turn(&self.session.id, input, None).await?;
         Ok(output)
@@ -177,6 +172,8 @@ impl SessionHandle {
             self.hooks.clone(),
             None,
             self.tool_approvals.clone(),
+            None,
+            None,
         );
         let (tx, rx) = mpsc::unbounded_channel();
         let session_id = self.session.id.clone();
@@ -186,7 +183,6 @@ impl SessionHandle {
         });
         Ok(rx)
     }
-
 }
 
 fn build_provider(settings: &Settings, override_id: Option<&str>) -> Result<Box<dyn Provider>> {
@@ -244,7 +240,11 @@ fn resolve_model(
     anyhow::bail!("未配置默认模型")
 }
 
-fn resolve_api_key(api_key: Option<String>, api_key_env: Option<String>, provider_id: &str) -> String {
+fn resolve_api_key(
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+    provider_id: &str,
+) -> String {
     if let Some(key) = api_key {
         return key;
     }

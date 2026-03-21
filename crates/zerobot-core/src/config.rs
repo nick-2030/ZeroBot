@@ -1,6 +1,6 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
-use crate::workspace::resolve_workspace_root;
 use crate::prompt::default_system_prompt;
+use crate::workspace::resolve_workspace_root;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
@@ -29,6 +29,10 @@ pub struct Settings {
     pub instructions: Vec<String>,
     #[serde(default)]
     pub logging: LoggingSettings,
+    #[serde(default)]
+    pub gateway: GatewaySettings,
+    #[serde(default)]
+    pub channels: ChannelsSettings,
     #[serde(default)]
     pub mcp: McpSettings,
     #[serde(default)]
@@ -194,7 +198,6 @@ fn default_tool_output_direction() -> ToolOutputDirection {
     ToolOutputDirection::Head
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
     #[serde(default)]
@@ -267,6 +270,122 @@ pub struct LoggingSettings {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewaySettings {
+    #[serde(default)]
+    pub heartbeat: HeartbeatSettings,
+    #[serde(default)]
+    pub cron: CronSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_heartbeat_interval_s")]
+    pub interval_s: u64,
+    #[serde(default = "default_heartbeat_file")]
+    pub file: String,
+    #[serde(default)]
+    pub target: Option<ChannelTarget>,
+}
+
+fn default_heartbeat_interval_s() -> u64 {
+    30 * 60
+}
+
+fn default_heartbeat_file() -> String {
+    "HEARTBEAT.md".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelTarget {
+    pub channel: String,
+    #[serde(rename = "chat_id")]
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronSettings {
+    #[serde(default = "default_cron_history_limit")]
+    pub run_history_limit: usize,
+    #[serde(default)]
+    pub export_json: Option<String>,
+}
+
+fn default_cron_history_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsSettings {
+    #[serde(default = "default_channels_send_progress")]
+    pub send_progress: bool,
+    #[serde(default)]
+    pub send_tool_hints: bool,
+    #[serde(default)]
+    pub feishu: FeishuChannelSettings,
+}
+
+fn default_channels_send_progress() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuChannelSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: String,
+    #[serde(default)]
+    pub encrypt_key: String,
+    #[serde(default)]
+    pub verification_token: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default = "default_feishu_group_policy")]
+    pub group_policy: FeishuGroupPolicy,
+    #[serde(default)]
+    pub reply_to_message: bool,
+    #[serde(default = "default_feishu_dedup_max_entries")]
+    pub dedup_max_entries: usize,
+    #[serde(default = "default_feishu_reaction_mode")]
+    pub reaction_mode: FeishuReactionMode,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub bot_open_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeishuGroupPolicy {
+    Open,
+    Mention,
+}
+
+fn default_feishu_group_policy() -> FeishuGroupPolicy {
+    FeishuGroupPolicy::Mention
+}
+
+fn default_feishu_dedup_max_entries() -> usize {
+    5000
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeishuReactionMode {
+    Off,
+    Own,
+    All,
+}
+
+fn default_feishu_reaction_mode() -> FeishuReactionMode {
+    FeishuReactionMode::Own
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +473,8 @@ impl Default for Settings {
             context: ContextSettings::default(),
             instructions: Vec::new(),
             logging: LoggingSettings::default(),
+            gateway: GatewaySettings::default(),
+            channels: ChannelsSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
         }
@@ -440,15 +561,61 @@ impl Default for LoggingSettings {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl Default for GatewaySettings {
+    fn default() -> Self {
+        Self {
+            heartbeat: HeartbeatSettings::default(),
+            cron: CronSettings::default(),
+        }
+    }
+}
 
-    #[test]
-    fn tool_approval_mode_for_respects_overrides() {
-        let settings = ToolApprovalSettings::default();
-        assert_eq!(settings.mode_for("read"), ToolApprovalMode::Auto);
-        assert_eq!(settings.mode_for("write"), ToolApprovalMode::Prompt);
+impl Default for HeartbeatSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_s: default_heartbeat_interval_s(),
+            file: default_heartbeat_file(),
+            target: None,
+        }
+    }
+}
+
+impl Default for CronSettings {
+    fn default() -> Self {
+        Self {
+            run_history_limit: default_cron_history_limit(),
+            export_json: None,
+        }
+    }
+}
+
+impl Default for ChannelsSettings {
+    fn default() -> Self {
+        Self {
+            send_progress: default_channels_send_progress(),
+            send_tool_hints: false,
+            feishu: FeishuChannelSettings::default(),
+        }
+    }
+}
+
+impl Default for FeishuChannelSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: String::new(),
+            app_secret: String::new(),
+            encrypt_key: String::new(),
+            verification_token: String::new(),
+            allow_from: Vec::new(),
+            group_policy: default_feishu_group_policy(),
+            reply_to_message: false,
+            dedup_max_entries: default_feishu_dedup_max_entries(),
+            reaction_mode: default_feishu_reaction_mode(),
+            base_url: None,
+            bot_open_id: None,
+        }
     }
 }
 
@@ -541,9 +708,7 @@ impl ConfigLoader {
 
         let project_dir = resolve_workspace_root(&self.cwd);
         let project_settings = project_dir.join(".zerobot").join("settings.yaml");
-        let local_settings = project_dir
-            .join(".zerobot")
-            .join("settings.local.yaml");
+        let local_settings = project_dir.join(".zerobot").join("settings.local.yaml");
 
         let zerobot_ignored = is_zerobot_ignored(&project_dir)?;
 
@@ -605,8 +770,8 @@ impl ConfigLoader {
             warnings.push("settings.local.yaml 未加入 .gitignore".to_string());
         }
 
-        let settings: Settings = serde_yaml::from_value(merged)
-            .map_err(|err| ZeroBotError::Config(err.to_string()))?;
+        let settings: Settings =
+            serde_yaml::from_value(merged).map_err(|err| ZeroBotError::Config(err.to_string()))?;
 
         Ok(LoadedConfig {
             settings,
@@ -621,8 +786,8 @@ fn read_yaml(path: &Path) -> ZeroBotResult<Option<YamlValue>> {
         return Ok(None);
     }
     let content = fs::read_to_string(path)?;
-    let value = serde_yaml::from_str(&content)
-        .map_err(|err| ZeroBotError::Config(err.to_string()))?;
+    let value =
+        serde_yaml::from_str(&content).map_err(|err| ZeroBotError::Config(err.to_string()))?;
     Ok(Some(value))
 }
 
@@ -668,9 +833,7 @@ fn set_yaml_path(target: &mut YamlValue, path: &str, value: YamlValue) -> ZeroBo
             return set_inner(entry, &parts[1..], value, path);
         }
 
-        Err(ZeroBotError::Config(format!(
-            "无法写入覆盖路径: {path}"
-        )))
+        Err(ZeroBotError::Config(format!("无法写入覆盖路径: {path}")))
     }
 
     set_inner(target, &parts, value, path)
@@ -701,7 +864,11 @@ fn user_settings_path() -> Option<PathBuf> {
 fn managed_settings_path() -> Option<PathBuf> {
     if cfg!(windows) {
         let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-        return Some(PathBuf::from(base).join("ZeroBot").join("managed-settings.yaml"));
+        return Some(
+            PathBuf::from(base)
+                .join("ZeroBot")
+                .join("managed-settings.yaml"),
+        );
     }
     Some(PathBuf::from("/etc/zerobot/managed-settings.yaml"))
 }
@@ -771,9 +938,8 @@ mod tests {
             "default_provider: anthropic\n",
         );
 
-        let loader = ConfigLoader::new(cwd.to_path_buf()).with_cli_overrides(vec![
-            ("default_provider".to_string(), "cli".to_string()),
-        ]);
+        let loader = ConfigLoader::new(cwd.to_path_buf())
+            .with_cli_overrides(vec![("default_provider".to_string(), "cli".to_string())]);
         let loaded = loader.load().unwrap();
         assert_eq!(loaded.settings.default_provider, Some("cli".to_string()));
     }

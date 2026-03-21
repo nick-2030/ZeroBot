@@ -1,3 +1,4 @@
+use crate::slash::{SlashMatch, SlashRegistry};
 use anyhow::Result;
 use base64::Engine as _;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -10,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Clear, BorderType};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
@@ -28,32 +29,19 @@ use zerobot_core::agent::Agent;
 use zerobot_core::config::Settings;
 use zerobot_core::events::AgentEvent;
 use zerobot_core::hooks::HookManager;
+use zerobot_core::init_prompt;
 use zerobot_core::interaction::{
-    InteractionHandler,
-    ToolApprovalDecision,
-    ToolApprovalRequest,
-    ToolApprovalResponse,
-    UserInputAnswer,
-    UserInputOption,
-    UserInputQuestion,
-    UserInputRequest,
-    UserInputResponse,
+    InteractionHandler, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
+    UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
 use zerobot_core::provider::{ProviderFactory, TokenUsage};
 use zerobot_core::session::{
-    create_session_with_hooks,
-    MessageRole,
-    Session,
-    SessionKind,
-    SessionStore,
-    TodoItem,
+    create_session_with_hooks, MessageRole, Session, SessionKind, SessionStore, TodoItem,
     TodoStatus,
 };
 use zerobot_core::skills::SkillStackEntry;
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
-use zerobot_core::init_prompt;
-use crate::slash::{SlashMatch, SlashRegistry};
 
 #[derive(Copy, Clone)]
 enum DotColor {
@@ -212,7 +200,10 @@ struct App {
 #[derive(Clone)]
 enum OutputItem {
     Lines(Vec<Line<'static>>),
-    Block { color: DotColor, text: String },
+    Block {
+        color: DotColor,
+        text: String,
+    },
     Markdown(String),
     ToolOutput {
         color: DotColor,
@@ -420,7 +411,9 @@ impl App {
         }
         let mut lines = Vec::new();
         let status_line = match &self.status {
-            Status::Idle => Line::from(Span::styled("状态: 空闲", Style::default().fg(COLOR_MUTED))),
+            Status::Idle => {
+                Line::from(Span::styled("状态: 空闲", Style::default().fg(COLOR_MUTED)))
+            }
             Status::Thinking => {
                 let dot = if self.blink_on { "●" } else { " " };
                 Line::from(Span::styled(
@@ -631,7 +624,11 @@ impl UserInputOverlay {
             return;
         };
         let note = self.current_note();
-        let note = if note.trim().is_empty() { None } else { Some(note) };
+        let note = if note.trim().is_empty() {
+            None
+        } else {
+            Some(note)
+        };
         let answer = UserInputAnswer {
             option_id: self.current_option_id(),
             note,
@@ -748,24 +745,22 @@ impl UserInputOverlay {
                 .fg(COLOR_ACCENT),
         )));
         if self.request.questions.len() > 1 {
-        let mut spans = Vec::new();
-        spans.push(Span::styled("问题: ", Style::default().fg(COLOR_MUTED)));
-        for (idx, q) in self.request.questions.iter().enumerate() {
-            let label = truncate_chars(&q.prompt, 12);
-            let text = format!("{}{} ", idx + 1, label);
-            if idx == self.current {
-                spans.push(Span::styled(
-                    text,
-                    Style::default()
-                        .add_modifier(Modifier::BOLD)
-                        .fg(COLOR_TEXT),
-                ));
-            } else {
-                spans.push(Span::styled(text, Style::default().fg(COLOR_MUTED)));
+            let mut spans = Vec::new();
+            spans.push(Span::styled("问题: ", Style::default().fg(COLOR_MUTED)));
+            for (idx, q) in self.request.questions.iter().enumerate() {
+                let label = truncate_chars(&q.prompt, 12);
+                let text = format!("{}{} ", idx + 1, label);
+                if idx == self.current {
+                    spans.push(Span::styled(
+                        text,
+                        Style::default().add_modifier(Modifier::BOLD).fg(COLOR_TEXT),
+                    ));
+                } else {
+                    spans.push(Span::styled(text, Style::default().fg(COLOR_MUTED)));
+                }
             }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
-    }
         if let Some(question) = self.current_question() {
             lines.push(Line::from(Span::raw(format!(
                 "问题 {}/{}: {}",
@@ -782,7 +777,10 @@ impl UserInputOverlay {
                     } else {
                         Style::default().fg(COLOR_MUTED)
                     };
-                    lines.push(Line::from(Span::styled(format!("{prefix}{}", opt.label), style)));
+                    lines.push(Line::from(Span::styled(
+                        format!("{prefix}{}", opt.label),
+                        style,
+                    )));
                 }
             } else {
                 lines.push(Line::from(Span::styled(
@@ -798,7 +796,10 @@ impl UserInputOverlay {
             } else {
                 Style::default().fg(COLOR_MUTED)
             };
-            lines.push(Line::from(Span::styled(format!("{prefix}输入内容: {note}"), style)));
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}输入内容: {note}"),
+                style,
+            )));
         }
         lines.push(Line::from(Span::styled(
             "↑/↓ 选择  ←/→ 切换  Tab 切换输入  Enter 下一项/提交  Esc 取消",
@@ -809,7 +810,10 @@ impl UserInputOverlay {
 }
 
 impl ToolApprovalOverlay {
-    fn new(request: ToolApprovalRequest, respond_to: oneshot::Sender<ToolApprovalResponse>) -> Self {
+    fn new(
+        request: ToolApprovalRequest,
+        respond_to: oneshot::Sender<ToolApprovalResponse>,
+    ) -> Self {
         Self {
             request,
             selected: 0,
@@ -994,7 +998,8 @@ async fn run_tui_inner(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiRequest>();
-    let interaction: Arc<dyn InteractionHandler> = Arc::new(UiInteractionHandler { tx: ui_tx.clone() });
+    let interaction: Arc<dyn InteractionHandler> =
+        Arc::new(UiInteractionHandler { tx: ui_tx.clone() });
     let mut runner: Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>> =
         None;
     let mut reader = EventStream::new();
@@ -1217,7 +1222,8 @@ async fn handle_event(
                                     let mut lines = Vec::new();
                                     lines.push("可用命令:".to_string());
                                     for cmd in slash.commands() {
-                                        lines.push(format!("  {} - {}", cmd.usage, cmd.description));
+                                        lines
+                                            .push(format!("  {} - {}", cmd.usage, cmd.description));
                                     }
                                     lines.push("输入 /help <命令> 查看用法".to_string());
                                     lines.join("\n")
@@ -1256,7 +1262,8 @@ async fn handle_event(
                                 } else {
                                     names.join(", ")
                                 };
-                                let message = format!("启用工具: {enabled}\n已注册工具: {registered}");
+                                let message =
+                                    format!("启用工具: {enabled}\n已注册工具: {registered}");
                                 app.push_block(DotColor::White, &message);
                             }
                             "init" => {
@@ -1279,6 +1286,8 @@ async fn handle_event(
                                     hooks.clone(),
                                     Some(interaction.clone()),
                                     tool_approvals.clone(),
+                                    None,
+                                    None,
                                 );
                                 let session_id = app.session_id.clone();
                                 let tx_clone = tx.clone();
@@ -1321,12 +1330,17 @@ async fn handle_event(
                                         let mut items = settings
                                             .providers
                                             .iter()
-                                            .map(|(id, info)| (id.clone(), info.kind.clone(), info.model.clone()))
+                                            .map(|(id, info)| {
+                                                (id.clone(), info.kind.clone(), info.model.clone())
+                                            })
                                             .collect::<Vec<_>>();
                                         items.sort_by(|a, b| a.0.cmp(&b.0));
                                         for (id, kind, model) in items {
-                                            let suffix = if id == app.provider_id { " *" } else { "" };
-                                            let model = model.map(|m| format!(", model={m}")).unwrap_or_default();
+                                            let suffix =
+                                                if id == app.provider_id { " *" } else { "" };
+                                            let model = model
+                                                .map(|m| format!(", model={m}"))
+                                                .unwrap_or_default();
                                             lines.push(format!("  {id} ({kind}{model}){suffix}"));
                                         }
                                     }
@@ -1336,13 +1350,17 @@ async fn handle_event(
                                     let exists = settings.providers.contains_key(&target)
                                         || matches!(target.as_str(), "openai" | "anthropic");
                                     if !exists {
-                                        app.push_block(DotColor::Red, "未知提供商（输入 /provider list 查看）");
+                                        app.push_block(
+                                            DotColor::Red,
+                                            "未知提供商（输入 /provider list 查看）",
+                                        );
                                     } else {
                                         app.provider_id = target.clone();
                                         if let Ok(mut guard) = provider_state.write() {
                                             *guard = target.clone();
                                         }
-                                        if let Some(info) = settings.providers.get(&app.provider_id) {
+                                        if let Some(info) = settings.providers.get(&app.provider_id)
+                                        {
                                             if let Some(model) = &info.model {
                                                 app.model = model.clone();
                                             }
@@ -1367,22 +1385,25 @@ async fn handle_event(
                                 let mut parts = args.split_whitespace();
                                 let action = parts.next().unwrap_or("").to_lowercase();
                                 match action.as_str() {
-                                    "list" => {
-                                        match store.list_sessions().await {
-                                            Ok(sessions) => {
-                                                let mut lines = Vec::new();
-                                                lines.push("会话列表:".to_string());
-                                                for session in sessions {
-                                                    let summary = session_summary_for_display(store, &session).await;
-                                                    lines.push(format_session_line(&session, &summary));
-                                                }
-                                                app.push_block(DotColor::White, &lines.join("\n"));
+                                    "list" => match store.list_sessions().await {
+                                        Ok(sessions) => {
+                                            let mut lines = Vec::new();
+                                            lines.push("会话列表:".to_string());
+                                            for session in sessions {
+                                                let summary =
+                                                    session_summary_for_display(store, &session)
+                                                        .await;
+                                                lines.push(format_session_line(&session, &summary));
                                             }
-                                            Err(err) => {
-                                                app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
-                                            }
+                                            app.push_block(DotColor::White, &lines.join("\n"));
                                         }
-                                    }
+                                        Err(err) => {
+                                            app.push_block(
+                                                DotColor::Red,
+                                                &format!("读取会话失败: {err}"),
+                                            );
+                                        }
+                                    },
                                     "new" => {
                                         let title = parts.collect::<Vec<_>>().join(" ");
                                         let title = if title.trim().is_empty() {
@@ -1410,17 +1431,26 @@ async fn handle_event(
                                                 app.context_used = None;
                                                 app.context_limit = None;
                                                 refresh_session_state(app, store).await;
-                                                app.push_block(DotColor::White, "已创建并切换到新会话");
+                                                app.push_block(
+                                                    DotColor::White,
+                                                    "已创建并切换到新会话",
+                                                );
                                             }
                                             Err(err) => {
-                                                app.push_block(DotColor::Red, &format!("创建会话失败: {err}"));
+                                                app.push_block(
+                                                    DotColor::Red,
+                                                    &format!("创建会话失败: {err}"),
+                                                );
                                             }
                                         }
                                     }
                                     "show" => {
                                         let id = parts.next().unwrap_or("");
                                         if id.is_empty() {
-                                            app.push_block(DotColor::Red, "用法: /session show <id>");
+                                            app.push_block(
+                                                DotColor::Red,
+                                                "用法: /session show <id>",
+                                            );
                                         } else {
                                             match store.list_messages(id).await {
                                                 Ok(messages) => {
@@ -1446,10 +1476,16 @@ async fn handle_event(
                                                             content
                                                         ));
                                                     }
-                                                    app.push_block(DotColor::White, &lines.join("\n"));
+                                                    app.push_block(
+                                                        DotColor::White,
+                                                        &lines.join("\n"),
+                                                    );
                                                 }
                                                 Err(err) => {
-                                                    app.push_block(DotColor::Red, &format!("读取消息失败: {err}"));
+                                                    app.push_block(
+                                                        DotColor::Red,
+                                                        &format!("读取消息失败: {err}"),
+                                                    );
                                                 }
                                             }
                                         }
@@ -1472,7 +1508,10 @@ async fn handle_event(
                                 let sessions = match store.list_sessions().await {
                                     Ok(sessions) => sessions,
                                     Err(err) => {
-                                        app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
+                                        app.push_block(
+                                            DotColor::Red,
+                                            &format!("读取会话失败: {err}"),
+                                        );
                                         return Ok(true);
                                     }
                                 };
@@ -1520,7 +1559,8 @@ async fn handle_event(
                                             .get("session")
                                             .and_then(|ans| ans.option_id.clone());
                                         if let Some(session_id) = selected {
-                                            let _ = ui_tx.send(UiRequest::ResumeSelected { session_id });
+                                            let _ = ui_tx
+                                                .send(UiRequest::ResumeSelected { session_id });
                                         }
                                     }
                                 });
@@ -1554,6 +1594,8 @@ async fn handle_event(
                                             hooks,
                                             Some(interaction),
                                             tool_approvals,
+                                            None,
+                                            None,
                                         );
                                         agent.compact_now(&session_id).await
                                     })()
@@ -1601,12 +1643,16 @@ async fn handle_event(
                         hooks.clone(),
                         Some(interaction.clone()),
                         tool_approvals.clone(),
+                        None,
+                        None,
                     );
                     let session_id = app.session_id.clone();
                     let input_clone = raw_input.clone();
                     let tx_clone = tx.clone();
                     *runner = Some(tokio::spawn(async move {
-                        agent.run_turn(&session_id, &input_clone, Some(tx_clone)).await
+                        agent
+                            .run_turn(&session_id, &input_clone, Some(tx_clone))
+                            .await
                     }));
                     return Ok(true);
                 }
@@ -1733,12 +1779,18 @@ async fn handle_ui_request(
     store: &std::sync::Arc<dyn SessionStore>,
 ) {
     match req {
-        UiRequest::UserInput { request, respond_to } => {
+        UiRequest::UserInput {
+            request,
+            respond_to,
+        } => {
             app.enqueue_overlay(InfoOverlay::UserInput(UserInputOverlay::new(
                 request, respond_to,
             )));
         }
-        UiRequest::ToolApproval { request, respond_to } => {
+        UiRequest::ToolApproval {
+            request,
+            respond_to,
+        } => {
             app.enqueue_overlay(InfoOverlay::ToolApproval(ToolApprovalOverlay::new(
                 request, respond_to,
             )));
@@ -2013,7 +2065,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
         width: input_area.width,
         height: 1,
     };
-    let cursor_offset = UnicodeWidthStr::width(app.input.chars().take(app.cursor).collect::<String>().as_str()) as u16;
+    let cursor_offset = UnicodeWidthStr::width(
+        app.input
+            .chars()
+            .take(app.cursor)
+            .collect::<String>()
+            .as_str(),
+    ) as u16;
     let cursor_x = inner.x.saturating_add(2 + cursor_offset);
     let cursor_x = cursor_x.min(inner.x.saturating_add(inner.width.saturating_sub(1)));
     frame.set_cursor(cursor_x, inner.y);
@@ -2058,7 +2116,9 @@ fn build_status_bar(app: &App) -> String {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
     let percent = match (app.context_used, app.context_limit) {
-        (Some(used), Some(limit)) if limit > 0 => format!("{:.1}%", (used as f64 / limit as f64) * 100.0),
+        (Some(used), Some(limit)) if limit > 0 => {
+            format!("{:.1}%", (used as f64 / limit as f64) * 100.0)
+        }
         _ => "-".to_string(),
     };
     let commands = app.command_hint();
@@ -2106,7 +2166,6 @@ fn masked_settings_yaml(settings: &Settings) -> String {
     }
     serde_yaml::to_string(&safe).unwrap_or_else(|_| "配置序列化失败".to_string())
 }
-
 
 fn slash_page_size() -> usize {
     6
@@ -2291,20 +2350,33 @@ fn build_welcome_lines(
             let right = box_rendered.get(i).map(|(s, _)| s.as_str()).unwrap_or("");
             let right_is_border = box_rendered.get(i).map(|(_, b)| *b).unwrap_or(false);
             let mut spans = Vec::new();
-            spans.push(Span::styled(left.to_string(), Style::default().fg(LOGO_COLOR)));
+            spans.push(Span::styled(
+                left.to_string(),
+                Style::default().fg(LOGO_COLOR),
+            ));
             spans.push(Span::raw(" ".repeat(left_pad)));
             spans.push(Span::raw("  "));
             if right_is_border {
-                spans.push(Span::styled(right.to_string(), Style::default().fg(BORDER_COLOR)));
+                spans.push(Span::styled(
+                    right.to_string(),
+                    Style::default().fg(BORDER_COLOR),
+                ));
             } else {
                 // right line has borders; color only the borders to keep text bright.
                 let mut chars = right.chars();
                 let left_border = chars.next().unwrap_or('│').to_string();
                 let right_border = right.chars().last().unwrap_or('│').to_string();
-                let middle: String = right.chars().skip(1).take(right.chars().count().saturating_sub(2)).collect();
+                let middle: String = right
+                    .chars()
+                    .skip(1)
+                    .take(right.chars().count().saturating_sub(2))
+                    .collect();
                 spans.push(Span::styled(left_border, Style::default().fg(BORDER_COLOR)));
                 spans.push(Span::raw(middle));
-                spans.push(Span::styled(right_border, Style::default().fg(BORDER_COLOR)));
+                spans.push(Span::styled(
+                    right_border,
+                    Style::default().fg(BORDER_COLOR),
+                ));
             }
             out.push(Line::from(spans));
         }
@@ -2545,10 +2617,10 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     };
 
     let ensure_prefix = |current: &mut Vec<Span<'static>>,
-                             pending_prefix: &mut Option<String>,
-                             current_prefix: &Option<String>,
-                             list_stack: &Vec<(bool, usize, usize)>,
-                             blockquote_depth: usize| {
+                         pending_prefix: &mut Option<String>,
+                         current_prefix: &Option<String>,
+                         list_stack: &Vec<(bool, usize, usize)>,
+                         blockquote_depth: usize| {
         if !current.is_empty() {
             return;
         }
@@ -2573,19 +2645,35 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         match event {
             MdEvent::Start(tag) => match tag {
                 Tag::Emphasis => {
-                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::ITALIC);
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(Modifier::ITALIC);
                     style_stack.push(style);
                 }
                 Tag::Strong => {
-                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::BOLD);
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(Modifier::BOLD);
                     style_stack.push(style);
                 }
                 Tag::Strikethrough => {
-                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::CROSSED_OUT);
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(Modifier::CROSSED_OUT);
                     style_stack.push(style);
                 }
                 Tag::Heading { .. } => {
-                    let style = style_stack.last().copied().unwrap_or_default().add_modifier(Modifier::BOLD);
+                    let style = style_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_default()
+                        .add_modifier(Modifier::BOLD);
                     style_stack.push(style);
                 }
                 Tag::CodeBlock(kind) => {
@@ -2608,7 +2696,11 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 Tag::List(start) => {
                     let ordered = start.is_some();
                     let index = start.unwrap_or(1);
-                    let indent = if ordered { index.to_string().len() + 2 } else { 2 };
+                    let indent = if ordered {
+                        index.to_string().len() + 2
+                    } else {
+                        2
+                    };
                     list_stack.push((ordered, index as usize, indent));
                 }
                 Tag::Item => {
@@ -2726,7 +2818,12 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 }
                 TagEnd::Table => {
                     if !table_rows.is_empty() {
-                        render_table_lines(&table_rows, &table_align, table_header_rows, &mut lines);
+                        render_table_lines(
+                            &table_rows,
+                            &table_align,
+                            table_header_rows,
+                            &mut lines,
+                        );
                         lines.push(Line::from(Span::raw("")));
                     }
                 }
@@ -2962,11 +3059,7 @@ fn render_table_lines(
     lines.push(Line::from(Span::raw(bottom)));
 }
 
-fn render_code_block_lines(
-    lines: &[String],
-    lang: Option<&str>,
-    width: u16,
-) -> Vec<Line<'static>> {
+fn render_code_block_lines(lines: &[String], lang: Option<&str>, width: u16) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mut content_width = 1usize;
     for line in lines {
@@ -3031,11 +3124,17 @@ fn render_code_block_lines(
         spans.push(Span::styled("│", border_style));
         spans.push(Span::raw(" "));
         if regions.is_empty() {
-            spans.push(Span::styled(trimmed.clone(), Style::default().fg(COLOR_TEXT)));
+            spans.push(Span::styled(
+                trimmed.clone(),
+                Style::default().fg(COLOR_TEXT),
+            ));
         } else {
             for (style, text) in regions {
-                let mut span_style = Style::default()
-                    .fg(Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b));
+                let mut span_style = Style::default().fg(Color::Rgb(
+                    style.foreground.r,
+                    style.foreground.g,
+                    style.foreground.b,
+                ));
                 if style.font_style.contains(FontStyle::BOLD) {
                     span_style = span_style.add_modifier(Modifier::BOLD);
                 }
@@ -3141,7 +3240,10 @@ fn format_tool_output_lines(
         let mut line = Vec::new();
         line.push(tool_dot_span(color));
         line.push(Span::raw(" "));
-        line.push(Span::styled(label.to_string(), Style::default().fg(COLOR_TEXT)));
+        line.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(COLOR_TEXT),
+        ));
         out.push(Line::from(line));
     }
     let mut content_lines = Vec::new();

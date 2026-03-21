@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::error::ZeroBotResult;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputRequest {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -13,7 +13,7 @@ pub struct UserInputRequest {
     pub questions: Vec<UserInputQuestion>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputQuestion {
     pub id: String,
     pub prompt: String,
@@ -21,13 +21,13 @@ pub struct UserInputQuestion {
     pub options: Option<Vec<UserInputOption>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputOption {
     pub id: String,
     pub label: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UserInputAnswer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_id: Option<String>,
@@ -39,7 +39,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct UserInputResponse {
     pub answers: HashMap<String, UserInputAnswer>,
     #[serde(default, skip_serializing_if = "is_false")]

@@ -1,14 +1,14 @@
 use crate::error::{ZeroBotError, ZeroBotResult};
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use futures::stream::{self, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::Stream;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::Stream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -142,16 +142,20 @@ impl Provider for OpenAIProvider {
         }
 
         let url = format!("{}/chat/completions", self.base_url);
-        let tools = request.tools.into_iter().map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                }
+        let tools = request
+            .tools
+            .into_iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
         let mut messages = Vec::new();
         if let Some(system) = request.system {
@@ -205,7 +209,10 @@ impl Provider for OpenAIProvider {
                                 })
                                 .collect::<Vec<_>>();
                             if let Some(obj) = message.as_object_mut() {
-                                obj.insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls));
+                                obj.insert(
+                                    "tool_calls".to_string(),
+                                    serde_json::Value::Array(tool_calls),
+                                );
                             }
                         }
                     }
@@ -237,8 +244,8 @@ impl Provider for OpenAIProvider {
             )));
         }
 
-        let raw: JsonValue = serde_json::from_str(&text)
-            .map_err(|err| ZeroBotError::Provider(err.to_string()))?;
+        let raw: JsonValue =
+            serde_json::from_str(&text).map_err(|err| ZeroBotError::Provider(err.to_string()))?;
 
         let content = raw
             .get("choices")
@@ -258,7 +265,11 @@ impl Provider for OpenAIProvider {
             .and_then(|v| v.as_array())
         {
             for call in calls {
-                let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = call
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let name = call
                     .get("function")
                     .and_then(|v| v.get("name"))
@@ -270,8 +281,13 @@ impl Provider for OpenAIProvider {
                     .and_then(|v| v.get("arguments"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("{}");
-                let arguments = serde_json::from_str(arguments_raw).unwrap_or(JsonValue::String(arguments_raw.to_string()));
-                tool_calls.push(ToolCall { id, name, arguments });
+                let arguments = serde_json::from_str(arguments_raw)
+                    .unwrap_or(JsonValue::String(arguments_raw.to_string()));
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
             }
         }
 
@@ -296,16 +312,20 @@ impl Provider for OpenAIProvider {
 
         tokio::spawn(async move {
             let url = format!("{}/chat/completions", base_url);
-            let tools = request.tools.into_iter().map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    }
+            let tools = request
+                .tools
+                .into_iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        }
+                    })
                 })
-            }).collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
             let mut messages = Vec::new();
             if let Some(system) = request.system {
@@ -360,7 +380,10 @@ impl Provider for OpenAIProvider {
                                     })
                                     .collect::<Vec<_>>();
                                 if let Some(obj) = message.as_object_mut() {
-                                    obj.insert("tool_calls".to_string(), serde_json::Value::Array(tool_calls));
+                                    obj.insert(
+                                        "tool_calls".to_string(),
+                                        serde_json::Value::Array(tool_calls),
+                                    );
                                 }
                             }
                         }
@@ -430,32 +453,55 @@ impl Provider for OpenAIProvider {
                                 }
                                 if let Ok(raw) = serde_json::from_str::<JsonValue>(&data) {
                                     if raw.get("error").is_some() {
-                                        let _ = tx.send(Err(ZeroBotError::Provider(
-                                            raw.to_string(),
-                                        )));
+                                        let _ =
+                                            tx.send(Err(ZeroBotError::Provider(raw.to_string())));
                                         return;
                                     }
-                                    if let Some(choices) = raw.get("choices").and_then(|v| v.as_array()) {
+                                    if let Some(choices) =
+                                        raw.get("choices").and_then(|v| v.as_array())
+                                    {
                                         for choice in choices {
                                             if let Some(delta) = choice.get("delta") {
-                                                if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                                                    let _ = tx.send(Ok(ProviderEvent::TextDelta(text.to_string())));
+                                                if let Some(text) =
+                                                    delta.get("content").and_then(|v| v.as_str())
+                                                {
+                                                    let _ = tx.send(Ok(ProviderEvent::TextDelta(
+                                                        text.to_string(),
+                                                    )));
                                                 }
-                                                if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                                if let Some(calls) = delta
+                                                    .get("tool_calls")
+                                                    .and_then(|v| v.as_array())
+                                                {
                                                     for call in calls {
-                                                        let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                        let index = call
+                                                            .get("index")
+                                                            .and_then(|v| v.as_u64())
+                                                            .unwrap_or(0)
+                                                            as usize;
                                                         if tool_calls.len() <= index {
-                                                            tool_calls.resize_with(index + 1, PartialToolCall::default);
+                                                            tool_calls.resize_with(
+                                                                index + 1,
+                                                                PartialToolCall::default,
+                                                            );
                                                         }
                                                         let entry = &mut tool_calls[index];
-                                                        if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                                                        if let Some(id) =
+                                                            call.get("id").and_then(|v| v.as_str())
+                                                        {
                                                             entry.id = id.to_string();
                                                         }
                                                         if let Some(func) = call.get("function") {
-                                                            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                            if let Some(name) = func
+                                                                .get("name")
+                                                                .and_then(|v| v.as_str())
+                                                            {
                                                                 entry.name = name.to_string();
                                                             }
-                                                            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                            if let Some(args) = func
+                                                                .get("arguments")
+                                                                .and_then(|v| v.as_str())
+                                                            {
                                                                 entry.arguments.push_str(args);
                                                             }
                                                         }
@@ -464,7 +510,9 @@ impl Provider for OpenAIProvider {
                                             }
                                         }
                                     }
-                                    if let Some(usage) = raw.get("usage").and_then(parse_openai_usage) {
+                                    if let Some(usage) =
+                                        raw.get("usage").and_then(parse_openai_usage)
+                                    {
                                         last_usage = Some(usage.clone());
                                         let _ = tx.send(Ok(ProviderEvent::Usage(usage)));
                                     }
@@ -488,8 +536,16 @@ impl Provider for OpenAIProvider {
                 }
                 let arguments = serde_json::from_str(&call.arguments)
                     .unwrap_or(JsonValue::String(call.arguments));
-                let id = if call.id.is_empty() { uuid::Uuid::new_v4().to_string() } else { call.id };
-                let _ = tx.send(Ok(ProviderEvent::ToolCall(ToolCall { id, name: call.name, arguments })));
+                let id = if call.id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    call.id
+                };
+                let _ = tx.send(Ok(ProviderEvent::ToolCall(ToolCall {
+                    id,
+                    name: call.name,
+                    arguments,
+                })));
             }
             if let Some(usage) = last_usage {
                 let _ = tx.send(Ok(ProviderEvent::Usage(usage)));
@@ -600,8 +656,8 @@ impl Provider for AnthropicProvider {
             )));
         }
 
-        let raw: JsonValue = serde_json::from_str(&text)
-            .map_err(|err| ZeroBotError::Provider(err.to_string()))?;
+        let raw: JsonValue =
+            serde_json::from_str(&text).map_err(|err| ZeroBotError::Provider(err.to_string()))?;
 
         let mut content = String::new();
         let mut tool_calls = Vec::new();
@@ -615,10 +671,22 @@ impl Provider for AnthropicProvider {
                             }
                         }
                         "tool_use" => {
-                            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             let arguments = item.get("input").cloned().unwrap_or(JsonValue::Null);
-                            tool_calls.push(ToolCall { id, name, arguments });
+                            tool_calls.push(ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            });
                         }
                         _ => {}
                     }
@@ -647,7 +715,9 @@ impl Provider for AnthropicProvider {
 
         tokio::spawn(async move {
             if api_key.is_empty() {
-                let _ = tx.send(Err(ZeroBotError::Provider("Anthropic API Key 为空".to_string())));
+                let _ = tx.send(Err(ZeroBotError::Provider(
+                    "Anthropic API Key 为空".to_string(),
+                )));
                 return;
             }
 
@@ -755,9 +825,8 @@ impl Provider for AnthropicProvider {
                                 let evt = event_name.take();
                                 if let Ok(raw) = serde_json::from_str::<JsonValue>(&data) {
                                     if raw.get("error").is_some() {
-                                        let _ = tx.send(Err(ZeroBotError::Provider(
-                                            raw.to_string(),
-                                        )));
+                                        let _ =
+                                            tx.send(Err(ZeroBotError::Provider(raw.to_string())));
                                         return;
                                     }
                                     let evt_type = evt
@@ -775,11 +844,15 @@ impl Provider for AnthropicProvider {
                                                 last_usage.input_tokens = usage.input_tokens;
                                                 last_usage.output_tokens = usage.output_tokens;
                                                 last_usage.total_tokens = usage.total_tokens;
-                                                let _ = tx.send(Ok(ProviderEvent::Usage(last_usage.clone())));
+                                                let _ = tx.send(Ok(ProviderEvent::Usage(
+                                                    last_usage.clone(),
+                                                )));
                                             }
                                         }
                                         "message_delta" => {
-                                            if let Some(usage) = raw.get("usage").and_then(parse_anthropic_usage) {
+                                            if let Some(usage) =
+                                                raw.get("usage").and_then(parse_anthropic_usage)
+                                            {
                                                 if usage.input_tokens.is_some() {
                                                     last_usage.input_tokens = usage.input_tokens;
                                                 }
@@ -789,32 +862,56 @@ impl Provider for AnthropicProvider {
                                                 if usage.total_tokens.is_some() {
                                                     last_usage.total_tokens = usage.total_tokens;
                                                 }
-                                                let _ = tx.send(Ok(ProviderEvent::Usage(last_usage.clone())));
+                                                let _ = tx.send(Ok(ProviderEvent::Usage(
+                                                    last_usage.clone(),
+                                                )));
                                             }
                                         }
                                         "content_block_start" => {
                                             if let Some(block) = raw.get("content_block") {
-                                                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                                let block_type = block
+                                                    .get("type")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
                                                 if block_type == "text" {
-                                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                                    if let Some(text) =
+                                                        block.get("text").and_then(|v| v.as_str())
+                                                    {
                                                         if !text.is_empty() {
-                                                            let _ = tx.send(Ok(ProviderEvent::TextDelta(text.to_string())));
+                                                            let _ = tx.send(Ok(
+                                                                ProviderEvent::TextDelta(
+                                                                    text.to_string(),
+                                                                ),
+                                                            ));
                                                         }
                                                     }
                                                 } else if block_type == "tool_use" {
-                                                    let index = raw.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                    let index = raw
+                                                        .get("index")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0)
+                                                        as usize;
                                                     if tool_calls.len() <= index {
-                                                        tool_calls.resize_with(index + 1, PartialToolCall::default);
+                                                        tool_calls.resize_with(
+                                                            index + 1,
+                                                            PartialToolCall::default,
+                                                        );
                                                     }
                                                     let entry = &mut tool_calls[index];
-                                                    if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                                                    if let Some(id) =
+                                                        block.get("id").and_then(|v| v.as_str())
+                                                    {
                                                         entry.id = id.to_string();
                                                     }
-                                                    if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                                                    if let Some(name) =
+                                                        block.get("name").and_then(|v| v.as_str())
+                                                    {
                                                         entry.name = name.to_string();
                                                     }
                                                     if let Some(input) = block.get("input") {
-                                                        if let Ok(text) = serde_json::to_string(input) {
+                                                        if let Ok(text) =
+                                                            serde_json::to_string(input)
+                                                        {
                                                             entry.arguments = text;
                                                         }
                                                     }
@@ -823,18 +920,38 @@ impl Provider for AnthropicProvider {
                                         }
                                         "content_block_delta" => {
                                             if let Some(delta) = raw.get("delta") {
-                                                let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                                let delta_type = delta
+                                                    .get("type")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
                                                 if delta_type == "text_delta" {
-                                                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                                        let _ = tx.send(Ok(ProviderEvent::TextDelta(text.to_string())));
+                                                    if let Some(text) =
+                                                        delta.get("text").and_then(|v| v.as_str())
+                                                    {
+                                                        let _ =
+                                                            tx.send(Ok(ProviderEvent::TextDelta(
+                                                                text.to_string(),
+                                                            )));
                                                     }
                                                 } else if delta_type == "input_json_delta" {
-                                                    let index = raw.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                    let index = raw
+                                                        .get("index")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0)
+                                                        as usize;
                                                     if tool_calls.len() <= index {
-                                                        tool_calls.resize_with(index + 1, PartialToolCall::default);
+                                                        tool_calls.resize_with(
+                                                            index + 1,
+                                                            PartialToolCall::default,
+                                                        );
                                                     }
-                                                    if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
-                                                        tool_calls[index].arguments.push_str(partial);
+                                                    if let Some(partial) = delta
+                                                        .get("partial_json")
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        tool_calls[index]
+                                                            .arguments
+                                                            .push_str(partial);
                                                     }
                                                 }
                                             }
@@ -866,8 +983,16 @@ impl Provider for AnthropicProvider {
                 }
                 let arguments = serde_json::from_str(&call.arguments)
                     .unwrap_or(JsonValue::String(call.arguments));
-                let id = if call.id.is_empty() { uuid::Uuid::new_v4().to_string() } else { call.id };
-                let _ = tx.send(Ok(ProviderEvent::ToolCall(ToolCall { id, name: call.name, arguments })));
+                let id = if call.id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    call.id
+                };
+                let _ = tx.send(Ok(ProviderEvent::ToolCall(ToolCall {
+                    id,
+                    name: call.name,
+                    arguments,
+                })));
             }
             if last_usage.input_tokens.is_some()
                 || last_usage.output_tokens.is_some()
