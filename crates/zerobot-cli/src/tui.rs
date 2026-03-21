@@ -195,6 +195,7 @@ struct App {
     slash_page: usize,
     slash_hint: String,
     show_full_tool_output: bool,
+    running_tool_output_idx: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -205,6 +206,9 @@ enum OutputItem {
         text: String,
     },
     Markdown(String),
+    ToolRunning {
+        label: String,
+    },
     ToolOutput {
         color: DotColor,
         tool_name: String,
@@ -246,6 +250,7 @@ impl App {
             slash_page: 0,
             slash_hint: String::new(),
             show_full_tool_output: false,
+            running_tool_output_idx: None,
         }
     }
 
@@ -291,6 +296,33 @@ impl App {
         self.stick_to_bottom = true;
     }
 
+    fn push_running_tool(&mut self, label: &str) {
+        self.output.push(OutputItem::ToolRunning {
+            label: label.to_string(),
+        });
+        self.running_tool_output_idx = Some(self.output.len().saturating_sub(1));
+        self.stick_to_bottom = true;
+    }
+
+    fn complete_running_tool(&mut self, name: &str, output: &str, ok: bool) {
+        let color = if ok { DotColor::Green } else { DotColor::Red };
+        let label = self.last_tool_label.clone();
+        let item = OutputItem::ToolOutput {
+            color,
+            tool_name: name.to_string(),
+            label: label.clone(),
+            output: output.to_string(),
+        };
+        if let Some(idx) = self.running_tool_output_idx.take() {
+            if idx < self.output.len() {
+                self.output[idx] = item;
+                self.stick_to_bottom = true;
+                return;
+            }
+        }
+        self.push_tool_output(color, name, label.as_deref(), output);
+    }
+
     fn append_stream_delta(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -329,6 +361,9 @@ impl App {
                 OutputItem::Lines(lines) => lines.clone(),
                 OutputItem::Block { color, text } => format_block_lines(*color, text),
                 OutputItem::Markdown(text) => format_markdown_lines(text, width),
+                OutputItem::ToolRunning { label } => {
+                    vec![format_running_tool_line(label, self.blink_on)]
+                }
                 OutputItem::ToolOutput {
                     color,
                     tool_name,
@@ -1210,6 +1245,8 @@ async fn handle_event(
                             app.output.clear();
                             app.stream_buffer.clear();
                             app.streaming = false;
+                            app.last_tool_label = None;
+                            app.running_tool_output_idx = None;
                             app.scroll = 0;
                             app.stick_to_bottom = true;
                             app.input.clear();
@@ -1903,12 +1940,13 @@ async fn handle_agent_event(
             let args = one_line(&input);
             let label = format_tool_label(&name, &args, app.viewport_width);
             app.last_tool_label = Some(label.clone());
+            app.push_running_tool(&label);
             app.status = Status::Tool(label);
+            app.blink_on = true;
+            app.last_blink = Instant::now();
         }
         AgentEvent::ToolCallFinished { name, output, ok } => {
-            let color = if ok { DotColor::Green } else { DotColor::Red };
-            let label = app.last_tool_label.clone();
-            app.push_tool_output(color, &name, label.as_deref(), output.trim());
+            app.complete_running_tool(&name, output.trim(), ok);
             app.last_tool_label = None;
             app.status = Status::Thinking;
             app.blink_on = true;
@@ -1978,6 +2016,7 @@ async fn resume_session(app: &mut App, store: &std::sync::Arc<dyn SessionStore>,
     app.context_used = None;
     app.context_limit = None;
     app.last_tool_label = None;
+    app.running_tool_output_idx = None;
     app.last_copyable_output = None;
 
     if let Ok(messages) = store.list_messages(session_id).await {
@@ -2046,7 +2085,7 @@ fn format_session_option(session: &Session, summary: &str) -> String {
 }
 
 fn update_blink(app: &mut App) -> bool {
-    if !matches!(app.status, Status::Thinking) {
+    if !matches!(app.status, Status::Thinking | Status::Tool(_)) {
         if !app.blink_on {
             app.blink_on = true;
             return true;
@@ -3269,6 +3308,25 @@ fn tool_dot_span(color: DotColor) -> Span<'static> {
         DotColor::Red => COLOR_ERROR,
     };
     Span::styled("⏺", Style::default().fg(fg))
+}
+
+fn running_tool_dot_span(blink_on: bool) -> Span<'static> {
+    if blink_on {
+        tool_dot_span(DotColor::White)
+    } else {
+        Span::styled(" ", Style::default().fg(COLOR_ACCENT))
+    }
+}
+
+fn format_running_tool_line(label: &str, blink_on: bool) -> Line<'static> {
+    let mut line = Vec::new();
+    line.push(running_tool_dot_span(blink_on));
+    line.push(Span::raw(" "));
+    line.push(Span::styled(
+        label.to_string(),
+        Style::default().fg(COLOR_TEXT),
+    ));
+    Line::from(line)
 }
 
 fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
