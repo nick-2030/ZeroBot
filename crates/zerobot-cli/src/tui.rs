@@ -63,6 +63,7 @@ const COLOR_ERROR: Color = Color::Rgb(236, 112, 104);
 const COLOR_WARN: Color = Color::Rgb(234, 196, 118);
 const LOGO_COLOR: Color = COLOR_ACCENT;
 const BORDER_COLOR: Color = COLOR_PANEL_BORDER;
+const DOUBLE_PRESS_WINDOW_MS: u64 = 900;
 
 #[derive(Clone)]
 enum Status {
@@ -124,6 +125,10 @@ enum UiRequest {
     },
     ResumeSelected {
         session_id: String,
+    },
+    RewindSelected {
+        message_id: String,
+        input: String,
     },
 }
 
@@ -196,6 +201,9 @@ struct App {
     slash_hint: String,
     show_full_tool_output: bool,
     running_tool_output_idx: Option<usize>,
+    last_idle_esc: Option<Instant>,
+    last_idle_ctrl_c: Option<Instant>,
+    status_notice: Option<String>,
 }
 
 #[derive(Clone)]
@@ -251,6 +259,9 @@ impl App {
             slash_hint: String::new(),
             show_full_tool_output: false,
             running_tool_output_idx: None,
+            last_idle_esc: None,
+            last_idle_ctrl_c: None,
+            status_notice: None,
         }
     }
 
@@ -557,6 +568,11 @@ impl App {
         } else {
             String::new()
         }
+    }
+
+    fn clear_key_arms(&mut self) {
+        self.last_idle_esc = None;
+        self.last_idle_ctrl_c = None;
     }
 }
 
@@ -1100,7 +1116,7 @@ async fn run_tui_inner(
                     dirty = true;
                 }
                 Some(req) = ui_rx.recv() => {
-                    handle_ui_request(req, &mut app, &store).await;
+                    handle_ui_request(req, &mut app, &store, &slash).await;
                     dirty = true;
                 }
                 result = handle => {
@@ -1158,7 +1174,7 @@ async fn run_tui_inner(
                     dirty = true;
                 }
                 Some(req) = ui_rx.recv() => {
-                    handle_ui_request(req, &mut app, &store).await;
+                    handle_ui_request(req, &mut app, &store, &slash).await;
                     dirty = true;
                 }
             }
@@ -1187,16 +1203,193 @@ async fn handle_event(
     tx: &mpsc::UnboundedSender<AgentEvent>,
     should_quit: &mut bool,
 ) -> Result<bool> {
+    fn is_busy(
+        app: &App,
+        runner: &Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>>,
+    ) -> bool {
+        if runner.is_some() {
+            return true;
+        }
+        matches!(
+            app.status,
+            Status::Thinking | Status::Tool(_) | Status::WaitingApproval | Status::WaitingUserInput
+        )
+    }
+
+    fn interrupt_active_turn(
+        app: &mut App,
+        runner: &mut Option<tokio::task::JoinHandle<zerobot_core::error::ZeroBotResult<String>>>,
+    ) -> bool {
+        let mut interrupted = false;
+        if let Some(handle) = runner.take() {
+            handle.abort();
+            interrupted = true;
+        }
+        app.finalize_stream();
+        if let Some(idx) = app.running_tool_output_idx.take() {
+            if idx < app.output.len() {
+                if let OutputItem::ToolRunning { label } = app.output[idx].clone() {
+                    app.output[idx] = OutputItem::ToolOutput {
+                        color: DotColor::Yellow,
+                        tool_name: "interrupted".to_string(),
+                        label: Some(label),
+                        output: "已中断".to_string(),
+                    };
+                }
+            }
+        }
+        if let Some(overlay) = app.info_overlay.as_mut() {
+            match overlay {
+                InfoOverlay::UserInput(overlay) => {
+                    overlay.finish(true);
+                }
+                InfoOverlay::ToolApproval(overlay) => {
+                    overlay.finish(ToolApprovalDecision::Deny);
+                }
+            }
+            app.dismiss_overlay();
+        }
+        if interrupted || !matches!(app.status, Status::Idle | Status::Error(_)) {
+            app.last_tool_label = None;
+            app.status = Status::Idle;
+            app.push_block(DotColor::Yellow, "已中断当前执行");
+            app.clear_key_arms();
+            app.status_notice = None;
+            return true;
+        }
+        false
+    }
+
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                *should_quit = true;
-                return Ok(true);
-            }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
                 app.show_full_tool_output = !app.show_full_tool_output;
                 return Ok(true);
             }
+            let now = Instant::now();
+            let double_window = Duration::from_millis(DOUBLE_PRESS_WINDOW_MS);
+            let ctrl_c =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+            let esc = key.code == KeyCode::Esc;
+            let busy = is_busy(app, runner);
+            let idle = !busy && app.info_overlay.is_none() && matches!(app.status, Status::Idle);
+
+            if ctrl_c {
+                if busy {
+                    return Ok(interrupt_active_turn(app, runner));
+                }
+                if idle {
+                    if let Some(prev) = app.last_idle_ctrl_c {
+                        if now.duration_since(prev) <= double_window {
+                            app.clear_key_arms();
+                            app.status_notice = None;
+                            *should_quit = true;
+                            return Ok(true);
+                        }
+                    }
+                    app.last_idle_ctrl_c = Some(now);
+                    app.last_idle_esc = None;
+                    app.status_notice = Some("再按一次ctrl+c退出程序".to_string());
+                    return Ok(true);
+                }
+                app.clear_key_arms();
+                app.status_notice = None;
+            } else if esc {
+                if busy {
+                    return Ok(interrupt_active_turn(app, runner));
+                }
+                if idle {
+                    if let Some(prev) = app.last_idle_esc {
+                        if now.duration_since(prev) <= double_window {
+                            app.clear_key_arms();
+                            app.status_notice = None;
+
+                            let messages = match store.list_messages(&app.session_id).await {
+                                Ok(messages) => messages,
+                                Err(err) => {
+                                    app.push_block(
+                                        DotColor::Red,
+                                        &format!("读取会话消息失败: {err}"),
+                                    );
+                                    return Ok(true);
+                                }
+                            };
+                            let mut options = Vec::new();
+                            let mut input_by_id = HashMap::<String, String>::new();
+                            let mut index = 1usize;
+                            for message in messages
+                                .into_iter()
+                                .filter(|msg| matches!(msg.role, MessageRole::User))
+                            {
+                                let summary = one_line(&message.content);
+                                let summary = truncate_chars(&summary, 80);
+                                options.push(UserInputOption {
+                                    id: message.id.clone(),
+                                    label: format!("{index:>3}. {summary}"),
+                                });
+                                input_by_id.insert(message.id.clone(), message.content.clone());
+                                index += 1;
+                            }
+                            if options.is_empty() {
+                                app.push_block(DotColor::White, "当前会话还没有可回退的用户输入");
+                                return Ok(true);
+                            }
+
+                            let request = UserInputRequest {
+                                id: "rewind".to_string(),
+                                title: Some("选择要回退的用户输入".to_string()),
+                                questions: vec![UserInputQuestion {
+                                    id: "message".to_string(),
+                                    prompt: "请选择一条用户输入（将回退到该消息之前）".to_string(),
+                                    options: Some(options),
+                                }],
+                            };
+                            let (resp_tx, resp_rx) = oneshot::channel();
+                            if ui_tx
+                                .send(UiRequest::UserInput {
+                                    request,
+                                    respond_to: resp_tx,
+                                })
+                                .is_err()
+                            {
+                                app.push_block(DotColor::Red, "无法打开回退选择列表");
+                                return Ok(true);
+                            }
+                            let ui_tx = ui_tx.clone();
+                            tokio::spawn(async move {
+                                if let Ok(resp) = resp_rx.await {
+                                    if resp.cancelled {
+                                        return;
+                                    }
+                                    let selected = resp
+                                        .answers
+                                        .get("message")
+                                        .and_then(|ans| ans.option_id.clone());
+                                    if let Some(message_id) = selected {
+                                        if let Some(input) = input_by_id.get(&message_id).cloned() {
+                                            let _ = ui_tx.send(UiRequest::RewindSelected {
+                                                message_id,
+                                                input,
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                            return Ok(true);
+                        }
+                    }
+                    app.last_idle_esc = Some(now);
+                    app.last_idle_ctrl_c = None;
+                    app.status_notice = None;
+                    return Ok(true);
+                }
+                app.clear_key_arms();
+                app.status_notice = None;
+            } else {
+                app.clear_key_arms();
+                app.status_notice = None;
+            }
+
             if app.info_overlay.is_some() {
                 if handle_overlay_key(key, app) {
                     return Ok(true);
@@ -1881,6 +2074,7 @@ async fn handle_ui_request(
     req: UiRequest,
     app: &mut App,
     store: &std::sync::Arc<dyn SessionStore>,
+    slash: &SlashRegistry,
 ) {
     match req {
         UiRequest::UserInput {
@@ -1901,6 +2095,28 @@ async fn handle_ui_request(
         }
         UiRequest::ResumeSelected { session_id } => {
             resume_session(app, store, &session_id).await;
+        }
+        UiRequest::RewindSelected { message_id, input } => {
+            match store
+                .rewind_to_before_message(&app.session_id, &message_id)
+                .await
+            {
+                Ok(()) => {
+                    let session_id = app.session_id.clone();
+                    load_session_into_output(app, store, &session_id).await;
+                    app.status = Status::Idle;
+                    app.input = input;
+                    app.cursor = app.input.chars().count();
+                    app.refresh_slash(slash);
+                    app.push_block(
+                        DotColor::White,
+                        "已回退到所选用户输入之前，原输入已恢复到输入框",
+                    );
+                }
+                Err(err) => {
+                    app.push_block(DotColor::Red, &format!("回退会话失败: {err}"));
+                }
+            }
         }
     }
 }
@@ -1993,19 +2209,11 @@ async fn refresh_session_state(app: &mut App, store: &std::sync::Arc<dyn Session
     }
 }
 
-async fn resume_session(app: &mut App, store: &std::sync::Arc<dyn SessionStore>, session_id: &str) {
-    match store.get_session(session_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            app.push_block(DotColor::Red, &format!("会话不存在: {session_id}"));
-            return;
-        }
-        Err(err) => {
-            app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
-            return;
-        }
-    }
-
+async fn load_session_into_output(
+    app: &mut App,
+    store: &std::sync::Arc<dyn SessionStore>,
+    session_id: &str,
+) {
     app.session_id = session_id.to_string();
     app.output.clear();
     app.stream_buffer.clear();
@@ -2018,6 +2226,8 @@ async fn resume_session(app: &mut App, store: &std::sync::Arc<dyn SessionStore>,
     app.last_tool_label = None;
     app.running_tool_output_idx = None;
     app.last_copyable_output = None;
+    app.clear_key_arms();
+    app.status_notice = None;
 
     if let Ok(messages) = store.list_messages(session_id).await {
         for message in messages {
@@ -2042,6 +2252,22 @@ async fn resume_session(app: &mut App, store: &std::sync::Arc<dyn SessionStore>,
     }
 
     refresh_session_state(app, store).await;
+}
+
+async fn resume_session(app: &mut App, store: &std::sync::Arc<dyn SessionStore>, session_id: &str) {
+    match store.get_session(session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            app.push_block(DotColor::Red, &format!("会话不存在: {session_id}"));
+            return;
+        }
+        Err(err) => {
+            app.push_block(DotColor::Red, &format!("读取会话失败: {err}"));
+            return;
+        }
+    }
+
+    load_session_into_output(app, store, session_id).await;
     app.push_block(DotColor::White, &format!("已恢复会话: {session_id}"));
 }
 
@@ -2245,6 +2471,9 @@ fn build_status_bar(app: &App) -> String {
     ];
     if !commands.is_empty() {
         parts.push(format!("Commands: {commands}"));
+    }
+    if let Some(notice) = &app.status_notice {
+        parts.push(notice.clone());
     }
     parts.join(" | ")
 }

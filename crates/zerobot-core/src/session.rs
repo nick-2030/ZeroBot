@@ -134,6 +134,15 @@ pub trait SessionStore: Send + Sync {
         first_ai_message: Option<&str>,
         summary: Option<&str>,
     ) -> ZeroBotResult<()>;
+    async fn rewind_to_before_message(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+    ) -> ZeroBotResult<()> {
+        Err(ZeroBotError::SessionStore(
+            "当前会话存储不支持回退消息".to_string(),
+        ))
+    }
     async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()>;
 }
 
@@ -627,6 +636,62 @@ impl SessionStore for SqliteSessionStore {
         Ok(())
     }
 
+    async fn rewind_to_before_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> ZeroBotResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            r#"
+            SELECT id, tool_call_id
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let Some(idx) = rows.iter().position(|(id, _)| id == message_id) else {
+            return Err(ZeroBotError::SessionStore(format!(
+                "未找到可回退的消息: {message_id}"
+            )));
+        };
+
+        let mut tool_call_ids = std::collections::HashSet::new();
+        for (id, tool_call_id) in rows.iter().skip(idx) {
+            if let Some(call_id) = tool_call_id {
+                tool_call_ids.insert(call_id.clone());
+            }
+            sqlx::query("DELETE FROM messages WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for call_id in tool_call_ids {
+            sqlx::query("DELETE FROM tool_outputs WHERE tool_call_id = ?")
+                .bind(&call_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM tool_calls WHERE id = ?")
+                .bind(&call_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        sqlx::query("UPDATE sessions SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now().timestamp())
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()> {
         sqlx::query("DELETE FROM sessions WHERE id = ?")
             .bind(session_id)
@@ -782,5 +847,73 @@ mod tests {
         store.set_todos(&session.id, &[]).await.unwrap();
         let cleared = store.get_todos(&session.id).await.unwrap();
         assert!(cleared.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewind_to_before_message_removes_selected_and_after() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteSessionStore::new(dir.path().join("test.db"))
+            .await
+            .unwrap();
+        store.init().await.unwrap();
+        let session = store.create_session("test".to_string()).await.unwrap();
+
+        let user1 = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::User,
+            content: "第一条".to_string(),
+            summary: false,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at: Utc::now().timestamp(),
+        };
+        store.append_message(user1.clone()).await.unwrap();
+
+        let assistant1 = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "回复一".to_string(),
+            summary: false,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at: Utc::now().timestamp(),
+        };
+        store.append_message(assistant1.clone()).await.unwrap();
+
+        let user2 = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::User,
+            content: "第二条".to_string(),
+            summary: false,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at: Utc::now().timestamp(),
+        };
+        store.append_message(user2.clone()).await.unwrap();
+
+        let assistant2 = Message {
+            id: Uuid::new_v4().to_string(),
+            session_id: session.id.clone(),
+            role: MessageRole::Assistant,
+            content: "回复二".to_string(),
+            summary: false,
+            tool_call_id: None,
+            tool_calls: None,
+            created_at: Utc::now().timestamp(),
+        };
+        store.append_message(assistant2.clone()).await.unwrap();
+
+        store
+            .rewind_to_before_message(&session.id, &user2.id)
+            .await
+            .unwrap();
+
+        let remaining = store.list_messages(&session.id).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].id, user1.id);
+        assert_eq!(remaining[1].id, assistant1.id);
     }
 }
