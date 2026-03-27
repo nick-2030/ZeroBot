@@ -8,7 +8,7 @@ use crate::interaction::{InteractionHandler, ToolApprovalDecision, ToolApprovalR
 use crate::plugin::{PluginHookWarning, PluginManager};
 use crate::provider::{Provider, ProviderEvent, ProviderRequest, ToolCall};
 use crate::session::{Message, MessageRole, SessionStore, StoredToolCall};
-use crate::skills::SkillInfo;
+use crate::skills::{SkillInfo, SkillManager};
 use crate::tool::{ToolContext, ToolRegistry, ToolRouteContext};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
@@ -852,9 +852,10 @@ impl Agent {
         call: ToolCall,
         events: &Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> ZeroBotResult<()> {
-        let tool_name = call.name.clone();
+        let mut tool_name = call.name.clone();
         let tool_call_external_id = call.id.clone();
         let mut args = call.arguments.clone();
+        tool_name = self.resolve_tool_alias(tool_name, &mut args)?;
 
         let pre_payload = serde_json::json!({
             "tool_name": tool_name.clone(),
@@ -1262,6 +1263,29 @@ impl Agent {
         }
     }
 
+    fn resolve_tool_alias(&self, tool_name: String, args: &mut JsonValue) -> ZeroBotResult<String> {
+        if self.tools.get(&tool_name).is_some() {
+            return Ok(tool_name);
+        }
+        if !self.settings.skills.enabled
+            || tool_name == "skill"
+            || self.tools.get("skill").is_none()
+        {
+            return Ok(tool_name);
+        }
+
+        let manager = SkillManager::new(&self.settings, &self.cwd);
+        let skills = match manager.discover() {
+            Ok(skills) => skills,
+            Err(_) => return Ok(tool_name),
+        };
+        let skill_names = skills.into_iter().map(|s| s.name).collect::<HashSet<_>>();
+        if let Some(mapped) = rewrite_skill_alias_call(&tool_name, args, &skill_names) {
+            return Ok(mapped);
+        }
+        Ok(tool_name)
+    }
+
     fn emit(&self, events: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
         if let Some(tx) = events {
             let _ = tx.send(event);
@@ -1351,6 +1375,25 @@ fn approval_key(tool_name: &str, args: &JsonValue) -> String {
     tool_name.to_string()
 }
 
+fn rewrite_skill_alias_call(
+    tool_name: &str,
+    args: &mut JsonValue,
+    skill_names: &HashSet<String>,
+) -> Option<String> {
+    if !skill_names.contains(tool_name) {
+        return None;
+    }
+    match args {
+        JsonValue::Object(obj) => {
+            obj.insert("name".to_string(), JsonValue::String(tool_name.to_string()));
+        }
+        _ => {
+            *args = serde_json::json!({ "name": tool_name });
+        }
+    }
+    Some("skill".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,5 +1402,32 @@ mod tests {
     fn approval_key_uses_skill_name() {
         let key = approval_key("skill", &serde_json::json!({ "name": "deploy-prod" }));
         assert_eq!(key, "skill:deploy-prod");
+    }
+
+    #[test]
+    fn rewrite_skill_alias_call_rewrites_object_args() {
+        let mut args = serde_json::json!({ "command": "create_presentation" });
+        let names = HashSet::from(["pptx".to_string()]);
+        let mapped = rewrite_skill_alias_call("pptx", &mut args, &names);
+        assert_eq!(mapped.as_deref(), Some("skill"));
+        assert_eq!(args.get("name").and_then(|v| v.as_str()), Some("pptx"));
+    }
+
+    #[test]
+    fn rewrite_skill_alias_call_wraps_non_object_args() {
+        let mut args = serde_json::json!("whatever");
+        let names = HashSet::from(["pptx".to_string()]);
+        let mapped = rewrite_skill_alias_call("pptx", &mut args, &names);
+        assert_eq!(mapped.as_deref(), Some("skill"));
+        assert_eq!(args, serde_json::json!({ "name": "pptx" }));
+    }
+
+    #[test]
+    fn rewrite_skill_alias_call_ignores_non_skill_name() {
+        let mut args = serde_json::json!({ "x": 1 });
+        let names = HashSet::from(["browser-automation".to_string()]);
+        let mapped = rewrite_skill_alias_call("pptx", &mut args, &names);
+        assert!(mapped.is_none());
+        assert_eq!(args, serde_json::json!({ "x": 1 }));
     }
 }
