@@ -11,6 +11,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+agent-client-protocol = { version = "0.10.3", features = ["unstable"] }
 anyhow = "1.0"
 async-trait = "0.1"
 arboard = "3.3"

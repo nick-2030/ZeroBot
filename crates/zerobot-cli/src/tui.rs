@@ -2151,7 +2151,11 @@ async fn handle_agent_event(
                 app.last_copyable_output = Some(content);
             }
         }
-        AgentEvent::ToolCallStarted { name, input } => {
+        AgentEvent::ToolCallStarted {
+            tool_call_id: _,
+            name,
+            input,
+        } => {
             app.finalize_stream();
             let args = one_line(&input);
             let label = format_tool_label(&name, &args, app.viewport_width);
@@ -2161,7 +2165,12 @@ async fn handle_agent_event(
             app.blink_on = true;
             app.last_blink = Instant::now();
         }
-        AgentEvent::ToolCallFinished { name, output, ok } => {
+        AgentEvent::ToolCallFinished {
+            tool_call_id: _,
+            name,
+            output,
+            ok,
+        } => {
             app.complete_running_tool(&name, output.trim(), ok);
             app.last_tool_label = None;
             app.status = Status::Thinking;

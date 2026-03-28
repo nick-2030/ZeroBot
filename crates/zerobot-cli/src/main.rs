@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock as TokioRwLock;
+use tokio::task::LocalSet;
+use zerobot_core::acp::{run_stdio as run_acp_stdio, AcpServerConfig};
 use zerobot_core::agent::Agent;
 use zerobot_core::bus::OutboundMessage;
 use zerobot_core::channel::{feishu::FeishuChannel, ChatChannel};
@@ -74,6 +76,14 @@ enum Command {
     Heartbeat {
         #[command(subcommand)]
         cmd: HeartbeatCmd,
+    },
+    Acp {
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -207,6 +217,20 @@ async fn main() -> Result<()> {
         }
         Some(Command::Heartbeat { cmd }) => {
             handle_heartbeat_cmd(&settings, &cwd, cli.provider, cli.model, cmd).await?;
+        }
+        Some(Command::Acp {
+            cwd: acp_cwd,
+            provider: acp_provider,
+            model: acp_model,
+        }) => {
+            let effective_cwd = acp_cwd.unwrap_or(cwd);
+            run_acp(
+                &settings,
+                &effective_cwd,
+                acp_provider.or(cli.provider),
+                acp_model.or(cli.model),
+            )
+            .await?;
         }
         None => {
             run_repl(
@@ -630,6 +654,60 @@ async fn run_gateway(
     println!("{}", style("gateway 已启动，按 Ctrl+C 结束").green());
     runtime.run().await?;
     tracing::info!("gateway 事件循环已退出");
+    Ok(())
+}
+
+async fn run_acp(
+    settings: &Settings,
+    cwd: &PathBuf,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+) -> Result<()> {
+    let _log_guard = init_logging_with_stdout(settings, Some("acp"), true)?;
+    tracing::info!("acp 启动中, cwd={}", cwd.display());
+
+    let workspace_root = resolve_workspace_root(cwd);
+    let db_path = resolve_session_db_path(&workspace_root);
+    let store = SqliteSessionStore::new(db_path).await?;
+    store.init().await?;
+    let approvals = store.list_tool_approvals().await.unwrap_or_default();
+    let store = Arc::new(store);
+
+    let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
+    let plugins = PluginManager::new(settings, cwd).await?;
+    let plugins_for_shutdown = plugins.clone();
+
+    let default_provider = resolve_provider_id(settings, provider_override.as_deref());
+    let default_model = resolve_model(
+        settings,
+        Some(default_provider.as_str()),
+        model_override.as_deref(),
+    )?;
+    let tool_approvals = Arc::new(TokioRwLock::new(
+        approvals.into_iter().collect::<HashSet<_>>(),
+    ));
+
+    let config = AcpServerConfig {
+        settings: settings.clone(),
+        cwd: cwd.clone(),
+        store,
+        base_hooks: hooks,
+        plugins,
+        tool_approvals,
+        default_provider,
+        default_model,
+    };
+
+    let local_set = LocalSet::new();
+    let result = local_set
+        .run_until(async move { run_acp_stdio(config).await })
+        .await;
+
+    if let Some(plugins) = &plugins_for_shutdown {
+        plugins.shutdown().await;
+    }
+
+    result?;
     Ok(())
 }
 
@@ -1077,6 +1155,33 @@ mod tests {
         match cli.command {
             Some(Command::Exec { prompt }) => assert_eq!(prompt, "hello"),
             _ => panic!("命令解析失败"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_acp_with_overrides() {
+        let args = [
+            "zerobot",
+            "acp",
+            "--cwd",
+            "/tmp/project",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o-mini",
+        ];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Command::Acp {
+                cwd,
+                provider,
+                model,
+            }) => {
+                assert_eq!(cwd, Some(PathBuf::from("/tmp/project")));
+                assert_eq!(provider.as_deref(), Some("openai"));
+                assert_eq!(model.as_deref(), Some("gpt-4o-mini"));
+            }
+            _ => panic!("acp 命令解析失败"),
         }
     }
 }

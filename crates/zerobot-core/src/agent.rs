@@ -873,6 +873,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolCallStarted {
+                    tool_call_id: tool_call_external_id.clone(),
                     name: tool_name.clone(),
                     input: call.arguments.to_string(),
                 },
@@ -894,7 +895,7 @@ impl Agent {
                     role: MessageRole::Tool,
                     content: message.clone(),
                     summary: false,
-                    tool_call_id: Some(tool_call_id),
+                    tool_call_id: Some(tool_call_id.clone()),
                     tool_calls: None,
                     created_at: Utc::now().timestamp(),
                 })
@@ -917,6 +918,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolCallFinished {
+                    tool_call_id: tool_call_id.clone(),
                     name: tool_name,
                     output: message,
                     ok: false,
@@ -1020,6 +1022,7 @@ impl Agent {
         self.emit(
             events,
             AgentEvent::ToolCallStarted {
+                tool_call_id: tool_call_external_id.clone(),
                 name: tool_name.clone(),
                 input: args.to_string(),
             },
@@ -1045,7 +1048,7 @@ impl Agent {
                     role: MessageRole::Tool,
                     content: message.clone(),
                     summary: false,
-                    tool_call_id: Some(tool_call_id),
+                    tool_call_id: Some(tool_call_id.clone()),
                     tool_calls: None,
                     created_at: Utc::now().timestamp(),
                 })
@@ -1068,6 +1071,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolCallFinished {
+                    tool_call_id: tool_call_id.clone(),
                     name: tool_name,
                     output: message,
                     ok: false,
@@ -1174,6 +1178,7 @@ impl Agent {
                 self.emit(
                     events,
                     AgentEvent::ToolCallFinished {
+                        tool_call_id: tool_call_id.clone(),
                         name: tool_name,
                         output: output_content,
                         ok,
@@ -1243,7 +1248,7 @@ impl Agent {
                         role: MessageRole::Tool,
                         content: output_content.clone(),
                         summary: false,
-                        tool_call_id: Some(tool_call_id),
+                        tool_call_id: Some(tool_call_id.clone()),
                         tool_calls: None,
                         created_at: Utc::now().timestamp(),
                     })
@@ -1252,6 +1257,7 @@ impl Agent {
                 self.emit(
                     events,
                     AgentEvent::ToolCallFinished {
+                        tool_call_id: tool_call_id.clone(),
                         name: tool_name,
                         output: output_content,
                         ok: false,

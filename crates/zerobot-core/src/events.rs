@@ -16,10 +16,12 @@ pub enum AgentEvent {
         content: String,
     },
     ToolCallStarted {
+        tool_call_id: String,
         name: String,
         input: String,
     },
     ToolCallFinished {
+        tool_call_id: String,
         name: String,
         output: String,
         ok: bool,
