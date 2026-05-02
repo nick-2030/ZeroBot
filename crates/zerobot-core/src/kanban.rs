@@ -277,3 +277,191 @@ impl KanbanManager {
         }
     }
 }
+
+// ============ Kanban Tools ============
+
+use async_trait::async_trait;
+use crate::tool::{Tool, ToolContext, ToolOutput};
+
+/// 创建看板任务
+pub struct KanbanCreateTool {
+    manager: std::sync::Arc<KanbanManager>,
+}
+
+impl KanbanCreateTool {
+    pub fn new(manager: std::sync::Arc<KanbanManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl Tool for KanbanCreateTool {
+    fn name(&self) -> &str { "kanban_create" }
+    fn description(&self) -> &str { "创建新的看板任务" }
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "任务标题" },
+                "description": { "type": "string", "description": "任务详细描述" },
+                "assignee": { "type": "string", "description": "分配给的 agent 名称" },
+                "parent_id": { "type": "string", "description": "父任务 ID（任务依赖）" }
+            },
+            "required": ["title"]
+        })
+    }
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let title = args["title"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 title".into()))?;
+        let description = args["description"].as_str().unwrap_or("").to_string();
+        let assignee = args["assignee"].as_str().map(|s| s.to_string());
+        let parent_id = args["parent_id"].as_str().map(|s| s.to_string());
+
+        let task = self.manager.create(NewKanbanTask {
+            title: title.to_string(),
+            description,
+            assignee,
+            parent_id,
+            metadata: None,
+        }).await?;
+
+        Ok(ToolOutput::new(serde_json::to_string_pretty(&task).unwrap_or_default()))
+    }
+}
+
+/// 查看看板任务
+pub struct KanbanShowTool {
+    manager: std::sync::Arc<KanbanManager>,
+}
+
+impl KanbanShowTool {
+    pub fn new(manager: std::sync::Arc<KanbanManager>) -> Self { Self { manager } }
+}
+
+#[async_trait]
+impl Tool for KanbanShowTool {
+    fn name(&self) -> &str { "kanban_show" }
+    fn description(&self) -> &str { "查看看板任务列表或单个任务详情" }
+    fn is_read_only(&self) -> bool { true }
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "任务 ID（查看单个）" },
+                "status": { "type": "string", "description": "按状态过滤" },
+                "assignee": { "type": "string", "description": "按分配者过滤" }
+            }
+        })
+    }
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        if let Some(id) = args["id"].as_str() {
+            let task = self.manager.get(id).await?;
+            return Ok(ToolOutput::new(serde_json::to_string_pretty(&task).unwrap_or_default()));
+        }
+
+        let filter = KanbanFilter {
+            status: args["status"].as_str().map(|s| s.to_string()),
+            assignee: args["assignee"].as_str().map(|s| s.to_string()),
+            parent_id: None,
+        };
+        let tasks = self.manager.list(filter).await?;
+        Ok(ToolOutput::new(serde_json::to_string_pretty(&tasks).unwrap_or_default()))
+    }
+}
+
+/// 完成看板任务
+pub struct KanbanCompleteTool {
+    manager: std::sync::Arc<KanbanManager>,
+}
+
+impl KanbanCompleteTool {
+    pub fn new(manager: std::sync::Arc<KanbanManager>) -> Self { Self { manager } }
+}
+
+#[async_trait]
+impl Tool for KanbanCompleteTool {
+    fn name(&self) -> &str { "kanban_complete" }
+    fn description(&self) -> &str { "标记看板任务为已完成" }
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "任务 ID" },
+                "summary": { "type": "string", "description": "完成摘要" },
+                "metadata": { "type": "object", "description": "结构化元数据" }
+            },
+            "required": ["id", "summary"]
+        })
+    }
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let id = args["id"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 id".into()))?;
+        let summary = args["summary"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 summary".into()))?;
+        let metadata = args.get("metadata").cloned().unwrap_or_else(|| serde_json::json!({}));
+
+        self.manager.complete(id, summary, metadata).await?;
+        Ok(ToolOutput::new(format!("任务 {} 已完成", id)))
+    }
+}
+
+/// 阻塞看板任务
+pub struct KanbanBlockTool {
+    manager: std::sync::Arc<KanbanManager>,
+}
+
+impl KanbanBlockTool {
+    pub fn new(manager: std::sync::Arc<KanbanManager>) -> Self { Self { manager } }
+}
+
+#[async_trait]
+impl Tool for KanbanBlockTool {
+    fn name(&self) -> &str { "kanban_block" }
+    fn description(&self) -> &str { "标记看板任务为阻塞状态" }
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "任务 ID" },
+                "reason": { "type": "string", "description": "阻塞原因" }
+            },
+            "required": ["id", "reason"]
+        })
+    }
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let id = args["id"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 id".into()))?;
+        let reason = args["reason"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 reason".into()))?;
+
+        self.manager.update_status(id, KanbanStatus::Blocked { reason: reason.to_string() }).await?;
+        Ok(ToolOutput::new(format!("任务 {} 已阻塞: {}", id, reason)))
+    }
+}
+
+/// 看板任务评论
+pub struct KanbanCommentTool {
+    manager: std::sync::Arc<KanbanManager>,
+}
+
+impl KanbanCommentTool {
+    pub fn new(manager: std::sync::Arc<KanbanManager>) -> Self { Self { manager } }
+}
+
+#[async_trait]
+impl Tool for KanbanCommentTool {
+    fn name(&self) -> &str { "kanban_comment" }
+    fn description(&self) -> &str { "为看板任务添加评论" }
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "任务 ID" },
+                "comment": { "type": "string", "description": "评论内容" }
+            },
+            "required": ["id", "comment"]
+        })
+    }
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let id = args["id"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 id".into()))?;
+        let comment = args["comment"].as_str().ok_or_else(|| ZeroBotError::Tool("缺少 comment".into()))?;
+
+        self.manager.comment(id, comment).await?;
+        Ok(ToolOutput::new(format!("已为任务 {} 添加评论", id)))
+    }
+}
