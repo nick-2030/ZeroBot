@@ -97,6 +97,8 @@ pub struct GatewayRuntime {
     heartbeat_service: HeartbeatService,
     executor: GatewayExecutor,
     plugins: Option<Arc<PluginManager>>,
+    kanban_manager: Option<Arc<crate::kanban::KanbanManager>>,
+    agent_dispatcher: Option<Arc<crate::agent_dispatch::AgentDispatcher>>,
 }
 
 impl GatewayRuntime {
@@ -262,6 +264,8 @@ impl GatewayRuntime {
             heartbeat_service,
             plugins: executor.plugins.clone(),
             executor,
+            kanban_manager: None,
+            agent_dispatcher: None,
         })
     }
 
@@ -272,6 +276,37 @@ impl GatewayRuntime {
     pub async fn run(&mut self) -> ZeroBotResult<()> {
         tracing::info!("gateway event loop started");
         while !self.shutdown.load(Ordering::SeqCst) {
+            // Kanban 调度 tick
+            if let (Some(kanban), Some(dispatcher)) = (&self.kanban_manager, &self.agent_dispatcher) {
+                let todo_tasks = kanban.list(crate::kanban::KanbanFilter {
+                    status: Some("todo".to_string()),
+                    assignee: None,
+                    parent_id: None,
+                }).await.unwrap_or_default();
+
+                for task in todo_tasks {
+                    if let Some(assignee) = &task.assignee {
+                        let request = crate::agent_dispatch::DispatchRequest {
+                            agent_type: assignee.clone(),
+                            prompt: format!("执行看板任务: {}\n\n{}", task.title, task.description),
+                            mode: crate::agent_dispatch::DispatchMode::Background { name: Some(assignee.clone()) },
+                            model_override: None,
+                            tool_overrides: None,
+                            cwd: None,
+                            max_turns: None,
+                            isolation: None,
+                            depth: None,
+                        };
+
+                        if let Err(e) = dispatcher.dispatch(request).await {
+                            tracing::warn!("Kanban 调度失败: {}", e);
+                        } else {
+                            let _ = kanban.update_status(&task.id, crate::kanban::KanbanStatus::InProgress).await;
+                        }
+                    }
+                }
+            }
+
             let recv = timeout(Duration::from_millis(500), self.inbound_rx.recv()).await;
             let msg = match recv {
                 Ok(Some(msg)) => msg,
