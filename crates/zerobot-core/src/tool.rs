@@ -462,6 +462,24 @@ impl ToolRegistry {
 
         Ok(registry)
     }
+
+    /// 注册 AgentDispatcherTool
+    pub fn with_agent_dispatcher(
+        mut self,
+        dispatcher: Arc<crate::agent_dispatch::AgentDispatcher>,
+    ) -> Self {
+        self.register(AgentDispatcherTool::new(dispatcher));
+        self
+    }
+
+    /// 注册 SendMessageTool
+    pub fn with_send_message(
+        mut self,
+        dispatcher: Arc<crate::agent_dispatch::AgentDispatcher>,
+    ) -> Self {
+        self.register(SendMessageTool::new(dispatcher));
+        self
+    }
 }
 
 pub struct SubagentTool {
@@ -646,6 +664,161 @@ impl Tool for SubagentTool {
             )
             .await;
         Ok(ToolOutput::new(output))
+    }
+}
+
+/// 统一的 Agent 分发工具，替代 SubagentTool
+pub struct AgentDispatcherTool {
+    dispatcher: Arc<crate::agent_dispatch::AgentDispatcher>,
+}
+
+impl AgentDispatcherTool {
+    pub fn new(dispatcher: Arc<crate::agent_dispatch::AgentDispatcher>) -> Self {
+        Self { dispatcher }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentToolArgs {
+    description: String,
+    prompt: String,
+    #[serde(default)]
+    subagent_type: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    run_in_background: Option<bool>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    team_name: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
+}
+
+#[async_trait]
+impl Tool for AgentDispatcherTool {
+    fn name(&self) -> &str {
+        "agent"
+    }
+
+    fn description(&self) -> &str {
+        "分发任务给子 agent 执行。支持同步和后台两种模式。"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": { "type": "string", "description": "3-5 个词的任务描述" },
+                "prompt": { "type": "string", "description": "详细任务描述" },
+                "subagent_type": { "type": "string", "description": "Agent 定义名称" },
+                "model": { "type": "string", "description": "模型覆盖" },
+                "run_in_background": { "type": "boolean", "description": "是否后台执行" },
+                "name": { "type": "string", "description": "后台 agent 名称" },
+                "team_name": { "type": "string", "description": "团队名称" },
+                "cwd": { "type": "string", "description": "工作目录" },
+                "max_turns": { "type": "number", "description": "最大轮次" }
+            },
+            "required": ["description", "prompt"]
+        })
+    }
+
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: AgentToolArgs = serde_json::from_value(args)
+            .map_err(|e| ZeroBotError::Tool(format!("参数解析失败: {}", e)))?;
+
+        let mode = if args.run_in_background.unwrap_or(false) {
+            crate::agent_dispatch::DispatchMode::Background { name: args.name }
+        } else {
+            crate::agent_dispatch::DispatchMode::Sync
+        };
+
+        let request = crate::agent_dispatch::DispatchRequest {
+            agent_type: args
+                .subagent_type
+                .unwrap_or_else(|| "general-purpose".to_string()),
+            prompt: args.prompt,
+            mode,
+            model_override: args.model,
+            tool_overrides: None,
+            cwd: args.cwd.map(PathBuf::from),
+            max_turns: args.max_turns,
+            isolation: None,
+            depth: None,
+        };
+
+        let result = self.dispatcher.dispatch(request).await?;
+
+        match result {
+            crate::agent_dispatch::DispatchResult::Sync(agent_result) => match agent_result {
+                crate::agent::AgentResult::Done { message, .. } => Ok(ToolOutput::new(message)),
+                crate::agent::AgentResult::Failed(e) => {
+                    Ok(ToolOutput::new(format!("Agent 执行失败: {}", e)))
+                }
+                crate::agent::AgentResult::Interrupted { reason } => {
+                    Ok(ToolOutput::new(format!("Agent 被中断: {}", reason)))
+                }
+                crate::agent::AgentResult::BudgetExhausted { steps_used } => Ok(ToolOutput::new(
+                    format!("Agent 迭代预算耗尽 ({} 步)", steps_used),
+                )),
+            },
+            crate::agent_dispatch::DispatchResult::Background(task_id) => Ok(ToolOutput::new(
+                format!("Agent 已作为后台任务分发: {}", task_id),
+            )),
+            _ => Ok(ToolOutput::new("分发完成".to_string())),
+        }
+    }
+}
+
+/// 向后台 agent 发送后续消息
+pub struct SendMessageTool {
+    dispatcher: Arc<crate::agent_dispatch::AgentDispatcher>,
+}
+
+impl SendMessageTool {
+    pub fn new(dispatcher: Arc<crate::agent_dispatch::AgentDispatcher>) -> Self {
+        Self { dispatcher }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SendMessageArgs {
+    task_id: String,
+    message: String,
+}
+
+#[async_trait]
+impl Tool for SendMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn description(&self) -> &str {
+        "向已运行的后台 agent 发送后续消息。"
+    }
+
+    fn parameters(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "后台 agent 的 TaskId" },
+                "message": { "type": "string", "description": "消息内容" }
+            },
+            "required": ["task_id", "message"]
+        })
+    }
+
+    async fn run(&self, _ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput> {
+        let args: SendMessageArgs = serde_json::from_value(args)
+            .map_err(|e| ZeroBotError::Tool(format!("参数解析失败: {}", e)))?;
+
+        let task_id = crate::task::TaskId::from_string(args.task_id);
+        self.dispatcher.send_message(&task_id, args.message).await?;
+
+        Ok(ToolOutput::new("消息已发送".to_string()))
     }
 }
 
