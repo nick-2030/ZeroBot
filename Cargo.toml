@@ -40,6 +40,7 @@ serde_yaml = "0.9"
 thiserror = "1.0"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "process", "time", "io-std"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
