@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::notification::{Notification, NotificationSender, NotificationStatus};
-use crate::task::{TaskId, TaskManager, TaskStatus, TaskUsage};
+use crate::notification::{Notification, NotificationBus, NotificationSender, NotificationStatus};
+use crate::task::{TaskId, TaskManager, TaskStatus, TaskType, TaskUsage};
 
 /// Tracks consecutive and total permission denials for fallback logic.
 /// Uses AtomicU32 for thread-safe interior mutability.
@@ -89,6 +89,14 @@ const COMPACTION_PROMPT: &str = r#"请根据以下对话内容生成一份结构
 - 不要回答对话中的问题，只输出摘要
 - 保留具体的技术细节（函数名、文件路径、错误信息）
 - 如果有未完成的任务，明确标注进度和阻塞点"#;
+
+#[derive(Debug)]
+pub enum AgentResult {
+    Done { message: String, usage: TaskUsage },
+    Interrupted { reason: String },
+    BudgetExhausted { steps_used: u32 },
+    Failed(String),
+}
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -781,6 +789,83 @@ impl Agent {
             .await;
 
         Ok(last_response)
+    }
+
+    /// 后台运行 agent，返回 TaskId
+    pub async fn run_background(
+        mut self,
+        session_id: String,
+        input: String,
+        task_manager: Arc<TaskManager>,
+        notification_bus: Arc<NotificationBus>,
+        parent_task_id: Option<TaskId>,
+    ) -> ZeroBotResult<TaskId> {
+        let (task_id, cancel_token) = task_manager
+            .register(
+                TaskType::Agent,
+                input.clone(),
+                parent_task_id.clone(),
+                Some(self.agent_type.clone()),
+            )
+            .await;
+
+        self.task_id = Some(task_id.clone());
+        self.parent_task_id = parent_task_id.clone();
+        self.abort_token = cancel_token;
+
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.notification_tx = Some(notification_tx);
+
+        let notification_bus_clone = notification_bus.clone();
+        let task_id_clone = task_id.clone();
+
+        task_manager
+            .update_status(&task_id, TaskStatus::Running)
+            .await;
+
+        let agent_type = self.agent_type.clone();
+
+        tokio::spawn(async move {
+            let result = self.run_turn(&session_id, &input, None).await;
+
+            let status = match &result {
+                Ok(_) => TaskStatus::Completed,
+                Err(e) => TaskStatus::Failed(e.to_string()),
+            };
+
+            task_manager.update_status(&task_id_clone, status).await;
+
+            if let Some(ref parent_id) = parent_task_id {
+                let notification = Notification {
+                    task_id: task_id_clone.clone(),
+                    agent_type,
+                    description: input,
+                    status: match result {
+                        Ok(_) => NotificationStatus::Completed,
+                        Err(ref e) => NotificationStatus::Failed(e.to_string()),
+                    },
+                    result: match result {
+                        Ok(ref msg) => Some(msg.clone()),
+                        Err(ref e) => Some(e.to_string()),
+                    },
+                    usage: None,
+                    timestamp: std::time::Instant::now(),
+                };
+                notification_bus_clone.notify(parent_id, notification).await;
+            }
+        });
+
+        Ok(task_id)
+    }
+
+    /// 中断 agent
+    pub fn abort(&self) {
+        self.abort_token.cancel();
+    }
+
+    /// 获取 TaskId
+    pub fn task_id(&self) -> Option<&TaskId> {
+        self.task_id.as_ref()
     }
 
     pub async fn compact_now(&self, session_id: &str) -> ZeroBotResult<()> {

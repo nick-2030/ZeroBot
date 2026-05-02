@@ -31,7 +31,7 @@ pub mod task;
 pub mod tool;
 pub mod workspace;
 
-pub use agent::Agent;
+pub use agent::{Agent, AgentResult};
 pub use agents::{AgentDefinition, AgentManager};
 pub use bus::{InboundMessage, MessageBus, OutboundMessage};
 pub use channel::{build_channel_manager, ChannelManager, ChatChannel};
