@@ -42,7 +42,7 @@ pub use error::{ZeroBotError, ZeroBotResult};
 pub use events::AgentEvent;
 pub use gateway::GatewayRuntime;
 pub use heartbeat::{HeartbeatDecision, HeartbeatService};
-pub use hooks::{HookAction, HookDecision, HookDefinition, HookEvent, HookManager};
+pub use hooks::{HookAction, HookCommand, HookDecision, HookDefinition, HookEvent, HookManager};
 pub use interaction::{
     InteractionHandler, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
     UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
