@@ -340,6 +340,29 @@ fn builtin_agents() -> Vec<AgentDefinition> {
             omit_context: false,
             isolation: None,
         },
+        AgentDefinition {
+            name: "coordinator".to_string(),
+            description: "编排多个 worker agent 完成复杂任务".to_string(),
+            model: None,
+            tools: Some(vec![
+                "agent".to_string(),
+                "send_message".to_string(),
+                "todo_read".to_string(),
+                "todo_write".to_string(),
+                "read".to_string(),
+            ]),
+            hooks: Vec::new(),
+            path: PathBuf::from("<builtin:coordinator>"),
+            body: include_str!("../prompts/modes/coordinator.md")
+                .trim()
+                .to_string(),
+            role: AgentRole::Coordinator,
+            toolsets: None,
+            max_turns: None,
+            background: false,
+            omit_context: false,
+            isolation: None,
+        },
     ]
 }
 
