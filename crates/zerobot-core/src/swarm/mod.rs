@@ -1,5 +1,6 @@
 pub mod in_process;
 pub mod mailbox;
+pub mod tools;
 
 use async_trait::async_trait;
 use crate::error::ZeroBotResult;
