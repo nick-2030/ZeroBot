@@ -107,6 +107,18 @@ impl AgentDispatcher {
     pub async fn dispatch(&self, request: DispatchRequest) -> ZeroBotResult<DispatchResult> {
         let def = self.agent_manager.load(&request.agent_type)?;
 
+        // 检查编排深度限制
+        if let Some(depth) = request.depth {
+            if depth >= self.settings.agent.max_orchestration_depth {
+                return Err(ZeroBotError::OrchestrationDepthExceeded(
+                    format!(
+                        "编排深度 {} 超过限制 {}",
+                        depth, self.settings.agent.max_orchestration_depth
+                    ),
+                ));
+            }
+        }
+
         let model = request
             .model_override
             .or(def.model.clone())

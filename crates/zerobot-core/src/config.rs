@@ -366,10 +366,17 @@ pub struct AgentSettings {
     pub system_prompt: Option<String>,
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
+    /// 编排器最大递归深度
+    #[serde(default = "default_max_orchestration_depth")]
+    pub max_orchestration_depth: u32,
 }
 
 fn default_max_steps() -> usize {
     100
+}
+
+fn default_max_orchestration_depth() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -913,6 +920,7 @@ impl Default for AgentSettings {
         Self {
             system_prompt: Some(default_system_prompt()),
             max_steps: default_max_steps(),
+            max_orchestration_depth: default_max_orchestration_depth(),
         }
     }
 }
