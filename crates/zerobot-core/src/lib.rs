@@ -13,6 +13,7 @@ pub mod events;
 pub mod gateway;
 pub mod heartbeat;
 pub mod hooks;
+pub mod kanban;
 pub mod instruction;
 pub mod interaction;
 pub mod logging;
@@ -59,6 +60,7 @@ pub use interaction::{
     InteractionHandler, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
     UserInputAnswer, UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
+pub use kanban::{KanbanFilter, KanbanManager, KanbanStatus, KanbanTask, NewKanbanTask};
 pub use logging::{init_logging, init_logging_with_stdout, LogGuard};
 pub use plugin::{
     PluginAssetRoot, PluginAuthAuthorizeResult, PluginAuthCallbackResult, PluginAuthMethod,
