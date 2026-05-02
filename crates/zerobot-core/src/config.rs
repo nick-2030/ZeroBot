@@ -45,6 +45,10 @@ pub struct Settings {
     pub curator: CuratorSettings,
     #[serde(default)]
     pub plugins: PluginsSettings,
+    #[serde(default)]
+    pub kanban: KanbanSettings,
+    #[serde(default)]
+    pub swarm: SwarmSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -792,6 +796,60 @@ fn default_plugins_auto_enable_tools() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KanbanSettings {
+    /// 是否启用 Kanban 模式
+    #[serde(default)]
+    pub enabled: bool,
+    /// 调度 tick 间隔（秒）
+    #[serde(default = "default_kanban_tick_interval")]
+    pub tick_interval_secs: u64,
+}
+
+fn default_kanban_tick_interval() -> u64 {
+    60
+}
+
+impl Default for KanbanSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tick_interval_secs: default_kanban_tick_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmSettings {
+    /// 是否启用 Swarm 模式
+    #[serde(default)]
+    pub enabled: bool,
+    /// 默认后端类型: "in_process", "tmux", "external"
+    #[serde(default = "default_swarm_backend")]
+    pub default_backend: String,
+    /// 邮箱目录
+    #[serde(default = "default_mailbox_dir")]
+    pub mailbox_dir: String,
+}
+
+fn default_swarm_backend() -> String {
+    "in_process".to_string()
+}
+
+fn default_mailbox_dir() -> String {
+    "~/.zerobot/mailbox".to_string()
+}
+
+impl Default for SwarmSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_backend: default_swarm_backend(),
+            mailbox_dir: default_mailbox_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum McpServerConfig {
     Local {
@@ -868,6 +926,8 @@ impl Default for Settings {
             self_review: SelfReviewSettings::default(),
             curator: CuratorSettings::default(),
             plugins: PluginsSettings::default(),
+            kanban: KanbanSettings::default(),
+            swarm: SwarmSettings::default(),
         }
     }
 }
