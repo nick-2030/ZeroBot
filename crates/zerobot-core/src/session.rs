@@ -147,6 +147,20 @@ pub trait SessionStore: Send + Sync {
         ))
     }
     async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()>;
+    async fn search_messages(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> ZeroBotResult<Vec<Message>> {
+        let messages = self.list_messages(session_id).await?;
+        let query_lower = query.to_lowercase();
+        Ok(messages
+            .into_iter()
+            .filter(|m| m.content.to_lowercase().contains(&query_lower))
+            .take(limit)
+            .collect())
+    }
 }
 
 #[derive(Clone)]
@@ -708,6 +722,37 @@ impl SessionStore for SqliteSessionStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn search_messages(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> ZeroBotResult<Vec<Message>> {
+        let pattern = format!("%{}%", query);
+        let rows = sqlx::query_as::<_, (String, String, String, String, i64, Option<String>, Option<String>, i64)>(
+            "SELECT id, session_id, role, content, summary, tool_call_id, tool_calls_json, created_at FROM messages WHERE session_id = ? AND content LIKE ? ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(&pattern)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Message {
+                id: row.0,
+                session_id: row.1,
+                role: MessageRole::from_str(&row.2),
+                content: row.3,
+                summary: row.4 != 0,
+                tool_call_id: row.5,
+                tool_calls: row.6.and_then(|raw| serde_json::from_str(&raw).ok()),
+                created_at: row.7,
+            })
+            .collect())
     }
 }
 

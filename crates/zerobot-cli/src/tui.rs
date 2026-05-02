@@ -95,9 +95,23 @@ struct PermissionPrompt {
     selected: usize,
 }
 
+struct SearchResult {
+    message_id: String,
+    role: String,
+    preview: String,
+}
+
+struct HistorySearchOverlay {
+    query: String,
+    cursor: usize,
+    results: Vec<SearchResult>,
+    selected: usize,
+}
+
 enum InfoOverlay {
     UserInput(UserInputOverlay),
     ToolApproval(ToolApprovalOverlay),
+    HistorySearch(HistorySearchOverlay),
 }
 
 struct UserInputOverlay {
@@ -227,6 +241,8 @@ struct App {
     last_idle_esc: Option<Instant>,
     last_idle_ctrl_c: Option<Instant>,
     status_notice: Option<String>,
+    last_tool_args: Option<String>,
+    tool_start_time: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -244,7 +260,10 @@ enum OutputItem {
         color: DotColor,
         tool_name: String,
         label: Option<String>,
+        arguments: String,
         output: String,
+        expanded: bool,
+        duration_ms: Option<u64>,
     },
     HookRunning {
         label: String,
@@ -301,6 +320,8 @@ impl App {
             last_idle_esc: None,
             last_idle_ctrl_c: None,
             status_notice: None,
+            last_tool_args: None,
+            tool_start_time: None,
         }
     }
 
@@ -341,7 +362,10 @@ impl App {
             color,
             tool_name: tool_name.to_string(),
             label: label.map(|s| s.to_string()),
+            arguments: String::new(),
             output: output.to_string(),
+            expanded: false,
+            duration_ms: None,
         });
         self.stick_to_bottom = true;
     }
@@ -378,14 +402,18 @@ impl App {
         self.stick_to_bottom = true;
     }
 
-    fn complete_running_tool(&mut self, name: &str, output: &str, ok: bool) {
+    fn complete_running_tool(&mut self, name: &str, output: &str, ok: bool, duration_ms: Option<u64>) {
         let color = if ok { DotColor::Green } else { DotColor::Red };
         let label = self.last_tool_label.clone();
+        let arguments = self.last_tool_args.clone().unwrap_or_default();
         let item = OutputItem::ToolOutput {
             color,
             tool_name: name.to_string(),
             label: label.clone(),
+            arguments,
             output: output.to_string(),
+            expanded: false,
+            duration_ms,
         };
         if let Some(idx) = self.running_tool_output_idx.take() {
             if idx < self.output.len() {
@@ -442,16 +470,21 @@ impl App {
                     color,
                     tool_name,
                     label,
+                    arguments,
                     output,
+                    expanded,
+                    duration_ms,
                 } => {
                     let always_full = is_full_output_tool(tool_name);
                     format_tool_output_lines(
                         *color,
+                        tool_name,
                         label.as_deref(),
+                        arguments,
                         output,
                         width,
-                        self.show_full_tool_output || always_full,
-                        always_full,
+                        self.show_full_tool_output || always_full || *expanded,
+                        *duration_ms,
                     )
                 }
                 OutputItem::HookRunning { label } => {
@@ -765,6 +798,7 @@ impl InfoOverlay {
         match self {
             InfoOverlay::UserInput(_) => Status::WaitingUserInput,
             InfoOverlay::ToolApproval(_) => Status::WaitingApproval,
+            InfoOverlay::HistorySearch(_) => Status::WaitingUserInput,
         }
     }
 
@@ -772,6 +806,7 @@ impl InfoOverlay {
         match self {
             InfoOverlay::UserInput(overlay) => overlay.lines(),
             InfoOverlay::ToolApproval(overlay) => overlay.lines(),
+            InfoOverlay::HistorySearch(overlay) => overlay.lines(),
         }
     }
 
@@ -779,7 +814,161 @@ impl InfoOverlay {
         match self {
             InfoOverlay::UserInput(overlay) => overlay.handle_key(key),
             InfoOverlay::ToolApproval(overlay) => overlay.handle_key(key),
+            InfoOverlay::HistorySearch(overlay) => overlay.handle_key(key),
         }
+    }
+}
+
+impl HistorySearchOverlay {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            cursor: 0,
+            results: Vec::new(),
+            selected: 0,
+        }
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> OverlayAction<()> {
+        match key.code {
+            KeyCode::Esc => OverlayAction::Complete(()),
+            KeyCode::Up => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                }
+                OverlayAction::Updated
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < self.results.len() {
+                    self.selected += 1;
+                }
+                OverlayAction::Updated
+            }
+            KeyCode::Enter => {
+                // 返回选中结果，由调用方处理跳转
+                OverlayAction::Complete(())
+            }
+            KeyCode::Backspace => {
+                if self.cursor > 0 {
+                    self.query.remove(self.cursor - 1);
+                    self.cursor -= 1;
+                    self.selected = 0;
+                }
+                OverlayAction::Updated
+            }
+            KeyCode::Delete => {
+                if self.cursor < self.query.len() {
+                    self.query.remove(self.cursor);
+                }
+                OverlayAction::Updated
+            }
+            KeyCode::Left => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
+                OverlayAction::Updated
+            }
+            KeyCode::Right => {
+                if self.cursor < self.query.len() {
+                    self.cursor += 1;
+                }
+                OverlayAction::Updated
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                OverlayAction::Updated
+            }
+            KeyCode::End => {
+                self.cursor = self.query.len();
+                OverlayAction::Updated
+            }
+            KeyCode::Char(c) => {
+                self.query.insert(self.cursor, c);
+                self.cursor += 1;
+                self.selected = 0;
+                OverlayAction::Updated
+            }
+            _ => OverlayAction::None,
+        }
+    }
+
+    fn lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        // 标题
+        lines.push(Line::from(Span::styled(
+            "历史搜索",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(COLOR_ACCENT),
+        )));
+        // 搜索框
+        let query_display = if self.query.is_empty() {
+            "输入关键词搜索...".to_string()
+        } else {
+            self.query.clone()
+        };
+        let query_style = if self.query.is_empty() {
+            Style::default().fg(COLOR_MUTED)
+        } else {
+            Style::default().fg(COLOR_TEXT)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("搜索: ", Style::default().fg(COLOR_MUTED)),
+            Span::styled(query_display, query_style),
+        ]));
+        // 结果
+        if self.query.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "输入关键词开始搜索",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        } else if self.results.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "未找到匹配结果",
+                Style::default().fg(COLOR_MUTED),
+            )));
+        } else {
+            let max_display = 10;
+            for (i, result) in self.results.iter().take(max_display).enumerate() {
+                let selected = i == self.selected;
+                let prefix = if selected { "▸ " } else { "  " };
+                let role_icon = match result.role.as_str() {
+                    "user" => "👤",
+                    "assistant" => "🤖",
+                    "tool" => "🔧",
+                    _ => "📝",
+                };
+                let preview = if result.preview.len() > 60 {
+                    format!("{}...", &result.preview[..57])
+                } else {
+                    result.preview.clone()
+                };
+                let style = if selected {
+                    Style::default().fg(COLOR_TEXT).bg(COLOR_SELECTED_BG)
+                } else {
+                    Style::default().fg(COLOR_MUTED)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}{role_icon} "), style),
+                    Span::styled(preview, style),
+                ]));
+            }
+            if self.results.len() > max_display {
+                lines.push(Line::from(Span::styled(
+                    format!("  ... 还有 {} 条结果", self.results.len() - max_display),
+                    Style::default().fg(COLOR_MUTED),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            "↑/↓ 导航  Enter 跳转  Esc 关闭",
+            Style::default().fg(COLOR_MUTED),
+        )));
+        lines
+    }
+
+    fn selected_message_id(&self) -> Option<&str> {
+        self.results.get(self.selected).map(|r| r.message_id.as_str())
     }
 }
 
@@ -1540,7 +1729,10 @@ async fn handle_event(
                         color: DotColor::Yellow,
                         tool_name: "interrupted".to_string(),
                         label: Some(label),
+                        arguments: String::new(),
                         output: "已中断".to_string(),
+                        expanded: false,
+                        duration_ms: None,
                     };
                 }
             }
@@ -1553,6 +1745,7 @@ async fn handle_event(
                 InfoOverlay::ToolApproval(overlay) => {
                     overlay.finish(ToolApprovalDecision::Deny);
                 }
+                InfoOverlay::HistorySearch(_) => {}
             }
             app.dismiss_overlay();
         }
@@ -1615,6 +1808,12 @@ async fn handle_event(
                 app.scroll = 0;
                 app.stick_to_bottom = true;
                 app.status_notice = Some("屏幕已清除".to_string());
+                return Ok(true);
+            }
+            // Ctrl+R: 历史搜索
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+                let overlay = HistorySearchOverlay::new();
+                app.info_overlay = Some(InfoOverlay::HistorySearch(overlay));
                 return Ok(true);
             }
             // Ctrl+U: 清除当前输入行
@@ -1839,8 +2038,42 @@ async fn handle_event(
             }
 
             if app.info_overlay.is_some() {
-                if handle_overlay_key(key, app) {
+                let updated = handle_overlay_key(key, app);
+                if updated {
+                    // 如果是历史搜索 overlay 更新了查询，执行搜索
+                    if let Some(InfoOverlay::HistorySearch(ref mut overlay)) = app.info_overlay {
+                        if !overlay.query.is_empty() {
+                            let results = store
+                                .search_messages(&app.session_id, &overlay.query, 20)
+                                .await
+                                .unwrap_or_default();
+                            overlay.results = results
+                                .into_iter()
+                                .map(|m| SearchResult {
+                                    message_id: m.id,
+                                    role: format!("{:?}", m.role).to_lowercase(),
+                                    preview: m.content.chars().take(100).collect(),
+                                })
+                                .collect();
+                            overlay.selected = overlay.selected.min(overlay.results.len().saturating_sub(1));
+                        } else {
+                            overlay.results.clear();
+                        }
+                    }
                     return Ok(true);
+                }
+                // Enter 键在 HistorySearch 中被按下，执行跳转
+                if let Some(InfoOverlay::HistorySearch(ref overlay)) = app.info_overlay {
+                    if key.code == KeyCode::Enter {
+                        if let Some(target_id) = overlay.selected_message_id() {
+                            // 在输出中查找对应消息并滚动
+                            // 简单实现：滚动到顶部
+                            app.scroll = 0;
+                            app.stick_to_bottom = false;
+                        }
+                        app.dismiss_overlay();
+                        return Ok(true);
+                    }
                 }
                 return Ok(false);
             }
@@ -2755,6 +2988,8 @@ async fn handle_agent_event(
             let args = one_line(&input);
             let label = format_tool_label(&name, &args, app.viewport_width);
             app.last_tool_label = Some(label.clone());
+            app.last_tool_args = Some(input.clone());
+            app.tool_start_time = Some(Instant::now());
             app.push_running_tool(&label);
             app.status = Status::Tool(label);
             app.blink_on = true;
@@ -2766,8 +3001,10 @@ async fn handle_agent_event(
             output,
             ok,
         } => {
-            app.complete_running_tool(&name, output.trim(), ok);
+            let duration_ms = app.tool_start_time.take().map(|t| t.elapsed().as_millis() as u64);
+            app.complete_running_tool(&name, output.trim(), ok, duration_ms);
             app.last_tool_label = None;
+            app.last_tool_args = None;
             app.status = Status::Thinking;
             app.blink_on = true;
             app.last_blink = Instant::now();
@@ -4419,29 +4656,61 @@ fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
 
 fn format_tool_output_lines(
     color: DotColor,
+    tool_name: &str,
     label: Option<&str>,
+    arguments: &str,
     output: &str,
     width: u16,
     show_full: bool,
-    always_full: bool,
+    duration_ms: Option<u64>,
 ) -> Vec<Line<'static>> {
+    // 确定默认显示行数
+    let default_lines = match tool_name {
+        "read" => 5,
+        "write" | "edit" | "apply_patch" => 0, // 展开
+        "bash" | "shell" => 3,
+        _ => 3,
+    };
+    let always_full = is_full_output_tool(tool_name) || default_lines == 0;
+
     let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
     let (lines, omitted) = if show_full || always_full {
         (lines, 0)
     } else {
-        truncate_lines(output, 3)
+        truncate_lines(output, default_lines)
     };
+
     let mut out = Vec::new();
+
+    // 标题行：图标 + 工具名 + 耗时
+    let mut header = Vec::new();
+    header.push(tool_dot_span(color));
+    header.push(Span::raw(" "));
     if let Some(label) = label {
-        let mut line = Vec::new();
-        line.push(tool_dot_span(color));
-        line.push(Span::raw(" "));
-        line.push(Span::styled(
+        header.push(Span::styled(
             label.to_string(),
             Style::default().fg(COLOR_TEXT),
         ));
-        out.push(Line::from(line));
+    } else {
+        header.push(Span::styled(
+            tool_name.to_string(),
+            Style::default().fg(COLOR_TEXT),
+        ));
     }
+    if let Some(ms) = duration_ms {
+        let time_str = if ms < 1000 {
+            format!(" ({}ms)", ms)
+        } else {
+            format!(" ({:.1}s)", ms as f64 / 1000.0)
+        };
+        header.push(Span::styled(
+            time_str,
+            Style::default().fg(COLOR_MUTED),
+        ));
+    }
+    out.push(Line::from(header));
+
+    // 内容
     let mut content_lines = Vec::new();
     content_lines.extend(lines);
     if omitted > 0 {
