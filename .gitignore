@@ -6,4 +6,6 @@
 .zerobot/state/
 .zerobot/skills/
 
+.openclaw-workflow/
+
 /tmp

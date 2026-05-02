@@ -1,11 +1,14 @@
 use crate::config::Settings;
 use crate::error::{ZeroBotError, ZeroBotResult};
+use crate::events::AgentEvent;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::warn;
 
@@ -346,6 +349,7 @@ pub struct HookManager {
     agent_hooks: Vec<HookDefinition>,
     dir_hooks: Vec<HookDefinition>,
     cwd: std::path::PathBuf,
+    event_sender: Arc<StdMutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
 }
 
 impl HookManager {
@@ -354,6 +358,7 @@ impl HookManager {
             agent_hooks,
             dir_hooks,
             cwd: std::env::current_dir().unwrap_or_default(),
+            event_sender: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -362,6 +367,7 @@ impl HookManager {
             agent_hooks: Vec::new(),
             dir_hooks: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_default(),
+            event_sender: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -376,7 +382,23 @@ impl HookManager {
             agent_hooks: agent_hooks.unwrap_or_default(),
             dir_hooks,
             cwd: cwd.to_path_buf(),
+            event_sender: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// Set the event sender for emitting hook progress events to the TUI.
+    pub fn set_event_sender(&self, sender: mpsc::UnboundedSender<AgentEvent>) {
+        if let Ok(mut guard) = self.event_sender.lock() {
+            *guard = Some(sender);
+        }
+    }
+
+    fn emit_hook_event(&self, event: AgentEvent) {
+        if let Ok(guard) = self.event_sender.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(event);
+            }
+        }
     }
 
     pub fn hooks(&self) -> &[HookDefinition] {
@@ -400,16 +422,18 @@ impl HookManager {
         let mut additional_contexts = Vec::new();
         let mut hooks_to_remove_once = Vec::new();
 
+        let event_name = format!("{:?}", event);
         for (idx, hook) in hooks.iter().enumerate() {
             if !hook.enabled() || !hook.matches(event, &current) {
                 continue;
             }
 
-            let status_msg = hook
-                .status_message
-                .as_deref()
-                .unwrap_or("Running hook…");
-            let _ = status_msg; // Available for TUI progress display
+            // Emit HookStarted event for TUI display
+            self.emit_hook_event(AgentEvent::HookStarted {
+                event: event_name.clone(),
+                hook_name: hook.name.clone(),
+                status_message: hook.status_message.clone(),
+            });
 
             if hook.is_async() {
                 // Fire-and-forget: spawn in background
@@ -417,11 +441,31 @@ impl HookManager {
                 let current_clone = current.clone();
                 let session_id = session_id.to_string();
                 let cwd = self.cwd.clone();
+                let sender = self.event_sender.lock().ok().and_then(|g| g.clone());
                 tokio::spawn(async move {
                     match execute_hook(&hook_clone, event, &session_id, &current_clone, &cwd).await
                     {
-                        Ok(_) => {}
-                        Err(err) => warn!("Async hook '{}' failed: {}", hook_clone.name, err),
+                        Ok(_) => {
+                            if let Some(tx) = &sender {
+                                let _ = tx.send(AgentEvent::HookFinished {
+                                    event: format!("{:?}", event),
+                                    hook_name: hook_clone.name.clone(),
+                                    ok: true,
+                                    message: None,
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            warn!("Async hook '{}' failed: {}", hook_clone.name, err);
+                            if let Some(tx) = &sender {
+                                let _ = tx.send(AgentEvent::HookFinished {
+                                    event: format!("{:?}", event),
+                                    hook_name: hook_clone.name.clone(),
+                                    ok: false,
+                                    message: Some(err.to_string()),
+                                });
+                            }
+                        }
                     }
                 });
                 continue;
@@ -429,6 +473,13 @@ impl HookManager {
 
             match execute_hook(hook, event, session_id, &current, &self.cwd).await {
                 Ok(response) => {
+                    let hook_ok = !matches!(response.action, Some(HookAction::Deny));
+                    self.emit_hook_event(AgentEvent::HookFinished {
+                        event: event_name.clone(),
+                        hook_name: hook.name.clone(),
+                        ok: hook_ok,
+                        message: response.message.clone(),
+                    });
                     if let Some(sm) = response.system_message {
                         system_messages.push(sm);
                     }
@@ -459,6 +510,12 @@ impl HookManager {
                 }
                 Err(err) => {
                     warn!("Hook '{}' execution failed: {}", hook.name, err);
+                    self.emit_hook_event(AgentEvent::HookFinished {
+                        event: event_name.clone(),
+                        hook_name: hook.name.clone(),
+                        ok: false,
+                        message: Some(err.to_string()),
+                    });
                 }
             }
         }

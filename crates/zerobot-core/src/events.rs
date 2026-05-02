@@ -46,6 +46,17 @@ pub enum AgentEvent {
         message: String,
         degraded: bool,
     },
+    HookStarted {
+        event: String,
+        hook_name: String,
+        status_message: Option<String>,
+    },
+    HookFinished {
+        event: String,
+        hook_name: String,
+        ok: bool,
+        message: Option<String>,
+    },
     Done,
     SessionCost {
         input_tokens: u64,

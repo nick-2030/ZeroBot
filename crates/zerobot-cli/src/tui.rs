@@ -70,6 +70,7 @@ enum Status {
     Idle,
     Thinking,
     Tool(String),
+    Hook(String),
     Error(String),
     WaitingUserInput,
     WaitingApproval,
@@ -206,6 +207,8 @@ struct App {
     slash_hint: String,
     show_full_tool_output: bool,
     running_tool_output_idx: Option<usize>,
+    running_hook_output_idx: Option<usize>,
+    active_hooks: Vec<String>,
     last_idle_esc: Option<Instant>,
     last_idle_ctrl_c: Option<Instant>,
     status_notice: Option<String>,
@@ -227,6 +230,13 @@ enum OutputItem {
         tool_name: String,
         label: Option<String>,
         output: String,
+    },
+    HookRunning {
+        label: String,
+    },
+    HookOutput {
+        ok: bool,
+        label: String,
     },
 }
 
@@ -269,6 +279,8 @@ impl App {
             slash_hint: String::new(),
             show_full_tool_output: false,
             running_tool_output_idx: None,
+            running_hook_output_idx: None,
+            active_hooks: Vec::new(),
             last_idle_esc: None,
             last_idle_ctrl_c: None,
             status_notice: None,
@@ -314,6 +326,30 @@ impl App {
             label: label.map(|s| s.to_string()),
             output: output.to_string(),
         });
+        self.stick_to_bottom = true;
+    }
+
+    fn push_running_hook(&mut self, label: &str) {
+        self.output.push(OutputItem::HookRunning {
+            label: label.to_string(),
+        });
+        self.running_hook_output_idx = Some(self.output.len().saturating_sub(1));
+        self.stick_to_bottom = true;
+    }
+
+    fn complete_running_hook(&mut self, ok: bool, label: &str) {
+        let item = OutputItem::HookOutput {
+            ok,
+            label: label.to_string(),
+        };
+        if let Some(idx) = self.running_hook_output_idx.take() {
+            if idx < self.output.len() {
+                self.output[idx] = item;
+                self.stick_to_bottom = true;
+                return;
+            }
+        }
+        self.output.push(item);
         self.stick_to_bottom = true;
     }
 
@@ -401,6 +437,12 @@ impl App {
                         always_full,
                     )
                 }
+                OutputItem::HookRunning { label } => {
+                    vec![format_running_hook_line(label, self.blink_on)]
+                }
+                OutputItem::HookOutput { ok, label } => {
+                    vec![format_hook_output_line(*ok, label)]
+                }
             };
             if lines.is_empty() {
                 continue;
@@ -487,6 +529,10 @@ impl App {
                 format!("状态: 工具执行中: {name}"),
                 Style::default().fg(COLOR_ACCENT),
             )),
+            Status::Hook(name) => Line::from(Span::styled(
+                format!("状态: Hook 执行中: {name}"),
+                Style::default().fg(COLOR_WARN),
+            )),
             Status::Error(message) => Line::from(Span::styled(
                 format!("状态: 错误: {message}"),
                 Style::default().fg(COLOR_ERROR),
@@ -501,6 +547,18 @@ impl App {
             )),
         };
         lines.push(status_line);
+        if !self.active_hooks.is_empty() {
+            let hook_count = self.active_hooks.len();
+            let label = if hook_count == 1 {
+                format!("Hooks: {} running", self.active_hooks[0])
+            } else {
+                format!("Hooks: {} active", hook_count)
+            };
+            lines.push(Line::from(Span::styled(
+                label,
+                Style::default().fg(COLOR_WARN),
+            )));
+        }
         if !self.todos.is_empty() {
             let total = self.todos.len();
             let done = self
@@ -1145,6 +1203,7 @@ async fn run_tui_inner(
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    hooks.set_event_sender(tx.clone());
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiRequest>();
     let interaction: Arc<dyn InteractionHandler> =
         Arc::new(UiInteractionHandler { tx: ui_tx.clone() });
@@ -2290,6 +2349,37 @@ async fn handle_agent_event(
             };
             app.push_block(DotColor::Yellow, &text);
         }
+        AgentEvent::HookStarted {
+            event,
+            hook_name,
+            status_message,
+        } => {
+            let label = status_message
+                .as_deref()
+                .unwrap_or(&hook_name)
+                .to_string();
+            app.finalize_stream();
+            app.push_running_hook(&label);
+            app.active_hooks.push(hook_name.clone());
+            app.status = Status::Hook(format!("{}: {}", event, hook_name));
+            app.blink_on = true;
+            app.last_blink = Instant::now();
+        }
+        AgentEvent::HookFinished {
+            event: _,
+            hook_name,
+            ok,
+            message,
+        } => {
+            let label = message.as_deref().unwrap_or(&hook_name).to_string();
+            app.complete_running_hook(ok, &label);
+            app.active_hooks.retain(|h| h != &hook_name);
+            if app.active_hooks.is_empty() {
+                app.status = Status::Thinking;
+            }
+            app.blink_on = true;
+            app.last_blink = Instant::now();
+        }
         AgentEvent::SessionCost {
             input_tokens,
             output_tokens,
@@ -2345,6 +2435,8 @@ async fn load_session_into_output(
     app.context_limit = None;
     app.last_tool_label = None;
     app.running_tool_output_idx = None;
+    app.running_hook_output_idx = None;
+    app.active_hooks.clear();
     app.last_copyable_output = None;
     app.clear_key_arms();
     app.status_notice = None;
@@ -2431,7 +2523,7 @@ fn format_session_option(session: &Session, summary: &str) -> String {
 }
 
 fn update_blink(app: &mut App) -> bool {
-    if !matches!(app.status, Status::Thinking | Status::Tool(_)) {
+    if !matches!(app.status, Status::Thinking | Status::Tool(_) | Status::Hook(_)) {
         if !app.blink_on {
             app.blink_on = true;
             return true;
@@ -3701,6 +3793,34 @@ fn format_running_tool_line(label: &str, blink_on: bool) -> Line<'static> {
         Style::default().fg(COLOR_TEXT),
     ));
     Line::from(line)
+}
+
+fn format_running_hook_line(label: &str, blink_on: bool) -> Line<'static> {
+    let icon = if blink_on { "⚡" } else { " " };
+    Line::from(vec![
+        Span::styled(icon, Style::default().fg(COLOR_WARN)),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            format!("Hook: {label}"),
+            Style::default().fg(COLOR_WARN).add_modifier(Modifier::DIM),
+        ),
+    ])
+}
+
+fn format_hook_output_line(ok: bool, label: &str) -> Line<'static> {
+    let (icon, color) = if ok {
+        ("✓", COLOR_SUCCESS)
+    } else {
+        ("✗", COLOR_ERROR)
+    };
+    Line::from(vec![
+        Span::styled(icon, Style::default().fg(color)),
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            format!("Hook: {label}"),
+            Style::default().fg(color).add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
