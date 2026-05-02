@@ -4,6 +4,7 @@ use crate::instruction;
 use crate::provider::{ProviderMessage, ProviderMessageRole};
 use crate::session::{Message, MessageRole, StoredToolCall};
 use crate::skills::{format_skill_index, SkillInfo};
+use crate::tool::{ToolPromptContext, ToolRegistry};
 use crate::workspace::resolve_workspace_root;
 use chrono::Local;
 use std::collections::HashSet;
@@ -21,6 +22,7 @@ pub struct ContextBuild {
 pub struct ContextManager {
     settings: Settings,
     cwd: PathBuf,
+    tool_registry: Option<ToolRegistry>,
 }
 
 impl ContextManager {
@@ -28,7 +30,13 @@ impl ContextManager {
         Self {
             settings: settings.clone(),
             cwd,
+            tool_registry: None,
         }
+    }
+
+    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tool_registry = Some(tools);
+        self
     }
 
     pub fn build(&self, model: &str, history: &[Message]) -> ContextBuild {
@@ -223,6 +231,29 @@ impl ContextManager {
             parts.push(build_environment_block(model, &self.cwd));
         }
 
+        // Dynamic tool guidance from tool prompt() methods
+        if let Some(registry) = &self.tool_registry {
+            let shell = std::env::var("SHELL")
+                .ok()
+                .map(|s| {
+                    Path::new(&s)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "sh".to_string());
+            let ctx = ToolPromptContext {
+                cwd: self.cwd.clone(),
+                platform: std::env::consts::OS,
+                shell,
+            };
+            let tool_guidance = registry.collect_prompts(&self.settings.tools.enabled, &ctx);
+            if !tool_guidance.is_empty() {
+                parts.push(format!("## 工具使用指导\n\n{tool_guidance}"));
+            }
+        }
+
         if self.settings.skills.enabled {
             if let Some(list) = skills {
                 parts.push(format_skill_index(list));
@@ -369,19 +400,64 @@ fn build_environment_block(model: &str, cwd: &Path) -> String {
     let git_repo = workspace.join(".git").exists();
     let date = Local::now().format("%Y-%m-%d").to_string();
     let platform = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|s| {
+            Path::new(&s)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
+        .unwrap_or_else(|| "sh".to_string());
 
-    [
-        "以下是运行环境信息：",
-        "<env>",
-        &format!("  模型: {model}"),
-        &format!("  工作目录: {}", cwd.display()),
-        &format!("  工作区根目录: {}", workspace.display()),
-        &format!("  是否为 Git 仓库: {}", if git_repo { "是" } else { "否" }),
-        &format!("  平台: {platform}"),
-        &format!("  日期: {date}"),
-        "</env>",
-    ]
-    .join("\n")
+    let mut lines = vec![
+        "以下是运行环境信息：".to_string(),
+        "<env>".to_string(),
+        format!("  模型: {model}"),
+        format!("  工作目录: {}", cwd.display()),
+        format!("  工作区根目录: {}", workspace.display()),
+        format!(
+            "  是否为 Git 仓库: {}",
+            if git_repo { "是" } else { "否" }
+        ),
+        format!("  平台: {platform}"),
+        format!("  架构: {arch}"),
+        format!("  Shell: {shell}"),
+        format!("  日期: {date}"),
+    ];
+
+    if git_repo {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&workspace)
+            .output()
+        {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !branch.is_empty() {
+                lines.push(format!("  Git 分支: {branch}"));
+            }
+        }
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["log", "--oneline", "-5"])
+            .current_dir(&workspace)
+            .output()
+        {
+            let log = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !log.is_empty() {
+                let formatted = log
+                    .lines()
+                    .map(|l| format!("    {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                lines.push(format!("  最近提交:\n{formatted}"));
+            }
+        }
+    }
+
+    lines.push("</env>".to_string());
+    lines.join("\n")
 }
 
 // workspace resolution moved to crate::workspace

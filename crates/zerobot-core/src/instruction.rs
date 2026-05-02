@@ -5,8 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tokio::time::{timeout, Duration};
+use walkdir::WalkDir;
 
 const FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"];
+const RULES_DIR: &str = ".zerobot/rules";
 const URL_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,11 @@ pub fn system_sources(settings: &Settings, cwd: &Path) -> InstructionSources {
         }
     }
 
+    // Rules directory (.zerobot/rules/*.md)
+    for path in find_rules_files(&root) {
+        push_unique(&path, &mut files, &mut seen);
+    }
+
     let (config_files, config_urls) = config_instruction_sources(settings, cwd);
     for path in config_files {
         push_unique(&path, &mut files, &mut seen);
@@ -57,7 +64,10 @@ pub fn load_file_instructions(paths: &[PathBuf]) -> Vec<Instruction> {
         let source = path.display().to_string();
         results.push(Instruction {
             source: source.clone(),
-            content: format!("Instructions from: {}\n{}", source, trimmed),
+            content: format!(
+                "<instruction source=\"{}\">\n{}\n</instruction>",
+                source, trimmed
+            ),
         });
     }
     results
@@ -73,7 +83,10 @@ pub async fn fetch_url_instructions(urls: &[String]) -> Vec<Instruction> {
         if let Some(cached) = url_cache_get(url) {
             results.push(Instruction {
                 source: url.clone(),
-                content: format!("Instructions from: {}\n{}", url, cached),
+                content: format!(
+                    "<instruction source=\"{}\">\n{}\n</instruction>",
+                    url, cached
+                ),
             });
             continue;
         }
@@ -96,7 +109,10 @@ pub async fn fetch_url_instructions(urls: &[String]) -> Vec<Instruction> {
         url_cache_put(url, trimmed.to_string());
         results.push(Instruction {
             source: url.clone(),
-            content: format!("Instructions from: {}\n{}", url, trimmed),
+            content: format!(
+                "<instruction source=\"{}\">\n{}\n</instruction>",
+                url, trimmed
+            ),
         });
     }
     results
@@ -116,7 +132,10 @@ pub fn resolve_nearby_instructions(session_id: &str, filepath: &Path) -> Vec<Ins
                     let source = path.display().to_string();
                     results.push(Instruction {
                         source: source.clone(),
-                        content: format!("Instructions from: {}\n{}", source, trimmed),
+                        content: format!(
+                            "<instruction source=\"{}\">\n{}\n</instruction>",
+                            source, trimmed
+                        ),
                     });
                 }
             }
@@ -195,6 +214,26 @@ fn find_instruction_in_dir(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_rules_files(root: &Path) -> Vec<PathBuf> {
+    let rules_dir = root.join(RULES_DIR);
+    if !rules_dir.exists() {
+        return vec![];
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&rules_dir).max_depth(1).into_iter().flatten() {
+        if entry.path().is_file()
+            && entry
+                .path()
+                .extension()
+                .map_or(false, |e| e == "md")
+        {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    files.sort();
+    files
 }
 
 // workspace resolution moved to crate::workspace

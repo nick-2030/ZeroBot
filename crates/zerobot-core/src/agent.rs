@@ -20,20 +20,38 @@ use tokio_stream::StreamExt;
 use tracing::warn;
 use uuid::Uuid;
 
-const COMPACTION_PROMPT: &str = r#"请根据以下对话内容生成一份“可继续执行任务”的摘要。
+const COMPACTION_PROMPT: &str = r#"请根据以下对话内容生成一份结构化摘要，确保后续对话可以无缝继续执行任务。
 
-摘要需尽量保留：
-- 目标与范围
-- 关键指令/约束/偏好
-- 已完成的工作与当前状态
-- 重要的技术决策与原因
-- 涉及的关键文件/路径/接口
-- 下一步计划
+<summary>
+## 目标与范围
+[任务的最终目标和约束条件]
 
-输出要求：
-- 使用清晰的条目或分段
-- 不要回答对话中的问题
-- 只输出摘要内容"#;
+## 已完成的工作
+[按时间顺序列出关键操作和结果]
+
+## 当前状态
+[正在做什么、进展到哪一步]
+
+## 关键决策
+[做出的技术选择及原因]
+
+## 重要文件与路径
+[涉及的关键文件路径、接口、配置]
+
+## 待办事项
+[明确的下一步计划]
+
+## 用户偏好
+[用户表达的风格/习惯/约束]
+
+## 关键上下文
+[其他需要保留的信息]
+</summary>
+
+要求：
+- 不要回答对话中的问题，只输出摘要
+- 保留具体的技术细节（函数名、文件路径、错误信息）
+- 如果有未完成的任务，明确标注进度和阻塞点"#;
 
 pub struct Agent {
     provider: Box<dyn Provider>,
@@ -189,12 +207,14 @@ impl Agent {
             } else {
                 None
             };
-            let context = ContextManager::new(&self.settings, self.cwd.clone()).build_with_skills(
-                &self.model,
-                &history,
-                skill_list.as_deref(),
-                Some(&url_instruction_text),
-            );
+            let context = ContextManager::new(&self.settings, self.cwd.clone())
+                .with_tools(self.tools.clone())
+                .build_with_skills(
+                    &self.model,
+                    &history,
+                    skill_list.as_deref(),
+                    Some(&url_instruction_text),
+                );
             let mut system = context.system.unwrap_or_default();
 
             if self.settings.context.compaction.enabled && self.settings.context.compaction.auto {

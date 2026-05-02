@@ -233,6 +233,13 @@ impl ToolOutput {
     }
 }
 
+/// Context information passed to Tool::prompt() for dynamic prompt generation.
+pub struct ToolPromptContext {
+    pub cwd: PathBuf,
+    pub platform: &'static str,
+    pub shell: String,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -249,6 +256,12 @@ pub trait Tool: Send + Sync {
     /// Whether this tool performs irreversible/destructive operations.
     fn is_destructive(&self) -> bool {
         false
+    }
+
+    /// Generate dynamic tool-specific prompt guidance for the current context.
+    /// Returns None by default (no extra guidance).
+    fn prompt(&self, _ctx: &ToolPromptContext) -> Option<String> {
+        None
     }
 }
 
@@ -280,6 +293,23 @@ impl ToolRegistry {
 
     pub fn is_read_only(&self, name: &str) -> bool {
         self.tools.get(name).map_or(false, |t| t.is_read_only())
+    }
+
+    /// Collect dynamic prompt guidance from all enabled tools.
+    pub fn collect_prompts(&self, enabled: &[String], ctx: &ToolPromptContext) -> String {
+        let mut parts = Vec::new();
+        for name in enabled {
+            if let Some(tool) = self.tools.get(name) {
+                if let Some(p) = tool.prompt(ctx) {
+                    parts.push(format!("### {}\n{}", name, p));
+                }
+            }
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            parts.join("\n\n")
+        }
     }
 
     pub fn specs(&self, enabled: &[String]) -> Vec<crate::provider::ToolSpec> {
@@ -473,6 +503,16 @@ impl Tool for SubagentTool {
         "调用指定子代理处理任务"
     }
 
+    fn prompt(&self, _ctx: &ToolPromptContext) -> Option<String> {
+        Some(
+            "- 当任务匹配某个子代理的描述时，使用 subagent 委派任务。\n\
+             - prompt 应包含完整的任务描述和必要上下文，因为子代理无法看到当前对话。\n\
+             - 避免重复子代理已开展的工作。\n\
+             - 子代理适合独立的探索性任务，不适合需要频繁交互的工作。"
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
@@ -565,7 +605,7 @@ impl Tool for SubagentTool {
 
         let result = agent.run_turn(&session.id, &args.prompt, None).await;
         crate::session::end_session_with_hooks(&hooks, &session.id).await;
-        let output = result?;
+        let output: String = result?;
         let output_for_hook = output.clone();
 
         let _ = self
@@ -994,6 +1034,16 @@ impl Tool for ReadTool {
         "读取文件或目录内容（1-indexed 行号）"
     }
 
+    fn prompt(&self, _ctx: &ToolPromptContext) -> Option<String> {
+        Some(
+            "- offset 为 1-indexed（第一行是 1，不是 0）。\n\
+             - 大文件应分段读取，使用 offset + limit 控制范围。\n\
+             - 可读取图片和 PDF 文件（多模态）。\n\
+             - 优先使用 read 而非 bash 的 cat/head/tail 读取文件内容。"
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
@@ -1298,6 +1348,16 @@ impl Tool for EditTool {
 
     fn description(&self) -> &str {
         "替换文件内容"
+    }
+
+    fn prompt(&self, _ctx: &ToolPromptContext) -> Option<String> {
+        Some(
+            "- 写入前必须先使用 read 读取目标文件。\n\
+             - oldString 必须精确匹配文件中的文本（包括缩进和空格）。\n\
+             - 优先使用 edit 修改已有文件，而非 write 重写整个文件。\n\
+             - replaceAll 仅在需要替换所有出现时使用，默认 false。"
+                .to_string(),
+        )
     }
 
     fn parameters(&self) -> JsonValue {
@@ -1915,6 +1975,15 @@ impl Tool for GlobTool {
         "查找匹配文件"
     }
 
+    fn prompt(&self, _ctx: &ToolPromptContext) -> Option<String> {
+        Some(
+            "- 优先使用 glob 查找文件，而非 bash 的 find 命令。\n\
+             - 支持标准 glob 模式：** 递归目录，* 任意字符，? 单个字符。\n\
+             - 从项目根目录搜索通常最有效。"
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
@@ -2010,6 +2079,16 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &str {
         "搜索文件内容"
+    }
+
+    fn prompt(&self, _ctx: &ToolPromptContext) -> Option<String> {
+        Some(
+            "- 优先使用 grep 搜索代码内容，而非 bash 的 grep/rg 命令。\n\
+             - pattern 使用正则表达式语法。\n\
+             - 使用 include 过滤文件类型（如 *.rs、*.ts）缩小搜索范围。\n\
+             - 从项目根目录搜索通常最有效。"
+                .to_string(),
+        )
     }
 
     fn parameters(&self) -> JsonValue {
@@ -2175,6 +2254,18 @@ impl Tool for BashTool {
 
     fn description(&self) -> &str {
         "执行 bash 命令（支持 workdir/timeoutMs/description）"
+    }
+
+    fn prompt(&self, ctx: &ToolPromptContext) -> Option<String> {
+        Some(format!(
+            "- 有专用工具时优先使用专用工具（read/edit/glob/grep），不要用 bash 代替。\n\
+             - 避免使用 cat、head、tail 读取文件（用 read），避免 sed、awk 编辑文件（用 edit）。\n\
+             - 引用包含空格的路径时使用双引号。\n\
+             - 默认超时 120 秒，可通过 timeoutMs 调整（最大 600 秒）。\n\
+             - 运行非平凡命令前应提供 description 说明目的。\n\
+             - 使用 `{shell}` 执行命令。",
+            shell = ctx.shell
+        ))
     }
 
     fn parameters(&self) -> JsonValue {
