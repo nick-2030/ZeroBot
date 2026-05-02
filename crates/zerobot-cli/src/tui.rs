@@ -2185,6 +2185,11 @@ async fn handle_event(
                                 tool_approvals.clone(),
                                 None,
                                 None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
                             );
                             let session_id = app.session_id.clone();
                             let tx_clone = tx.clone();
@@ -2275,6 +2280,11 @@ async fn handle_event(
                                     Some(interaction.clone()),
                                     plugins.clone(),
                                     tool_approvals.clone(),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
                                     None,
                                     None,
                                 );
@@ -2587,6 +2597,11 @@ async fn handle_event(
                                             tool_approvals,
                                             None,
                                             None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
                                         );
                                         agent.compact_now(&session_id).await
                                     })()
@@ -2782,6 +2797,11 @@ async fn handle_event(
                         Some(interaction.clone()),
                         plugins.clone(),
                         tool_approvals.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                         None,
                         None,
                     );

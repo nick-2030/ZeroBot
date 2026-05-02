@@ -18,8 +18,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
+
+use crate::notification::{Notification, NotificationSender, NotificationStatus};
+use crate::task::{TaskId, TaskManager, TaskStatus, TaskUsage};
 
 /// Tracks consecutive and total permission denials for fallback logic.
 /// Uses AtomicU32 for thread-safe interior mutability.
@@ -100,6 +104,13 @@ pub struct Agent {
     tool_route: Option<ToolRouteContext>,
     outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
     denial_counts: DenialCounts,
+    // 多智能体支持
+    task_id: Option<TaskId>,
+    parent_task_id: Option<TaskId>,
+    abort_token: CancellationToken,
+    notification_tx: Option<NotificationSender>,
+    agent_type: String,
+    iteration_budget: Option<u32>,
 }
 
 impl Agent {
@@ -116,6 +127,11 @@ impl Agent {
         tool_approvals: Arc<RwLock<HashSet<String>>>,
         tool_route: Option<ToolRouteContext>,
         outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+        task_id: Option<TaskId>,
+        parent_task_id: Option<TaskId>,
+        agent_type: Option<String>,
+        iteration_budget: Option<u32>,
+        notification_tx: Option<NotificationSender>,
     ) -> Self {
         Self {
             provider,
@@ -131,6 +147,12 @@ impl Agent {
             tool_route,
             outbound,
             denial_counts: DenialCounts::new(),
+            task_id,
+            parent_task_id,
+            abort_token: CancellationToken::new(),
+            notification_tx,
+            agent_type: agent_type.unwrap_or_else(|| "default".to_string()),
+            iteration_budget,
         }
     }
 

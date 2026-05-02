@@ -73,6 +73,11 @@ impl QueryEngine {
             self.tool_approvals.clone(),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ))
     }
 

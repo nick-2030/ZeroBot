@@ -620,6 +620,11 @@ impl Tool for SubagentTool {
             self.tool_approvals.clone(),
             ctx.route.clone(),
             ctx.outbound.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
         );
 
         let result = agent.run_turn(&session.id, &args.prompt, None).await;

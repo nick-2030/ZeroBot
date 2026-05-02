@@ -969,6 +969,11 @@ async fn handle_heartbeat_cmd(
                             tool_approvals,
                             route,
                             None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
                         );
                         agent.run_turn(&session_id, &tasks, None).await
                     }

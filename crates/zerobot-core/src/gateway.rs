@@ -79,6 +79,11 @@ impl GatewayExecutor {
             self.tool_approvals.clone(),
             route,
             Some(self.outbound.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         agent.run_turn(&session_id, input, None).await
     }

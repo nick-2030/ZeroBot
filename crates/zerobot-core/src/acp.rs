@@ -614,6 +614,11 @@ impl AcpRuntime {
             self.config.tool_approvals.clone(),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
