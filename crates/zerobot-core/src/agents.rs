@@ -1,8 +1,21 @@
+use crate::agent_dispatch::IsolationMode;
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::hooks::HookDefinition;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Agent 角色
+#[derive(Debug, Clone, Default)]
+pub enum AgentRole {
+    /// 普通 worker：执行具体任务
+    #[default]
+    Worker,
+    /// Coordinator：编排多个 worker
+    Coordinator,
+    /// Orchestrator：可递归派发的编排器
+    Orchestrator { max_depth: u32 },
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentDefinition {
@@ -13,6 +26,18 @@ pub struct AgentDefinition {
     pub hooks: Vec<HookDefinition>,
     pub path: PathBuf,
     pub body: String,
+    /// Agent 角色
+    pub role: AgentRole,
+    /// 工具集限制
+    pub toolsets: Option<Vec<String>>,
+    /// 最大迭代轮次
+    pub max_turns: Option<u32>,
+    /// 是否默认后台运行
+    pub background: bool,
+    /// 是否跳过 CLAUDE.md 等上下文
+    pub omit_context: bool,
+    /// 隔离模式
+    pub isolation: Option<IsolationMode>,
 }
 
 pub struct AgentManager {
@@ -58,6 +83,20 @@ impl AgentManager {
                         hooks: meta.hooks.unwrap_or_default(),
                         path: path.clone(),
                         body,
+                        role: match meta.role.as_deref() {
+                            Some("coordinator") => AgentRole::Coordinator,
+                            Some("orchestrator") => AgentRole::Orchestrator { max_depth: 3 },
+                            _ => AgentRole::Worker,
+                        },
+                        toolsets: meta.toolsets,
+                        max_turns: meta.max_turns,
+                        background: meta.background.unwrap_or(false),
+                        omit_context: meta.omit_context.unwrap_or(false),
+                        isolation: match meta.isolation.as_deref() {
+                            Some("worktree") => Some(IsolationMode::Worktree),
+                            Some("remote") => Some(IsolationMode::Remote),
+                            _ => None,
+                        },
                     });
                 }
             }
@@ -95,6 +134,20 @@ impl AgentManager {
                             hooks: meta.hooks.unwrap_or_default(),
                             path,
                             body,
+                            role: match meta.role.as_deref() {
+                                Some("coordinator") => AgentRole::Coordinator,
+                                Some("orchestrator") => AgentRole::Orchestrator { max_depth: 3 },
+                                _ => AgentRole::Worker,
+                            },
+                            toolsets: meta.toolsets,
+                            max_turns: meta.max_turns,
+                            background: meta.background.unwrap_or(false),
+                            omit_context: meta.omit_context.unwrap_or(false),
+                            isolation: match meta.isolation.as_deref() {
+                                Some("worktree") => Some(IsolationMode::Worktree),
+                                Some("remote") => Some(IsolationMode::Remote),
+                                _ => None,
+                            },
                         });
                     }
                 }
@@ -120,6 +173,15 @@ struct AgentFrontmatter {
     tools: Option<ToolsField>,
     #[serde(default)]
     hooks: Option<Vec<HookDefinition>>,
+    #[serde(default)]
+    pub role: Option<String>,
+    pub toolsets: Option<Vec<String>>,
+    pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub background: Option<bool>,
+    #[serde(default)]
+    pub omit_context: Option<bool>,
+    pub isolation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,6 +294,12 @@ fn builtin_agents() -> Vec<AgentDefinition> {
             hooks: Vec::new(),
             path: PathBuf::from("<builtin:plan>"),
             body: include_str!("../prompts/modes/plan.md").trim().to_string(),
+            role: AgentRole::Worker,
+            toolsets: None,
+            max_turns: None,
+            background: false,
+            omit_context: false,
+            isolation: None,
         },
         AgentDefinition {
             name: "review".to_string(),
@@ -248,6 +316,12 @@ fn builtin_agents() -> Vec<AgentDefinition> {
             body: include_str!("../prompts/modes/review.md")
                 .trim()
                 .to_string(),
+            role: AgentRole::Worker,
+            toolsets: None,
+            max_turns: None,
+            background: false,
+            omit_context: false,
+            isolation: None,
         },
         AgentDefinition {
             name: "execute".to_string(),
@@ -259,6 +333,12 @@ fn builtin_agents() -> Vec<AgentDefinition> {
             body: include_str!("../prompts/modes/execute.md")
                 .trim()
                 .to_string(),
+            role: AgentRole::Worker,
+            toolsets: None,
+            max_turns: None,
+            background: false,
+            omit_context: false,
+            isolation: None,
         },
     ]
 }
