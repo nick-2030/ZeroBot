@@ -732,7 +732,9 @@ impl AcpRuntime {
                             AgentEvent::Done
                             | AgentEvent::SessionStarted { .. }
                             | AgentEvent::SessionResumed { .. }
-                            | AgentEvent::PluginWarning { .. } => {}
+                            | AgentEvent::PluginWarning { .. }
+                            | AgentEvent::ToolBatchStarted { .. }
+                            | AgentEvent::SessionCost { .. } => {}
                         }
                     }
                 }

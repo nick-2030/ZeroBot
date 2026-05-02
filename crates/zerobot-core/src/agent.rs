@@ -94,6 +94,13 @@ impl Agent {
             },
         );
 
+        // Cost tracking accumulators
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut total_cache_creation_tokens: u64 = 0;
+        let mut total_cache_read_tokens: u64 = 0;
+        let mut turn_count: u32 = 0;
+
         let mut input_text = input.to_string();
         let skill_hooks = self.load_skill_hooks(session_id).await?;
         let decision = self
@@ -437,6 +444,11 @@ impl Agent {
                             tool_calls.push(call);
                         }
                         ProviderEvent::Usage(usage) => {
+                            total_input_tokens += usage.input_tokens.unwrap_or(0) as u64;
+                            total_output_tokens += usage.output_tokens.unwrap_or(0) as u64;
+                            total_cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0) as u64;
+                            total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0) as u64;
+                            turn_count += 1;
                             self.emit(&events, AgentEvent::Usage { usage });
                         }
                         ProviderEvent::Done => {}
@@ -533,6 +545,13 @@ impl Agent {
                     Some(&url_instruction_text),
                 )
                 .await;
+                self.emit(&events, AgentEvent::SessionCost {
+                    input_tokens: total_input_tokens,
+                    output_tokens: total_output_tokens,
+                    cache_creation_tokens: total_cache_creation_tokens,
+                    cache_read_tokens: total_cache_read_tokens,
+                    turn_count,
+                });
                 self.emit(&events, AgentEvent::Done);
                 break;
             }
@@ -569,8 +588,55 @@ impl Agent {
                 }
             }
 
-            for call in tool_calls {
-                self.handle_tool_call(session_id, call, &events).await?;
+            // Partition tool calls into parallel (read-only) and serial (write) batches
+            let executor = ToolExecutor::from_agent(self);
+            let batches = partition_tool_calls(tool_calls, &executor.tools);
+            for batch in batches {
+                let (call_ids, is_parallel) = match &batch {
+                    ToolBatch::Parallel(calls) => {
+                        (calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), true)
+                    }
+                    ToolBatch::Serial(calls) => {
+                        (calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), false)
+                    }
+                };
+                self.emit(
+                    &events,
+                    AgentEvent::ToolBatchStarted {
+                        tool_call_ids: call_ids,
+                        parallel: is_parallel,
+                    },
+                );
+                match batch {
+                    ToolBatch::Parallel(calls) => {
+                        let mut join_set = tokio::task::JoinSet::new();
+                        for call in calls {
+                            let exec = executor.clone();
+                            let sid = session_id.to_string();
+                            let evts = events.clone();
+                            join_set.spawn(async move {
+                                exec.handle_tool_call(&sid, call, &evts).await
+                            });
+                        }
+                        while let Some(result) = join_set.join_next().await {
+                            match result {
+                                Ok(inner) => inner?,
+                                Err(join_err) => {
+                                    return Err(ZeroBotError::Agent(format!(
+                                        "并行工具执行失败: {join_err}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    ToolBatch::Serial(calls) => {
+                        for call in calls {
+                            executor
+                                .handle_tool_call(session_id, call, &events)
+                                .await?;
+                        }
+                    }
+                }
                 self.emit_context_usage(
                     session_id,
                     &events,
@@ -844,6 +910,189 @@ impl Agent {
             text = text.chars().take(20).collect();
         }
         text
+    }
+
+    fn emit(&self, events: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
+        if let Some(tx) = events {
+            let _ = tx.send(event);
+        }
+    }
+
+    fn emit_plugin_warnings(
+        &self,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        warnings: Vec<PluginHookWarning>,
+    ) {
+        for warning in warnings {
+            self.emit(
+                events,
+                AgentEvent::PluginWarning {
+                    plugin: warning.plugin,
+                    hook: warning.hook,
+                    message: warning.message,
+                    degraded: warning.degraded,
+                },
+            );
+        }
+    }
+
+    fn emit_context_usage_values(
+        &self,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        used: usize,
+        limit: Option<u32>,
+    ) {
+        self.emit(events, AgentEvent::ContextUsage { used, limit });
+    }
+
+    async fn emit_context_usage(
+        &self,
+        session_id: &str,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        skill_list: Option<&[SkillInfo]>,
+        extra_instructions: Option<&[String]>,
+    ) {
+        let history = match self.store.list_messages(session_id).await {
+            Ok(history) => history,
+            Err(err) => {
+                warn!("failed to refresh context usage: {err}");
+                return;
+            }
+        };
+        let context = ContextManager::new(&self.settings, self.cwd.clone()).build_with_skills(
+            &self.model,
+            &history,
+            skill_list,
+            extra_instructions,
+        );
+        self.emit_context_usage_values(events, context.estimated_tokens, context.context_limit);
+    }
+
+    async fn load_skill_hooks(
+        &self,
+        _session_id: &str,
+    ) -> ZeroBotResult<Vec<crate::hooks::HookDefinition>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Cloneable executor for tool calls, extracted from Agent to support parallel execution.
+#[derive(Clone)]
+struct ToolExecutor {
+    tools: ToolRegistry,
+    settings: Settings,
+    store: Arc<dyn SessionStore>,
+    hooks: HookManager,
+    interaction: Option<Arc<dyn InteractionHandler>>,
+    plugins: Option<Arc<PluginManager>>,
+    tool_approvals: Arc<RwLock<HashSet<String>>>,
+    cwd: std::path::PathBuf,
+    tool_route: Option<ToolRouteContext>,
+    outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+}
+
+impl ToolExecutor {
+    fn from_agent(agent: &Agent) -> Self {
+        Self {
+            tools: agent.tools.clone(),
+            settings: agent.settings.clone(),
+            store: agent.store.clone(),
+            hooks: agent.hooks.clone(),
+            interaction: agent.interaction.clone(),
+            plugins: agent.plugins.clone(),
+            tool_approvals: agent.tool_approvals.clone(),
+            cwd: agent.cwd.clone(),
+            tool_route: agent.tool_route.clone(),
+            outbound: agent.outbound.clone(),
+        }
+    }
+
+    fn emit(&self, events: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
+        if let Some(tx) = events {
+            let _ = tx.send(event);
+        }
+    }
+
+    fn emit_plugin_warnings(
+        &self,
+        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
+        warnings: Vec<PluginHookWarning>,
+    ) {
+        for warning in warnings {
+            self.emit(
+                events,
+                AgentEvent::PluginWarning {
+                    plugin: warning.plugin,
+                    hook: warning.hook,
+                    message: warning.message,
+                    degraded: warning.degraded,
+                },
+            );
+        }
+    }
+
+    async fn append_message_with_hooks(&self, mut message: Message) -> ZeroBotResult<Message> {
+        let skill_hooks = self.load_skill_hooks(&message.session_id).await?;
+        let payload = serde_json::json!({
+            "role": message.role.to_string(),
+            "content": message.content.clone(),
+            "summary": message.summary,
+            "tool_call_id": message.tool_call_id.clone(),
+        });
+        let decision = self
+            .hooks
+            .apply_event(
+                HookEvent::MessageAppend,
+                &message.session_id,
+                payload,
+                &skill_hooks,
+            )
+            .await?;
+        if matches!(decision.action, HookAction::Deny) {
+            let message = decision
+                .message
+                .unwrap_or_else(|| "消息被 Hook 拒绝".to_string());
+            return Err(ZeroBotError::Agent(message));
+        }
+        if let Some(content) = decision.payload.get("content").and_then(|v| v.as_str()) {
+            message.content = content.to_string();
+        }
+        self.store.append_message(message.clone()).await?;
+        Ok(message)
+    }
+
+    fn resolve_tool_alias(
+        &self,
+        tool_name: String,
+        args: &mut JsonValue,
+    ) -> ZeroBotResult<String> {
+        if self.tools.get(&tool_name).is_some() {
+            return Ok(tool_name);
+        }
+        if !self.settings.skills.enabled
+            || tool_name == "skill"
+            || self.tools.get("skill").is_none()
+        {
+            return Ok(tool_name);
+        }
+
+        let manager = SkillManager::new(&self.settings, &self.cwd);
+        let skills = match manager.discover() {
+            Ok(skills) => skills,
+            Err(_) => return Ok(tool_name),
+        };
+        let skill_names = skills.into_iter().map(|s| s.name).collect::<HashSet<_>>();
+        if let Some(mapped) = rewrite_skill_alias_call(&tool_name, args, &skill_names) {
+            return Ok(mapped);
+        }
+        Ok(tool_name)
+    }
+
+    async fn load_skill_hooks(
+        &self,
+        _session_id: &str,
+    ) -> ZeroBotResult<Vec<crate::hooks::HookDefinition>> {
+        Ok(Vec::new())
     }
 
     async fn handle_tool_call(
@@ -1156,85 +1405,8 @@ impl Agent {
                     if let Some(updated) = output.get("tool_output").and_then(|v| v.as_str()) {
                         output_content = updated.to_string();
                     }
-                    ok = output.get("ok").and_then(|v| v.as_bool()).unwrap_or(ok);
-                }
-
-                self.store
-                    .record_tool_output(&tool_call_id, &output_content)
-                    .await?;
-                let _ = self
-                    .append_message_with_hooks(Message {
-                        id: Uuid::new_v4().to_string(),
-                        session_id: session_id.to_string(),
-                        role: MessageRole::Tool,
-                        content: output_content.clone(),
-                        summary: false,
-                        tool_call_id: Some(tool_call_id.clone()),
-                        tool_calls: None,
-                        created_at: Utc::now().timestamp(),
-                    })
-                    .await?;
-
-                self.emit(
-                    events,
-                    AgentEvent::ToolCallFinished {
-                        tool_call_id: tool_call_id.clone(),
-                        name: tool_name,
-                        output: output_content,
-                        ok,
-                    },
-                );
-
-                Ok(())
-            }
-            Err(err) => {
-                let message = err.to_string();
-                let mut output_content = message.clone();
-                let skill_hooks = self.load_skill_hooks(session_id).await?;
-                let post_decision = self
-                    .hooks
-                    .apply_event(
-                        HookEvent::PostToolUseFailure,
-                        session_id,
-                        serde_json::json!({
-                            "tool_name": tool_name.clone(),
-                            "tool_input": args.clone(),
-                            "tool_output": output_content.clone(),
-                            "ok": false,
-                        }),
-                        &skill_hooks,
-                    )
-                    .await?;
-                if matches!(post_decision.action, HookAction::Deny) {
-                    output_content = post_decision
-                        .message
-                        .unwrap_or_else(|| "工具输出被 Hook 拒绝".to_string());
-                } else if let Some(updated) = post_decision
-                    .payload
-                    .get("tool_output")
-                    .and_then(|v| v.as_str())
-                {
-                    output_content = updated.to_string();
-                }
-                if let Some(plugins) = &self.plugins {
-                    let (output, warnings) = plugins
-                        .run_hook_with_warnings(
-                            "tool.execute.after",
-                            serde_json::json!({
-                                "session_id": session_id,
-                                "tool_name": tool_name.clone(),
-                                "tool_call_id": tool_call_external_id,
-                            }),
-                            serde_json::json!({
-                                "tool_input": args.clone(),
-                                "tool_output": output_content.clone(),
-                                "ok": false,
-                            }),
-                        )
-                        .await?;
-                    self.emit_plugin_warnings(events, warnings);
-                    if let Some(updated) = output.get("tool_output").and_then(|v| v.as_str()) {
-                        output_content = updated.to_string();
+                    if let Some(updated_ok) = output.get("ok").and_then(|v| v.as_bool()) {
+                        ok = updated_ok;
                     }
                 }
                 let _ = self
@@ -1253,107 +1425,116 @@ impl Agent {
                         created_at: Utc::now().timestamp(),
                     })
                     .await;
-
+                let skill_hooks = self.load_skill_hooks(session_id).await?;
+                let event_name = if ok {
+                    HookEvent::PostToolUse
+                } else {
+                    HookEvent::PostToolUseFailure
+                };
+                let _ = self
+                    .hooks
+                    .apply_event(
+                        event_name,
+                        session_id,
+                        serde_json::json!({
+                            "tool_name": tool_name.clone(),
+                            "tool_input": args,
+                            "tool_output": output_content.clone(),
+                            "ok": ok,
+                        }),
+                        &skill_hooks,
+                    )
+                    .await;
                 self.emit(
                     events,
                     AgentEvent::ToolCallFinished {
                         tool_call_id: tool_call_id.clone(),
                         name: tool_name,
                         output: output_content,
+                        ok,
+                    },
+                );
+            }
+            Err(err) => {
+                let error_msg = format!("工具执行错误: {err}");
+                let _ = self
+                    .store
+                    .record_tool_output(&tool_call_id, &error_msg)
+                    .await;
+                let _ = self
+                    .append_message_with_hooks(Message {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session_id.to_string(),
+                        role: MessageRole::Tool,
+                        content: error_msg.clone(),
+                        summary: false,
+                        tool_call_id: Some(tool_call_id.clone()),
+                        tool_calls: None,
+                        created_at: Utc::now().timestamp(),
+                    })
+                    .await;
+                let skill_hooks = self.load_skill_hooks(session_id).await?;
+                let _ = self
+                    .hooks
+                    .apply_event(
+                        HookEvent::PostToolUseFailure,
+                        session_id,
+                        serde_json::json!({
+                            "tool_name": tool_name.clone(),
+                            "tool_input": args,
+                            "tool_output": error_msg.clone(),
+                            "ok": false,
+                        }),
+                        &skill_hooks,
+                    )
+                    .await;
+                self.emit(
+                    events,
+                    AgentEvent::ToolCallFinished {
+                        tool_call_id: tool_call_id.clone(),
+                        name: tool_name,
+                        output: error_msg,
                         ok: false,
                     },
                 );
-
-                Ok(())
             }
         }
+        Ok(())
     }
+}
 
-    fn resolve_tool_alias(&self, tool_name: String, args: &mut JsonValue) -> ZeroBotResult<String> {
-        if self.tools.get(&tool_name).is_some() {
-            return Ok(tool_name);
-        }
-        if !self.settings.skills.enabled
-            || tool_name == "skill"
-            || self.tools.get("skill").is_none()
-        {
-            return Ok(tool_name);
-        }
+/// A batch of tool calls to execute together.
+enum ToolBatch {
+    /// Read-only tools that can run concurrently.
+    Parallel(Vec<ToolCall>),
+    /// A single write/destructive tool that must run serially.
+    Serial(Vec<ToolCall>),
+}
 
-        let manager = SkillManager::new(&self.settings, &self.cwd);
-        let skills = match manager.discover() {
-            Ok(skills) => skills,
-            Err(_) => return Ok(tool_name),
-        };
-        let skill_names = skills.into_iter().map(|s| s.name).collect::<HashSet<_>>();
-        if let Some(mapped) = rewrite_skill_alias_call(&tool_name, args, &skill_names) {
-            return Ok(mapped);
-        }
-        Ok(tool_name)
-    }
+/// Partition tool calls into batches: consecutive read-only calls form a parallel batch,
+/// write calls each become a serial batch.
+fn partition_tool_calls(calls: Vec<ToolCall>, registry: &ToolRegistry) -> Vec<ToolBatch> {
+    let mut batches: Vec<ToolBatch> = Vec::new();
+    let mut current_read_only: Vec<ToolCall> = Vec::new();
 
-    fn emit(&self, events: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
-        if let Some(tx) = events {
-            let _ = tx.send(event);
-        }
-    }
-
-    fn emit_plugin_warnings(
-        &self,
-        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
-        warnings: Vec<PluginHookWarning>,
-    ) {
-        for warning in warnings {
-            self.emit(
-                events,
-                AgentEvent::PluginWarning {
-                    plugin: warning.plugin,
-                    hook: warning.hook,
-                    message: warning.message,
-                    degraded: warning.degraded,
-                },
-            );
-        }
-    }
-
-    fn emit_context_usage_values(
-        &self,
-        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
-        used: usize,
-        limit: Option<u32>,
-    ) {
-        self.emit(events, AgentEvent::ContextUsage { used, limit });
-    }
-
-    async fn emit_context_usage(
-        &self,
-        session_id: &str,
-        events: &Option<mpsc::UnboundedSender<AgentEvent>>,
-        skill_list: Option<&[SkillInfo]>,
-        extra_instructions: Option<&[String]>,
-    ) {
-        let history = match self.store.list_messages(session_id).await {
-            Ok(history) => history,
-            Err(err) => {
-                warn!("failed to refresh context usage: {err}");
-                return;
+    for call in calls {
+        if registry.is_read_only(&call.name) {
+            current_read_only.push(call);
+        } else {
+            // Flush accumulated read-only calls as a parallel batch
+            if !current_read_only.is_empty() {
+                batches.push(ToolBatch::Parallel(std::mem::take(&mut current_read_only)));
             }
-        };
-        let context = ContextManager::new(&self.settings, self.cwd.clone()).build_with_skills(
-            &self.model,
-            &history,
-            skill_list,
-            extra_instructions,
-        );
-        self.emit_context_usage_values(events, context.estimated_tokens, context.context_limit);
+            // Write tool gets its own serial batch
+            batches.push(ToolBatch::Serial(vec![call]));
+        }
+    }
+    // Flush any remaining read-only calls
+    if !current_read_only.is_empty() {
+        batches.push(ToolBatch::Parallel(current_read_only));
     }
 
-    async fn load_skill_hooks(
-        &self,
-        _session_id: &str,
-    ) -> ZeroBotResult<Vec<crate::hooks::HookDefinition>> {
-        Ok(Vec::new())
-    }
+    batches
 }
 
 fn is_bash_tool(name: &str) -> bool {

@@ -26,6 +26,10 @@ pub enum AgentEvent {
         output: String,
         ok: bool,
     },
+    ToolBatchStarted {
+        tool_call_ids: Vec<String>,
+        parallel: bool,
+    },
     ContextUsage {
         used: usize,
         limit: Option<u32>,
@@ -43,4 +47,11 @@ pub enum AgentEvent {
         degraded: bool,
     },
     Done,
+    SessionCost {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+        turn_count: u32,
+    },
 }

@@ -239,6 +239,17 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> JsonValue;
     async fn run(&self, ctx: &ToolContext, args: JsonValue) -> ZeroBotResult<ToolOutput>;
+
+    /// Whether this tool only reads state and never modifies it.
+    /// Read-only tools can be executed concurrently.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool performs irreversible/destructive operations.
+    fn is_destructive(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default, Clone)]
@@ -265,6 +276,10 @@ impl ToolRegistry {
 
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.tools.get(name).map_or(false, |t| t.is_read_only())
     }
 
     pub fn specs(&self, enabled: &[String]) -> Vec<crate::provider::ToolSpec> {
@@ -448,6 +463,10 @@ struct SubagentArgs {
 impl Tool for SubagentTool {
     fn name(&self) -> &str {
         "subagent"
+    }
+
+    fn is_destructive(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -967,6 +986,10 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "读取文件或目录内容（1-indexed 行号）"
     }
@@ -1178,6 +1201,10 @@ impl Tool for WriteTool {
         "write"
     }
 
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "写入文件（覆盖写入）"
     }
@@ -1263,6 +1290,10 @@ struct EditArgs {
 impl Tool for EditTool {
     fn name(&self) -> &str {
         "edit"
+    }
+
+    fn is_destructive(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -1370,6 +1401,10 @@ impl Tool for ApplyPatchTool {
         "apply_patch"
     }
 
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "应用补丁（*** Begin Patch 格式）"
     }
@@ -1404,6 +1439,10 @@ struct PatchArgs {
 impl Tool for PatchTool {
     fn name(&self) -> &str {
         "patch"
+    }
+
+    fn is_destructive(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -1868,6 +1907,10 @@ impl Tool for GlobTool {
         "glob"
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "查找匹配文件"
     }
@@ -1959,6 +2002,10 @@ struct GrepArgs {
 impl Tool for GrepTool {
     fn name(&self) -> &str {
         "grep"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -2122,6 +2169,10 @@ impl Tool for BashTool {
         "bash"
     }
 
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "执行 bash 命令（支持 workdir/timeoutMs/description）"
     }
@@ -2165,6 +2216,10 @@ struct ShellArgs {
 impl Tool for ShellTool {
     fn name(&self) -> &str {
         "shell"
+    }
+
+    fn is_destructive(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -2285,6 +2340,10 @@ struct TodoReadTool;
 impl Tool for TodoReadTool {
     fn name(&self) -> &str {
         "todoread"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {
@@ -2688,6 +2747,10 @@ struct RequestUserInputOptionArgs {
 impl Tool for RequestUserInputTool {
     fn name(&self) -> &str {
         "request_user_input"
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     fn description(&self) -> &str {

@@ -73,6 +73,8 @@ pub struct TokenUsage {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    pub cache_creation_input_tokens: Option<u32>,
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -969,6 +971,8 @@ impl Provider for AnthropicProvider {
                                                 last_usage.input_tokens = usage.input_tokens;
                                                 last_usage.output_tokens = usage.output_tokens;
                                                 last_usage.total_tokens = usage.total_tokens;
+                                                last_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                                                last_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
                                                 let _ = tx.send(Ok(ProviderEvent::Usage(
                                                     last_usage.clone(),
                                                 )));
@@ -986,6 +990,12 @@ impl Provider for AnthropicProvider {
                                                 }
                                                 if usage.total_tokens.is_some() {
                                                     last_usage.total_tokens = usage.total_tokens;
+                                                }
+                                                if usage.cache_creation_input_tokens.is_some() {
+                                                    last_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                                                }
+                                                if usage.cache_read_input_tokens.is_some() {
+                                                    last_usage.cache_read_input_tokens = usage.cache_read_input_tokens;
                                                 }
                                                 let _ = tx.send(Ok(ProviderEvent::Usage(
                                                     last_usage.clone(),
@@ -1143,6 +1153,8 @@ fn parse_openai_usage(raw: &JsonValue) -> Option<TokenUsage> {
         input_tokens: prompt_tokens.map(|v| v as u32),
         output_tokens: completion_tokens.map(|v| v as u32),
         total_tokens: total_tokens.map(|v| v as u32),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     })
 }
 
@@ -1152,6 +1164,10 @@ fn parse_anthropic_usage(raw: &JsonValue) -> Option<TokenUsage> {
     if input_tokens.is_none() && output_tokens.is_none() {
         return None;
     }
+    let cache_creation = raw
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64());
+    let cache_read = raw.get("cache_read_input_tokens").and_then(|v| v.as_u64());
     let total_tokens = match (input_tokens, output_tokens) {
         (Some(i), Some(o)) => Some(i + o),
         _ => None,
@@ -1160,6 +1176,8 @@ fn parse_anthropic_usage(raw: &JsonValue) -> Option<TokenUsage> {
         input_tokens: input_tokens.map(|v| v as u32),
         output_tokens: output_tokens.map(|v| v as u32),
         total_tokens: total_tokens.map(|v| v as u32),
+        cache_creation_input_tokens: cache_creation.map(|v| v as u32),
+        cache_read_input_tokens: cache_read.map(|v| v as u32),
     })
 }
 

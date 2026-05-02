@@ -186,6 +186,11 @@ struct App {
     usage: Option<TokenUsage>,
     context_used: Option<usize>,
     context_limit: Option<u32>,
+    session_input_tokens: u64,
+    session_output_tokens: u64,
+    session_cache_creation_tokens: u64,
+    session_cache_read_tokens: u64,
+    session_turn_count: u32,
     permission_prompt: Option<PermissionPrompt>,
     info_overlay: Option<InfoOverlay>,
     overlay_queue: VecDeque<InfoOverlay>,
@@ -244,6 +249,11 @@ impl App {
             usage: None,
             context_used: None,
             context_limit: None,
+            session_input_tokens: 0,
+            session_output_tokens: 0,
+            session_cache_creation_tokens: 0,
+            session_cache_read_tokens: 0,
+            session_turn_count: 0,
             permission_prompt: None,
             info_overlay: None,
             overlay_queue: VecDeque::new(),
@@ -2203,6 +2213,19 @@ async fn handle_agent_event(
             };
             app.push_block(DotColor::Yellow, &text);
         }
+        AgentEvent::SessionCost {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            turn_count,
+        } => {
+            app.session_input_tokens = input_tokens;
+            app.session_output_tokens = output_tokens;
+            app.session_cache_creation_tokens = cache_creation_tokens;
+            app.session_cache_read_tokens = cache_read_tokens;
+            app.session_turn_count = turn_count;
+        }
         AgentEvent::Done => {
             app.finalize_stream();
             app.status = Status::Idle;
@@ -2457,6 +2480,16 @@ fn render_permission_prompt(frame: &mut Frame, prompt: &PermissionPrompt) {
     frame.render_widget(widget, area);
 }
 
+fn format_token_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
 fn build_status_bar(app: &App) -> String {
     let used = app
         .context_used
@@ -2478,6 +2511,21 @@ fn build_status_bar(app: &App) -> String {
         format!("{} / {}", app.provider_id, app.model),
         format!("Tokens: {used}/{limit}/{percent}"),
     ];
+    if app.session_turn_count > 0 {
+        let total = app.session_input_tokens + app.session_output_tokens;
+        let cache_total = app.session_cache_creation_tokens + app.session_cache_read_tokens;
+        let cache_rate = if total > 0 {
+            format!("{:.0}%", (app.session_cache_read_tokens as f64 / total as f64) * 100.0)
+        } else {
+            "-".to_string()
+        };
+        parts.push(format!(
+            "Cost: {}tok (cache: {}, hit: {})",
+            format_token_count(total),
+            format_token_count(cache_total),
+            cache_rate,
+        ));
+    }
     if !commands.is_empty() {
         parts.push(format!("Commands: {commands}"));
     }
