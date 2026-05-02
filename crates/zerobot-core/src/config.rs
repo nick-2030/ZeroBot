@@ -38,6 +38,12 @@ pub struct Settings {
     #[serde(default)]
     pub skills: SkillsSettings,
     #[serde(default)]
+    pub memory: MemorySettings,
+    #[serde(default)]
+    pub self_review: SelfReviewSettings,
+    #[serde(default)]
+    pub curator: CuratorSettings,
+    #[serde(default)]
     pub plugins: PluginsSettings,
 }
 
@@ -568,6 +574,124 @@ fn default_skills_import_external() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_dir")]
+    pub dir: String,
+    #[serde(default = "default_memory_max_chars")]
+    pub memory_max_chars: usize,
+    #[serde(default = "default_user_max_chars")]
+    pub user_max_chars: usize,
+    #[serde(default = "default_true")]
+    pub inject_into_context: bool,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_memory_dir() -> String {
+    "~/.zerobot/memories".to_string()
+}
+
+fn default_memory_max_chars() -> usize {
+    2200
+}
+
+fn default_user_max_chars() -> usize {
+    1375
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            dir: default_memory_dir(),
+            memory_max_chars: default_memory_max_chars(),
+            user_max_chars: default_user_max_chars(),
+            inject_into_context: default_true(),
+            provider: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfReviewSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_review_interval")]
+    pub interval: u32,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_review_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_review_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_review_interval() -> u32 {
+    10
+}
+
+fn default_review_max_tokens() -> u32 {
+    4096
+}
+
+fn default_review_timeout() -> u64 {
+    120
+}
+
+impl Default for SelfReviewSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            interval: default_review_interval(),
+            model: None,
+            max_tokens: default_review_max_tokens(),
+            timeout_secs: default_review_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CuratorSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_curator_interval")]
+    pub interval_hours: u64,
+    #[serde(default = "default_stale_days")]
+    pub stale_after_days: u64,
+    #[serde(default = "default_archive_days")]
+    pub archive_after_days: u64,
+}
+
+fn default_curator_interval() -> u64 {
+    168 // 7 days
+}
+
+fn default_stale_days() -> u64 {
+    30
+}
+
+fn default_archive_days() -> u64 {
+    90
+}
+
+impl Default for CuratorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            interval_hours: default_curator_interval(),
+            stale_after_days: default_stale_days(),
+            archive_after_days: default_archive_days(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginFailureMode {
@@ -733,6 +857,9 @@ impl Default for Settings {
             channels: ChannelsSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
+            memory: MemorySettings::default(),
+            self_review: SelfReviewSettings::default(),
+            curator: CuratorSettings::default(),
             plugins: PluginsSettings::default(),
         }
     }

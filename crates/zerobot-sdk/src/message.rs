@@ -239,7 +239,8 @@ impl SDKMessage {
             | AgentEvent::CwdChanged { .. }
             | AgentEvent::FileChanged { .. }
             | AgentEvent::HookSessionAdded { .. }
-            | AgentEvent::HookSessionRemoved { .. } => None,
+            | AgentEvent::HookSessionRemoved { .. }
+            | AgentEvent::SelfReviewCompleted { .. } => None,
         }
     }
 }

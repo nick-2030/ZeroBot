@@ -242,8 +242,14 @@ impl Agent {
             } else {
                 None
             };
+            let memory_block = self.tools.memory_manager().and_then(|mgr| {
+                // Get frozen snapshot block from MemoryManager (blocking since we're in async context)
+                let mgr = mgr.try_lock().ok()?;
+                mgr.build_system_prompt_block()
+            });
             let context = ContextManager::new(&self.settings, self.cwd.clone())
                 .with_tools(self.tools.clone())
+                .with_memory_block(memory_block)
                 .build_with_skills(
                     &self.model,
                     &history,

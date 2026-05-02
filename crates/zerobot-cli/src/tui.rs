@@ -42,6 +42,7 @@ use zerobot_core::session::{
 use zerobot_core::tool::ToolRegistry;
 use zerobot_core::ZeroBotError;
 use zerobot_core::{discover_template_commands, init_prompt, render_template_prompt};
+use zerobot_core::{Curator, SelfReviewer};
 
 #[derive(Copy, Clone)]
 enum DotColor {
@@ -1471,6 +1472,8 @@ pub async fn run_tui(
     provider_state: Arc<StdRwLock<String>>,
     plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
+    self_reviewer: Option<SelfReviewer>,
+    curator: Option<Curator>,
 ) -> Result<String> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -1495,6 +1498,8 @@ pub async fn run_tui(
         provider_state,
         plugins,
         tool_approvals,
+        self_reviewer,
+        curator,
     )
     .await;
 
@@ -1526,6 +1531,8 @@ async fn run_tui_inner(
     provider_state: Arc<StdRwLock<String>>,
     plugins: Option<Arc<PluginManager>>,
     tool_approvals: Arc<TokioRwLock<HashSet<String>>>,
+    self_reviewer: Option<SelfReviewer>,
+    curator: Option<Curator>,
 ) -> Result<String> {
     let plugin_assets = plugins
         .as_ref()
@@ -1617,7 +1624,7 @@ async fn run_tui_inner(
                     }
                 }
                 Some(event) = rx.recv() => {
-                    handle_agent_event(event, &mut app, &store).await;
+                    handle_agent_event(event, &mut app, &store, self_reviewer.as_ref(), curator.as_ref(), &session_id).await;
                     dirty = true;
                 }
                 Some(req) = ui_rx.recv() => {
@@ -1675,7 +1682,7 @@ async fn run_tui_inner(
                     }
                 }
                 Some(event) = rx.recv() => {
-                    handle_agent_event(event, &mut app, &store).await;
+                    handle_agent_event(event, &mut app, &store, self_reviewer.as_ref(), curator.as_ref(), &session_id).await;
                     dirty = true;
                 }
                 Some(req) = ui_rx.recv() => {
@@ -2974,6 +2981,9 @@ async fn handle_agent_event(
     event: AgentEvent,
     app: &mut App,
     store: &std::sync::Arc<dyn SessionStore>,
+    self_reviewer: Option<&SelfReviewer>,
+    curator: Option<&Curator>,
+    session_id: &str,
 ) {
     match event {
         AgentEvent::AssistantDelta { content } => {
@@ -3099,6 +3109,41 @@ async fn handle_agent_event(
             app.finalize_stream();
             app.status = Status::Idle;
             refresh_session_state(app, store).await;
+
+            // Trigger self-review in background
+            if let Some(reviewer) = self_reviewer {
+                let reviewer = reviewer.clone();
+                let sid = session_id.to_string();
+                tokio::spawn(async move {
+                    match reviewer.maybe_review(&sid).await {
+                        Ok(Some(summary)) => {
+                            tracing::info!("Self-review completed: {summary}");
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("Self-review failed: {e}");
+                        }
+                    }
+                });
+            }
+
+            // Trigger curator in background if due
+            if let Some(c) = curator {
+                if c.is_due() {
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        match c.run().await {
+                            Ok(Some(result)) => {
+                                tracing::info!("Curator completed: {}", result.summary);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!("Curator failed: {e}");
+                            }
+                        }
+                    });
+                }
+            }
         }
         AgentEvent::PermissionDenied {
             tool_name,

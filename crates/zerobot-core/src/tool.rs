@@ -8,7 +8,10 @@ use crate::hooks::HookManager;
 use crate::instruction;
 use crate::interaction::{InteractionHandler, UserInputRequest, UserInputResponse};
 use crate::mcp::{format_tool_output, McpManager, McpToolInfo};
+use crate::memory::MemoryManager;
+use crate::memory_tool::MemoryTool;
 use crate::plugin::PluginManager;
+use crate::skill_manage::SkillManageTool;
 use crate::provider::ProviderFactory;
 use crate::session::{FileReadRecord, SessionKind, SessionStore, TodoItem};
 use crate::skills::{format_skill_summary, SkillContent, SkillManager};
@@ -269,6 +272,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     plugins: Option<Arc<PluginManager>>,
+    memory_manager: Option<Arc<tokio::sync::Mutex<MemoryManager>>>,
 }
 
 impl ToolRegistry {
@@ -276,6 +280,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             plugins: None,
+            memory_manager: None,
         }
     }
 
@@ -293,6 +298,11 @@ impl ToolRegistry {
 
     pub fn is_read_only(&self, name: &str) -> bool {
         self.tools.get(name).map_or(false, |t| t.is_read_only())
+    }
+
+    /// Get the memory manager if memory system is enabled.
+    pub fn memory_manager(&self) -> Option<Arc<tokio::sync::Mutex<MemoryManager>>> {
+        self.memory_manager.clone()
     }
 
     /// Collect dynamic prompt guidance from all enabled tools.
@@ -390,9 +400,18 @@ impl ToolRegistry {
                 Err(_) => "加载指定 Skill 的内容。".to_string(),
             };
             registry.register(SkillTool {
-                manager,
+                manager: manager.clone(),
                 description,
             });
+            registry.register(SkillManageTool::new(manager, cwd.to_path_buf()));
+        }
+
+        if settings.memory.enabled {
+            let mut memory_mgr = MemoryManager::new(&settings.memory)?;
+            memory_mgr.load_and_freeze()?;
+            let memory_mgr = Arc::new(tokio::sync::Mutex::new(memory_mgr));
+            registry.register(MemoryTool::new(memory_mgr.clone()));
+            registry.memory_manager = Some(memory_mgr);
         }
 
         let workspace_root = crate::workspace::resolve_workspace_root(cwd);

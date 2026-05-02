@@ -18,6 +18,7 @@ pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +139,7 @@ impl SkillManager {
                     name: key.clone(),
                     description: meta.description,
                     path: entry.path().to_path_buf(),
+                    status: meta.status,
                 };
                 if let Some(existing) = out.insert(key.clone(), next) {
                     warn!(
@@ -161,6 +163,74 @@ impl SkillManager {
         let content = std::fs::read_to_string(&info.path)?;
         let (_meta, body) = parse_skill_file(&content)?;
         Ok(SkillContent { info, body })
+    }
+
+    /// Write a new skill or overwrite an existing one. Returns the path to the SKILL.md.
+    pub fn write_skill(
+        &self,
+        name: &str,
+        description: &str,
+        body: &str,
+        status: Option<&str>,
+    ) -> ZeroBotResult<PathBuf> {
+        if !is_valid_skill_name(name) {
+            return Err(ZeroBotError::Skill(format!(
+                "skill 名称不合法: {name} (需符合 ^[a-z0-9]+(?:-[a-z0-9]+)*$)"
+            )));
+        }
+        // Write to the first writable root (zerobot native skills dir)
+        let home = home_dir();
+        let target_dir = home.join(".zerobot").join("skills").join(name);
+        std::fs::create_dir_all(&target_dir)?;
+
+        let now = chrono::Utc::now().timestamp();
+        let status_str = status.unwrap_or("active");
+        let frontmatter = format!(
+            "---\nname: {}\ndescription: {}\nstatus: {}\ncreated_at: {}\nupdated_at: {}\n---\n",
+            name, description, status_str, now, now
+        );
+        let content = format!("{}\n{}", frontmatter, body);
+        let path = target_dir.join("SKILL.md");
+        std::fs::write(&path, &content)?;
+        Ok(path)
+    }
+
+    /// Delete a skill by name. Only deletes from zerobot native skills dir.
+    pub fn delete_skill(&self, name: &str) -> ZeroBotResult<()> {
+        let home = home_dir();
+        let target_dir = home.join(".zerobot").join("skills").join(name);
+        if !target_dir.exists() {
+            return Err(ZeroBotError::Skill(format!("未找到 skill: {name}")));
+        }
+        std::fs::remove_dir_all(&target_dir)?;
+        Ok(())
+    }
+
+    /// Update the status of an existing skill.
+    pub fn update_skill_status(&self, name: &str, new_status: &str) -> ZeroBotResult<PathBuf> {
+        let skills = self.discover()?;
+        let info = skills
+            .into_iter()
+            .find(|skill| skill.name == name)
+            .ok_or_else(|| ZeroBotError::Skill(format!("未找到 skill: {name}")))?;
+
+        let content = std::fs::read_to_string(&info.path)?;
+        let (meta, body) = parse_skill_file(&content)?;
+
+        let now = chrono::Utc::now().timestamp();
+        let created_at = meta.created_at.unwrap_or(now);
+        let frontmatter = format!(
+            "---\nname: {}\ndescription: {}\nstatus: {}\ncreated_at: {}\nupdated_at: {}\nuse_count: {}\n---\n",
+            meta.name,
+            meta.description,
+            new_status,
+            created_at,
+            now,
+            meta.use_count.unwrap_or(0)
+        );
+        let new_content = format!("{}\n{}", frontmatter, body);
+        std::fs::write(&info.path, &new_content)?;
+        Ok(info.path)
     }
 }
 
@@ -322,6 +392,16 @@ impl SkillManager {
 struct SkillFrontmatter {
     name: String,
     description: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    created_at: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<i64>,
+    #[serde(default)]
+    last_used_at: Option<i64>,
+    #[serde(default)]
+    use_count: Option<u64>,
     #[allow(dead_code)]
     #[serde(default)]
     metadata: HashMap<String, serde_yaml::Value>,

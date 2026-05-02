@@ -44,6 +44,14 @@ pub const SYSTEM_PROMPT_SECTIONS: &[PromptSection] = &[
         name: "style",
         content: include_str!("../prompts/system/style.md"),
     },
+    PromptSection {
+        name: "memory",
+        content: include_str!("../prompts/system/memory.md"),
+    },
+    PromptSection {
+        name: "evolution",
+        content: include_str!("../prompts/system/evolution.md"),
+    },
 ];
 
 pub fn default_system_prompt() -> String {

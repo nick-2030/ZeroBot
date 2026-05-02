@@ -23,6 +23,7 @@ pub struct ContextManager {
     settings: Settings,
     cwd: PathBuf,
     tool_registry: Option<ToolRegistry>,
+    frozen_memory_block: Option<String>,
 }
 
 impl ContextManager {
@@ -31,11 +32,17 @@ impl ContextManager {
             settings: settings.clone(),
             cwd,
             tool_registry: None,
+            frozen_memory_block: None,
         }
     }
 
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tool_registry = Some(tools);
+        self
+    }
+
+    pub fn with_memory_block(mut self, block: Option<String>) -> Self {
+        self.frozen_memory_block = block;
         self
     }
 
@@ -229,6 +236,13 @@ impl ContextManager {
 
         if self.settings.context.include_environment {
             parts.push(build_environment_block(model, &self.cwd));
+        }
+
+        // Inject frozen memory snapshot (from MemoryManager)
+        if let Some(ref block) = self.frozen_memory_block {
+            if !block.is_empty() {
+                parts.push(block.clone());
+            }
         }
 
         // Dynamic tool guidance from tool prompt() methods

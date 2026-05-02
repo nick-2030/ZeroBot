@@ -745,7 +745,8 @@ impl AcpRuntime {
                             | AgentEvent::CwdChanged { .. }
                             | AgentEvent::FileChanged { .. }
                             | AgentEvent::HookSessionAdded { .. }
-                            | AgentEvent::HookSessionRemoved { .. } => {}
+                            | AgentEvent::HookSessionRemoved { .. }
+                            | AgentEvent::SelfReviewCompleted { .. } => {}
                         }
                     }
                 }

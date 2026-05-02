@@ -26,7 +26,7 @@ use zerobot_core::session::{
 };
 use zerobot_core::tool::{SubagentTool, ToolRegistry};
 use zerobot_core::workspace::{resolve_session_db_path, resolve_workspace_root};
-use zerobot_core::ZeroBotError;
+use zerobot_core::{Curator, SelfReviewer, ZeroBotError};
 
 mod slash;
 mod tui;
@@ -496,6 +496,40 @@ async fn run_repl(
         tool_approvals.clone(),
     ));
     let provider_id = resolve_provider_id(settings, provider_override.as_deref());
+
+    // Create SelfReviewer if memory system is enabled
+    let self_reviewer = if settings.memory.enabled && settings.self_review.enabled {
+        let memory_manager = tools.memory_manager().ok_or_else(|| {
+            ZeroBotError::Config("memory 已启用但 MemoryManager 未创建".to_string())
+        })?;
+        let skill_manager = Arc::new(zerobot_core::SkillManager::new(settings, cwd));
+        Some(SelfReviewer::new(
+            provider_factory.clone(),
+            model.clone(),
+            settings,
+            store.clone(),
+            memory_manager,
+            skill_manager.clone(),
+            cwd.clone(),
+        ))
+    } else {
+        None
+    };
+
+    // Create Curator if enabled
+    let curator = if settings.skills.enabled && settings.curator.enabled {
+        let skill_manager = Arc::new(zerobot_core::SkillManager::new(settings, cwd));
+        Some(Curator::new(
+            skill_manager,
+            provider_factory.clone(),
+            model.clone(),
+            settings,
+            cwd.clone(),
+        ))
+    } else {
+        None
+    };
+
     let final_session_id = tui::run_tui(
         settings.clone(),
         cwd.clone(),
@@ -511,6 +545,8 @@ async fn run_repl(
         provider_state.clone(),
         plugins.clone(),
         tool_approvals.clone(),
+        self_reviewer,
+        curator,
     )
     .await?;
 

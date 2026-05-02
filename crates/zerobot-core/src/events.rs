@@ -83,4 +83,9 @@ pub enum AgentEvent {
     HookSessionRemoved {
         hook_name: String,
     },
+    SelfReviewCompleted {
+        summary: String,
+        memory_changes: usize,
+        skill_changes: usize,
+    },
 }
