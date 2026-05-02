@@ -252,9 +252,23 @@ impl Agent {
         let mut overflow_compaction_attempted = false;
 
         loop {
+            // 检查中断令牌
+            if self.abort_token.is_cancelled() {
+                let _ = self.emit(&events, AgentEvent::Stop);
+                return Ok("任务被中断".to_string());
+            }
+
             steps += 1;
             if steps > self.settings.agent.max_steps {
                 return Err(ZeroBotError::Agent("超过最大步骤限制".to_string()));
+            }
+
+            // 迭代预算检查
+            if let Some(budget) = self.iteration_budget {
+                if steps > budget as usize {
+                    let _ = self.emit(&events, AgentEvent::Stop);
+                    return Ok(format!("迭代预算耗尽 ({} 步)", budget));
+                }
             }
 
             let history = self.store.list_messages(session_id).await?;
@@ -727,6 +741,22 @@ impl Agent {
                     Some(&url_instruction_text),
                 )
                 .await;
+            }
+
+            // 发送进度通知
+            if let Some(ref tx) = self.notification_tx {
+                let notification = Notification {
+                    task_id: self.task_id.clone().unwrap_or_else(|| TaskId::new("a_")),
+                    agent_type: self.agent_type.clone(),
+                    description: format!("已完成 {} 步", steps),
+                    status: NotificationStatus::Progress {
+                        summary: format!("步骤 {} 完成", steps),
+                    },
+                    result: None,
+                    usage: None,
+                    timestamp: std::time::Instant::now(),
+                };
+                let _ = tx.send(notification);
             }
         }
 

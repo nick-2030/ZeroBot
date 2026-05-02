@@ -751,7 +751,8 @@ impl AcpRuntime {
                             | AgentEvent::FileChanged { .. }
                             | AgentEvent::HookSessionAdded { .. }
                             | AgentEvent::HookSessionRemoved { .. }
-                            | AgentEvent::SelfReviewCompleted { .. } => {}
+                            | AgentEvent::SelfReviewCompleted { .. }
+                            | AgentEvent::Stop => {}
                         }
                     }
                 }

@@ -88,4 +88,5 @@ pub enum AgentEvent {
         memory_changes: usize,
         skill_changes: usize,
     },
+    Stop,
 }
