@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod agent;
+pub mod agent_dispatch;
 pub mod agents;
 pub mod bus;
 pub mod channel;
@@ -32,6 +33,9 @@ pub mod tool;
 pub mod workspace;
 
 pub use agent::{Agent, AgentResult};
+pub use agent_dispatch::{
+    AgentDispatcher, DispatchMode, DispatchRequest, DispatchResult, IsolationMode, ToolRestrictions,
+};
 pub use agents::{AgentDefinition, AgentManager};
 pub use bus::{InboundMessage, MessageBus, OutboundMessage};
 pub use channel::{build_channel_manager, ChannelManager, ChatChannel};
