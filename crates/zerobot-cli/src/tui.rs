@@ -206,7 +206,6 @@ struct App {
     output: Vec<OutputItem>,
     stream_buffer: String,
     streaming: bool,
-    last_tool_label: Option<String>,
     input: String,
     cursor: usize,
     scroll: u16,
@@ -235,14 +234,19 @@ struct App {
     slash_page: usize,
     slash_hint: String,
     show_full_tool_output: bool,
-    running_tool_output_idx: Option<usize>,
+    running_tools: HashMap<String, RunningTool>,
     running_hook_output_idx: Option<usize>,
     active_hooks: Vec<String>,
     last_idle_esc: Option<Instant>,
     last_idle_ctrl_c: Option<Instant>,
     status_notice: Option<String>,
-    last_tool_args: Option<String>,
-    tool_start_time: Option<Instant>,
+}
+
+struct RunningTool {
+    output_idx: usize,
+    label: String,
+    arguments: String,
+    start_time: Instant,
 }
 
 #[derive(Clone)]
@@ -285,7 +289,6 @@ impl App {
             output: Vec::new(),
             stream_buffer: String::new(),
             streaming: false,
-            last_tool_label: None,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -314,14 +317,12 @@ impl App {
             slash_page: 0,
             slash_hint: String::new(),
             show_full_tool_output: false,
-            running_tool_output_idx: None,
+            running_tools: HashMap::new(),
             running_hook_output_idx: None,
             active_hooks: Vec::new(),
             last_idle_esc: None,
             last_idle_ctrl_c: None,
             status_notice: None,
-            last_tool_args: None,
-            tool_start_time: None,
         }
     }
 
@@ -394,35 +395,43 @@ impl App {
         self.stick_to_bottom = true;
     }
 
-    fn push_running_tool(&mut self, label: &str) {
+    fn push_running_tool(&mut self, tool_call_id: &str, label: &str, arguments: &str) {
         self.output.push(OutputItem::ToolRunning {
             label: label.to_string(),
         });
-        self.running_tool_output_idx = Some(self.output.len().saturating_sub(1));
+        let idx = self.output.len().saturating_sub(1);
+        self.running_tools.insert(
+            tool_call_id.to_string(),
+            RunningTool {
+                output_idx: idx,
+                label: label.to_string(),
+                arguments: arguments.to_string(),
+                start_time: Instant::now(),
+            },
+        );
         self.stick_to_bottom = true;
     }
 
-    fn complete_running_tool(&mut self, name: &str, output: &str, ok: bool, duration_ms: Option<u64>) {
+    fn complete_running_tool(&mut self, tool_call_id: &str, name: &str, output: &str, ok: bool) {
         let color = if ok { DotColor::Green } else { DotColor::Red };
-        let label = self.last_tool_label.clone();
-        let arguments = self.last_tool_args.clone().unwrap_or_default();
-        let item = OutputItem::ToolOutput {
-            color,
-            tool_name: name.to_string(),
-            label: label.clone(),
-            arguments,
-            output: output.to_string(),
-            expanded: false,
-            duration_ms,
-        };
-        if let Some(idx) = self.running_tool_output_idx.take() {
-            if idx < self.output.len() {
-                self.output[idx] = item;
+        if let Some(rt) = self.running_tools.remove(tool_call_id) {
+            let duration_ms = Some(rt.start_time.elapsed().as_millis() as u64);
+            let item = OutputItem::ToolOutput {
+                color,
+                tool_name: name.to_string(),
+                label: Some(rt.label),
+                arguments: rt.arguments,
+                output: output.to_string(),
+                expanded: false,
+                duration_ms,
+            };
+            if rt.output_idx < self.output.len() {
+                self.output[rt.output_idx] = item;
                 self.stick_to_bottom = true;
                 return;
             }
         }
-        self.push_tool_output(color, name, label.as_deref(), output);
+        self.push_tool_output(color, name, None, output);
     }
 
     fn append_stream_delta(&mut self, text: &str) {
@@ -1722,19 +1731,19 @@ async fn handle_event(
             interrupted = true;
         }
         app.finalize_stream();
-        if let Some(idx) = app.running_tool_output_idx.take() {
-            if idx < app.output.len() {
-                if let OutputItem::ToolRunning { label } = app.output[idx].clone() {
-                    app.output[idx] = OutputItem::ToolOutput {
-                        color: DotColor::Yellow,
-                        tool_name: "interrupted".to_string(),
-                        label: Some(label),
-                        arguments: String::new(),
-                        output: "已中断".to_string(),
-                        expanded: false,
-                        duration_ms: None,
-                    };
-                }
+        let running: Vec<_> = app.running_tools.drain().collect();
+        for (_, rt) in running {
+            if rt.output_idx < app.output.len() {
+                let duration_ms = Some(rt.start_time.elapsed().as_millis() as u64);
+                app.output[rt.output_idx] = OutputItem::ToolOutput {
+                    color: DotColor::Yellow,
+                    tool_name: "interrupted".to_string(),
+                    label: Some(rt.label),
+                    arguments: rt.arguments,
+                    output: "已中断".to_string(),
+                    expanded: false,
+                    duration_ms,
+                };
             }
         }
         if let Some(overlay) = app.info_overlay.as_mut() {
@@ -1750,7 +1759,6 @@ async fn handle_event(
             app.dismiss_overlay();
         }
         if interrupted || !matches!(app.status, Status::Idle | Status::Error(_)) {
-            app.last_tool_label = None;
             app.status = Status::Idle;
             app.push_block(DotColor::Yellow, "已中断当前执行");
             app.clear_key_arms();
@@ -2119,8 +2127,7 @@ async fn handle_event(
                             app.output.clear();
                             app.stream_buffer.clear();
                             app.streaming = false;
-                            app.last_tool_label = None;
-                            app.running_tool_output_idx = None;
+                            app.running_tools.clear();
                             app.scroll = 0;
                             app.stick_to_bottom = true;
                             app.input.clear();
@@ -2980,32 +2987,28 @@ async fn handle_agent_event(
             }
         }
         AgentEvent::ToolCallStarted {
-            tool_call_id: _,
+            tool_call_id,
             name,
             input,
         } => {
             app.finalize_stream();
             let args = one_line(&input);
             let label = format_tool_label(&name, &args, app.viewport_width);
-            app.last_tool_label = Some(label.clone());
-            app.last_tool_args = Some(input.clone());
-            app.tool_start_time = Some(Instant::now());
-            app.push_running_tool(&label);
+            app.push_running_tool(&tool_call_id, &label, &input);
             app.status = Status::Tool(label);
             app.blink_on = true;
             app.last_blink = Instant::now();
         }
         AgentEvent::ToolCallFinished {
-            tool_call_id: _,
+            tool_call_id,
             name,
             output,
             ok,
         } => {
-            let duration_ms = app.tool_start_time.take().map(|t| t.elapsed().as_millis() as u64);
-            app.complete_running_tool(&name, output.trim(), ok, duration_ms);
-            app.last_tool_label = None;
-            app.last_tool_args = None;
-            app.status = Status::Thinking;
+            app.complete_running_tool(&tool_call_id, &name, output.trim(), ok);
+            if app.running_tools.is_empty() {
+                app.status = Status::Thinking;
+            }
             app.blink_on = true;
             app.last_blink = Instant::now();
             refresh_session_state(app, store).await;
@@ -3168,8 +3171,7 @@ async fn load_session_into_output(
     app.status = Status::Idle;
     app.context_used = None;
     app.context_limit = None;
-    app.last_tool_label = None;
-    app.running_tool_output_idx = None;
+    app.running_tools.clear();
     app.running_hook_output_idx = None;
     app.active_hooks.clear();
     app.last_copyable_output = None;
@@ -3282,7 +3284,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // 标题栏
             Constraint::Min(1),    // 输出区域
             Constraint::Length(1), // 分隔线
             Constraint::Length(info_height),
@@ -3291,11 +3292,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(size);
 
-    let header_area = chunks[0];
-    let output_area = chunks[1];
-    let info_area = chunks[3];
-    let input_area = chunks[4];
-    let status_area = chunks[5];
+    let output_area = chunks[0];
+    let info_area = chunks[2];
+    let input_area = chunks[3];
+    let status_area = chunks[4];
 
     app.viewport_width = output_area.width;
 
@@ -3316,32 +3316,6 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .scroll((app.scroll, 0))
         .style(output_style);
     frame.render_widget(output_widget, output_area);
-
-    // 标题栏
-    let mode_label = match app.permission_mode {
-        PermissionMode::Default => "默认",
-        PermissionMode::Plan => "计划",
-        PermissionMode::AcceptEdits => "自动编辑",
-        PermissionMode::BypassPermissions => "绕过",
-    };
-    let mode_style = match app.permission_mode {
-        PermissionMode::Default => Style::default().fg(COLOR_TEXT),
-        PermissionMode::Plan => Style::default().fg(Color::Yellow),
-        PermissionMode::AcceptEdits => Style::default().fg(Color::Green),
-        PermissionMode::BypassPermissions => Style::default().fg(Color::Red),
-    };
-    let header_spans = vec![
-        Span::styled(" ZeroBot ", Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(format!("{} ", app.model), Style::default().fg(COLOR_TEXT)),
-        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(format!("{} ", mode_label), mode_style),
-        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
-        Span::styled("Ctrl+H 帮助", Style::default().fg(COLOR_MUTED)),
-    ];
-    let header_widget = Paragraph::new(Line::from(header_spans))
-        .style(Style::default().bg(COLOR_PANEL_BG));
-    frame.render_widget(header_widget, header_area);
 
     let info_widget = Paragraph::new(Text::from(info_lines))
         .block(
@@ -3448,13 +3422,12 @@ fn build_status_bar(app: &App) -> Vec<Span<'static>> {
         }
         _ => "-".to_string(),
     };
-    let commands = app.command_hint();
 
     let mode_label = match app.permission_mode {
-        PermissionMode::Default => "Mode: Default",
-        PermissionMode::Plan => "Mode: Plan",
-        PermissionMode::AcceptEdits => "Mode: AcceptEdits",
-        PermissionMode::BypassPermissions => "Mode: Bypass",
+        PermissionMode::Default => "",
+        PermissionMode::Plan => "计划",
+        PermissionMode::AcceptEdits => "自动编辑",
+        PermissionMode::BypassPermissions => "绕过",
     };
     let mode_style = match app.permission_mode {
         PermissionMode::Default => Style::default().fg(COLOR_TEXT),
@@ -3464,14 +3437,15 @@ fn build_status_bar(app: &App) -> Vec<Span<'static>> {
     };
 
     let mut spans = vec![
-        Span::styled(format!("Session: {} ", app.session_id), Style::default().fg(COLOR_TEXT)),
-        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(format!("{} / {} ", app.provider_id, app.model), Style::default().fg(COLOR_TEXT)),
-        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(format!("{mode_label} "), mode_style),
-        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
-        Span::styled(format!("Tokens: {used}/{limit}/{percent} "), Style::default().fg(COLOR_TEXT)),
+        Span::styled(" ZeroBot ", Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} ", app.model), Style::default().fg(COLOR_TEXT)),
     ];
+    if !mode_label.is_empty() {
+        spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
+        spans.push(Span::styled(format!("{} ", mode_label), mode_style));
+    }
+    spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
+    spans.push(Span::styled(format!("{used}/{limit} ({percent}) "), Style::default().fg(COLOR_TEXT)));
 
     if app.session_turn_count > 0 {
         let total = app.session_input_tokens + app.session_output_tokens;
@@ -3484,20 +3458,18 @@ fn build_status_bar(app: &App) -> Vec<Span<'static>> {
         spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
         spans.push(Span::styled(
             format!(
-                "Cost: {}tok (cache: {}, hit: {}) ",
+                "{}tok cache:{}({}) ",
                 format_token_count(total),
                 format_token_count(cache_total),
                 cache_rate,
             ),
             Style::default().fg(COLOR_TEXT),
         ));
-        // Show last turn cost if available
         if let Some(last_turn) = app.turn_costs.last() {
             let turn_num = app.turn_costs.len();
-            let turn_total = last_turn.input_tokens + last_turn.output_tokens;
             spans.push(Span::styled(
                 format!(
-                    "T{}: {}in/{}out ",
+                    "T{}: {}/{} ",
                     turn_num,
                     format_token_count(last_turn.input_tokens),
                     format_token_count(last_turn.output_tokens),
@@ -3505,10 +3477,6 @@ fn build_status_bar(app: &App) -> Vec<Span<'static>> {
                 Style::default().fg(COLOR_ACCENT_DIM),
             ));
         }
-    }
-    if !commands.is_empty() {
-        spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
-        spans.push(Span::styled(format!("Commands: {commands} "), Style::default().fg(COLOR_TEXT)));
     }
     if let Some(notice) = &app.status_notice {
         spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
@@ -4657,7 +4625,7 @@ fn format_tool_box_lines(lines: &[String], width: u16) -> Vec<Line<'static>> {
 fn format_tool_output_lines(
     color: DotColor,
     tool_name: &str,
-    label: Option<&str>,
+    _label: Option<&str>,
     arguments: &str,
     output: &str,
     width: u16,
@@ -4673,35 +4641,42 @@ fn format_tool_output_lines(
     };
     let always_full = is_full_output_tool(tool_name) || default_lines == 0;
 
-    let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
+    // Extract meaningful content from tool output (strips XML wrapper tags)
+    let (display_output, stderr_output) = if matches!(tool_name, "bash" | "shell") {
+        extract_stdout_stderr(output)
+    } else {
+        extract_tool_content(output)
+    };
+
+    let lines: Vec<String> = display_output.lines().map(|s| s.to_string()).collect();
     let (lines, omitted) = if show_full || always_full {
         (lines, 0)
     } else {
-        truncate_lines(output, default_lines)
+        truncate_lines(&display_output, default_lines)
     };
 
     let mut out = Vec::new();
 
-    // 标题行：图标 + 工具名 + 耗时
+    // 标题行：图标 + 工具名 + 关键参数 + 耗时
     let mut header = Vec::new();
     header.push(tool_dot_span(color));
     header.push(Span::raw(" "));
-    if let Some(label) = label {
+    header.push(Span::styled(
+        tool_name.to_string(),
+        Style::default().fg(COLOR_TEXT).add_modifier(Modifier::BOLD),
+    ));
+    // Show key argument summary
+    if let Some(args_summary) = format_tool_args_summary(tool_name, arguments) {
         header.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(COLOR_TEXT),
-        ));
-    } else {
-        header.push(Span::styled(
-            tool_name.to_string(),
-            Style::default().fg(COLOR_TEXT),
+            format!("({})", args_summary),
+            Style::default().fg(COLOR_MUTED),
         ));
     }
     if let Some(ms) = duration_ms {
         let time_str = if ms < 1000 {
-            format!(" ({}ms)", ms)
+            format!(" {}ms", ms)
         } else {
-            format!(" ({:.1}s)", ms as f64 / 1000.0)
+            format!(" {:.1}s", ms as f64 / 1000.0)
         };
         header.push(Span::styled(
             time_str,
@@ -4716,7 +4691,19 @@ fn format_tool_output_lines(
     if omitted > 0 {
         content_lines.push(format!("... 已省略 {} 行", omitted));
     }
-    out.extend(format_tool_box_lines(&content_lines, width));
+    // Append stderr if present (error case)
+    if let Some(ref stderr) = stderr_output {
+        if !stderr.trim().is_empty() {
+            content_lines.push(String::new());
+            content_lines.push("[stderr]".to_string());
+            for line in stderr.lines() {
+                content_lines.push(line.to_string());
+            }
+        }
+    }
+    if !content_lines.is_empty() {
+        out.extend(format_tool_box_lines(&content_lines, width));
+    }
     out
 }
 
@@ -4779,6 +4766,168 @@ fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
 
 fn is_full_output_tool(name: &str) -> bool {
     matches!(name, "write" | "apply_patch" | "edit")
+}
+
+/// Parse tool arguments JSON and return a concise display summary per tool type.
+fn format_tool_args_summary(tool_name: &str, arguments: &str) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let obj = args.as_object()?;
+    // Helper: get a value by trying multiple key names (camelCase first, then snake_case)
+    let get_str = |keys: &[&str]| -> Option<&str> {
+        for key in keys {
+            if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
+                return Some(s);
+            }
+        }
+        None
+    };
+    let get_u64 = |keys: &[&str]| -> Option<u64> {
+        for key in keys {
+            if let Some(v) = obj.get(*key).and_then(|v| v.as_u64()) {
+                return Some(v);
+            }
+        }
+        None
+    };
+    let result = match tool_name {
+        "read" => {
+            let path = get_str(&["filePath", "file_path", "path"])?;
+            let mut s = path.to_string();
+            if let Some(offset) = get_u64(&["offset"]) {
+                if let Some(limit) = get_u64(&["limit"]) {
+                    s += &format!(" ({}-{})", offset, offset + limit);
+                }
+            }
+            Some(s)
+        }
+        "write" | "edit" | "apply_patch" | "patch" => {
+            let path = get_str(&["filePath", "file_path", "path"])?;
+            Some(path.to_string())
+        }
+        "bash" | "shell" => {
+            let cmd = get_str(&["command"])?;
+            truncate_str(cmd, 80)
+        }
+        "glob" | "grep" => {
+            get_str(&["pattern", "query"]).map(String::from)
+        }
+        "skill" => get_str(&["name"]).map(String::from),
+        "subagent" => {
+            let name = get_str(&["name"]).unwrap_or("subagent");
+            let prompt = get_str(&["prompt"]).unwrap_or("");
+            let brief = truncate_str(prompt, 60).unwrap_or_default();
+            Some(format!("{}: {}", name, brief))
+        }
+        "todowrite" | "todoread" => None,
+        "cron" => get_str(&["schedule", "cron"]).map(String::from),
+        "message" => get_str(&["content"])
+            .map(|s| truncate_str(s, 60).unwrap_or_default()),
+        "request_user_input" => get_str(&["prompt", "question"])
+            .map(|s| truncate_str(s, 60).unwrap_or_default()),
+        _ => None,
+    };
+    // Fall back to generic if specific handler returned None
+    result.or_else(|| generic_args_summary(obj))
+}
+
+fn truncate_str(s: &str, max: usize) -> Option<String> {
+    if s.is_empty() {
+        return None;
+    }
+    if s.chars().count() <= max {
+        Some(s.to_string())
+    } else {
+        let truncated: String = s.chars().take(max - 3).collect();
+        Some(format!("{}...", truncated))
+    }
+}
+
+/// Generic fallback: pick the first meaningful string value from args.
+fn generic_args_summary(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let preferred_keys = ["name", "pattern", "query", "command", "filePath", "file_path", "path", "prompt", "content", "message"];
+    for key in &preferred_keys {
+        if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return truncate_str(s, 80);
+            }
+        }
+    }
+    None
+}
+
+/// Extract meaningful content from tool output XML, stripping wrapper tags.
+/// Returns (display_content, None) - stderr is not used for non-bash tools.
+fn extract_tool_content(output: &str) -> (String, Option<String>) {
+    // Tools like read produce nested XML:
+    //   <content><path>...</path><type>...</type><content>actual content</content><summary>...</summary></content>
+    // We need the INNER <content> (2nd occurrence), not the outer wrapper.
+    let content = extract_xml_tag_second(output, "content")
+        .or_else(|| extract_xml_tag(output, "content"));
+    if let Some(content) = content {
+        let mut result = content;
+        if let Some(summary) = extract_xml_tag(output, "summary") {
+            result.push_str("\n");
+            result.push_str(&summary);
+        }
+        return (result, None);
+    }
+    // Directory listing: <entries>...</entries>
+    if let Some(entries) = extract_xml_tag(output, "entries") {
+        let mut result = entries;
+        if let Some(summary) = extract_xml_tag(output, "summary") {
+            result.push_str("\n");
+            result.push_str(&summary);
+        }
+        return (result, None);
+    }
+    // Generic: <output>...</output>
+    if let Some(inner) = extract_xml_tag(output, "output") {
+        return (inner, None);
+    }
+    // No XML structure found, return as-is
+    (output.to_string(), None)
+}
+
+/// Extract the SECOND occurrence of an XML tag (for nested tags like <content>).
+fn extract_xml_tag_second(text: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{}>", tag);
+    let end_tag = format!("</{}>", tag);
+    // Find first occurrence
+    let first_start = text.find(&start_tag)?;
+    let first_end = text.find(&end_tag)? + end_tag.len();
+    // Find second occurrence after the first
+    let rest = &text[first_end..];
+    let second_start = rest.find(&start_tag)? + start_tag.len();
+    let second_end = rest.find(&end_tag)?;
+    Some(rest[second_start..second_end].trim().to_string())
+}
+
+/// Extract stdout and stderr from bash tool XML output.
+fn extract_stdout_stderr(output: &str) -> (String, Option<String>) {
+    let stdout = extract_xml_tag(output, "stdout");
+    let stderr = extract_xml_tag(output, "stderr");
+    let exit_code = extract_xml_tag(output, "exit_code");
+    let stderr_non_empty = stderr.filter(|s| !s.trim().is_empty());
+    // If exit code is non-zero and stderr exists, it's an error
+    let is_error = exit_code
+        .as_deref()
+        .and_then(|c| c.trim().parse::<i32>().ok())
+        .map(|c| c != 0)
+        .unwrap_or(false);
+    if is_error {
+        let stdout_clean = stdout.unwrap_or_default();
+        (stdout_clean, stderr_non_empty)
+    } else {
+        (stdout.unwrap_or_else(|| output.to_string()), None)
+    }
+}
+
+fn extract_xml_tag(text: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{}>", tag);
+    let end_tag = format!("</{}>", tag);
+    let start = text.find(&start_tag)? + start_tag.len();
+    let end = text.find(&end_tag)?;
+    Some(text[start..end].trim().to_string())
 }
 
 fn one_line(text: &str) -> String {
