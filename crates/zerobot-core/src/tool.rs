@@ -480,6 +480,50 @@ impl ToolRegistry {
         self.register(SendMessageTool::new(dispatcher));
         self
     }
+
+    /// 按工具名白名单过滤，返回新的 ToolRegistry
+    pub fn with_allowlist(&self, allowed: &[String]) -> Self {
+        let allowed_set: HashSet<String> = allowed.iter().cloned().collect();
+        let filtered: HashMap<String, Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|(name, _)| allowed_set.contains(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        Self {
+            tools: filtered,
+            plugins: self.plugins.clone(),
+            memory_manager: self.memory_manager.clone(),
+        }
+    }
+
+    /// 按工具名黑名单过滤，返回新的 ToolRegistry
+    pub fn with_blocklist(&self, blocked: &[String]) -> Self {
+        let blocked_set: HashSet<String> = blocked.iter().cloned().collect();
+        let filtered: HashMap<String, Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|(name, _)| !blocked_set.contains(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        Self {
+            tools: filtered,
+            plugins: self.plugins.clone(),
+            memory_manager: self.memory_manager.clone(),
+        }
+    }
+
+    /// 按 toolset 名称过滤，返回新的 ToolRegistry
+    pub fn with_toolsets(
+        &self,
+        toolset_registry: &crate::toolset::ToolsetRegistry,
+        names: &[String],
+    ) -> crate::error::ZeroBotResult<Self> {
+        let allowed = toolset_registry.resolve_many(names)?;
+        Ok(self.with_allowlist(&allowed))
+    }
 }
 
 pub struct SubagentTool {
