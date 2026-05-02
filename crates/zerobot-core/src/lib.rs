@@ -29,6 +29,7 @@ pub mod prompt;
 pub mod provider;
 pub mod session;
 pub mod skills;
+pub mod swarm;
 pub mod task;
 pub mod tool;
 pub mod toolset;
@@ -84,3 +85,4 @@ pub use notification::{Notification, NotificationBus, NotificationSender, Notifi
 pub use skill_manage::SkillManageTool;
 pub use self_review::SelfReviewer;
 pub use curator::Curator;
+pub use swarm::{BackendType, SwarmManager, TeammateBackend, TeammateConfig, TeammateHandle};
