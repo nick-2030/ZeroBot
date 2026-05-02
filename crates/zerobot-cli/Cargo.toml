@@ -27,3 +27,4 @@ unicode-width.workspace = true
 syntect.workspace = true
 
 zerobot-core = { path = "../zerobot-core" }
+zerobot-sdk = { path = "../zerobot-sdk" }

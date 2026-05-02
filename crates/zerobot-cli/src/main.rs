@@ -400,84 +400,24 @@ async fn handle_provider_cmd(settings: &Settings, cwd: &PathBuf, cmd: ProviderCm
 }
 
 async fn run_exec(
-    settings: &Settings,
+    _settings: &Settings,
     cwd: &PathBuf,
     provider_override: Option<String>,
     model_override: Option<String>,
     prompt: &str,
 ) -> Result<()> {
-    let workspace_root = resolve_workspace_root(cwd);
-    let db_path = resolve_session_db_path(&workspace_root);
-    let store = SqliteSessionStore::new(db_path).await?;
-    store.init().await?;
-    let hooks = zerobot_core::hooks::HookManager::load(settings, cwd, None)?;
-    let session = create_session_with_hooks(
-        &store,
-        &hooks,
-        "一次性执行".to_string(),
-        None,
-        zerobot_core::session::SessionKind::Main,
-    )
-    .await?;
-    let _log_guard = init_logging(settings, Some(&session.id))?;
-
-    let model = resolve_model(
-        settings,
-        provider_override.as_deref(),
-        model_override.as_deref(),
-    )?;
-    let approvals = store.list_tool_approvals().await.unwrap_or_default();
-    let store = Arc::new(store);
-    let provider_factory = {
-        let settings = settings.clone();
-        let provider_override = provider_override.clone();
-        Arc::new(move || {
-            build_provider(&settings, provider_override.as_deref())
-                .map_err(|err| ZeroBotError::Provider(err.to_string()))
-        })
-    };
-    let provider = (provider_factory)()?;
-    let tool_approvals = Arc::new(TokioRwLock::new(
-        approvals.into_iter().collect::<HashSet<_>>(),
-    ));
-    let plugins = PluginManager::new(settings, cwd).await?;
-    let mut tools =
-        ToolRegistry::with_builtin_async(settings, cwd, Some(store.clone()), plugins.clone())
-            .await?;
-    let subagent_tools = tools.clone();
-    tools.register(SubagentTool::new(
-        settings.clone(),
-        store.clone(),
-        subagent_tools,
-        cwd.clone(),
-        provider_factory.clone(),
-        model.clone(),
-        hooks.clone(),
-        None,
-        tool_approvals.clone(),
-    ));
-    let agent = Agent::new(
-        provider,
-        model,
-        settings.clone(),
-        store,
-        tools,
-        cwd.clone(),
-        hooks.clone(),
-        None,
-        plugins.clone(),
-        tool_approvals.clone(),
-        None,
-        None,
-    );
-
-    let result = agent.run_turn(&session.id, prompt, None).await;
-    end_session_with_hooks(&hooks, &session.id).await;
-    if let Some(plugins) = &plugins {
-        plugins.shutdown().await;
+    let mut builder = zerobot_sdk::Options::builder().cwd(cwd.clone());
+    if let Some(provider) = provider_override {
+        builder = builder.provider(provider);
     }
-    let output = result?;
-    println!("{output}");
+    if let Some(model) = model_override {
+        builder = builder.model(model);
+    }
+    let client = zerobot_sdk::ZeroBot::new(builder.build()).await?;
+    let session = client.start_session(Some("一次性执行".to_string())).await?;
+    let result = session.run(prompt).await?;
+    client.shutdown().await;
+    println!("{result}");
     Ok(())
 }
 

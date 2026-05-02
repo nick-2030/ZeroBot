@@ -147,6 +147,11 @@ pub trait SessionStore: Send + Sync {
         ))
     }
     async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()>;
+    async fn update_session_title(&self, _session_id: &str, _title: &str) -> ZeroBotResult<()> {
+        Err(ZeroBotError::SessionStore(
+            "rename not supported".to_string(),
+        ))
+    }
     async fn search_messages(
         &self,
         session_id: &str,
@@ -718,6 +723,17 @@ impl SessionStore for SqliteSessionStore {
 
     async fn delete_session(&self, session_id: &str) -> ZeroBotResult<()> {
         sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_session_title(&self, session_id: &str, title: &str) -> ZeroBotResult<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(title)
+            .bind(now)
             .bind(session_id)
             .execute(&self.pool)
             .await?;

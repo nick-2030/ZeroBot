@@ -4869,6 +4869,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width 0.1.14",
  "zerobot-core",
+ "zerobot-sdk",
 ]
 
 [[package]]
@@ -4908,10 +4909,17 @@ dependencies = [
 
 [[package]]
 name = "zerobot-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
+ "uuid",
  "zerobot-core",
 ]
 
