@@ -37,6 +37,7 @@ pub struct HeartbeatService {
 }
 
 impl HeartbeatService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workspace: PathBuf,
         provider_factory: ProviderFactory,

@@ -118,18 +118,12 @@ struct PluginClient {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 struct PluginAuthStore {
     #[serde(default)]
     providers: HashMap<String, JsonValue>,
 }
 
-impl Default for PluginAuthStore {
-    fn default() -> Self {
-        Self {
-            providers: HashMap::new(),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct PluginManager {

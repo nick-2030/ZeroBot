@@ -314,7 +314,7 @@ impl LocalMcpClient {
                 McpLocalProtocol::ContentLength => {
                     let framed = format!(
                         "Content-Length: {}\r\n\r\n{}",
-                        payload.as_bytes().len(),
+                        payload.len(),
                         payload
                     );
                     stdin.write_all(framed.as_bytes()).await?;
@@ -359,7 +359,7 @@ impl LocalMcpClient {
             McpLocalProtocol::ContentLength => {
                 let framed = format!(
                     "Content-Length: {}\r\n\r\n{}",
-                    payload.as_bytes().len(),
+                    payload.len(),
                     payload
                 );
                 stdin.write_all(framed.as_bytes()).await?;
@@ -462,7 +462,7 @@ async fn read_jsonrpc_response(
 
         let lower = trimmed.to_ascii_lowercase();
         if lower.starts_with("content-length:") {
-            let value = trimmed.splitn(2, ':').nth(1).unwrap_or("").trim();
+            let value = trimmed.split_once(':').map(|x| x.1).unwrap_or("").trim();
             if let Ok(length) = value.parse::<usize>() {
                 content_length = Some(length);
             }

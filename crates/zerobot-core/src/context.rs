@@ -206,7 +206,7 @@ impl ContextManager {
 
         let estimated_tokens = estimate_tokens(
             system.as_deref().unwrap_or_default().chars().count()
-                + messages.iter().map(|msg| message_chars(msg)).sum::<usize>(),
+                + messages.iter().map(message_chars).sum::<usize>(),
         );
         let context_limit = resolve_context_limit(&self.settings, model);
 
@@ -305,7 +305,7 @@ fn resolve_context_limit(settings: &Settings, model: &str) -> Option<u32> {
 }
 
 fn estimate_tokens(chars: usize) -> usize {
-    (chars + 3) / 4
+    chars.div_ceil(4)
 }
 
 fn message_chars(message: &ProviderMessage) -> usize {

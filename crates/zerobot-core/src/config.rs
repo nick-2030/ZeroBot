@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Settings {
     #[serde(default)]
     pub version: Option<String>,
@@ -116,8 +117,10 @@ pub enum ToolApprovalMode {
 /// Session-level permission mode that acts as an envelope over per-tool decisions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PermissionMode {
     /// Default behavior: per-tool Auto/Prompt/Deny decisions apply.
+    #[default]
     Default,
     /// Read-only mode: all write/execute tools require explicit approval.
     Plan,
@@ -127,11 +130,6 @@ pub enum PermissionMode {
     BypassPermissions,
 }
 
-impl Default for PermissionMode {
-    fn default() -> Self {
-        PermissionMode::Default
-    }
-}
 
 impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -446,6 +444,7 @@ fn default_log_level() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct GatewaySettings {
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
@@ -562,6 +561,7 @@ fn default_feishu_reaction_mode() -> FeishuReactionMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct McpSettings {
     #[serde(default)]
     pub enabled: bool,
@@ -878,16 +878,13 @@ pub enum McpServerConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum McpLocalProtocol {
+    #[default]
     ContentLength,
     Line,
 }
 
-impl Default for McpLocalProtocol {
-    fn default() -> Self {
-        McpLocalProtocol::ContentLength
-    }
-}
 
 impl McpServerConfig {
     pub fn name(&self) -> &str {
@@ -905,32 +902,6 @@ impl McpServerConfig {
     }
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            version: None,
-            providers: HashMap::new(),
-            default_provider: None,
-            default_model: None,
-            session: SessionSettings::default(),
-            tools: ToolSettings::default(),
-            agent: AgentSettings::default(),
-            context: ContextSettings::default(),
-            instructions: Vec::new(),
-            logging: LoggingSettings::default(),
-            gateway: GatewaySettings::default(),
-            channels: ChannelsSettings::default(),
-            mcp: McpSettings::default(),
-            skills: SkillsSettings::default(),
-            memory: MemorySettings::default(),
-            self_review: SelfReviewSettings::default(),
-            curator: CuratorSettings::default(),
-            plugins: PluginsSettings::default(),
-            kanban: KanbanSettings::default(),
-            swarm: SwarmSettings::default(),
-        }
-    }
-}
 
 impl Default for SessionSettings {
     fn default() -> Self {
@@ -1017,14 +988,6 @@ impl Default for LoggingSettings {
     }
 }
 
-impl Default for GatewaySettings {
-    fn default() -> Self {
-        Self {
-            heartbeat: HeartbeatSettings::default(),
-            cron: CronSettings::default(),
-        }
-    }
-}
 
 impl Default for HeartbeatSettings {
     fn default() -> Self {
@@ -1075,14 +1038,6 @@ impl Default for FeishuChannelSettings {
     }
 }
 
-impl Default for McpSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            servers: Vec::new(),
-        }
-    }
-}
 
 impl Default for SkillsSettings {
     fn default() -> Self {

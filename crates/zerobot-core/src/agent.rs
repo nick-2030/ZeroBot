@@ -111,6 +111,7 @@ pub struct Agent {
     tool_approvals: Arc<RwLock<HashSet<String>>>,
     tool_route: Option<ToolRouteContext>,
     outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    #[allow(dead_code)]
     denial_counts: DenialCounts,
     // 多智能体支持
     task_id: Option<TaskId>,
@@ -122,6 +123,7 @@ pub struct Agent {
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Box<dyn Provider>,
         model: String,
@@ -242,8 +244,7 @@ impl Agent {
                 created_at: Utc::now().timestamp(),
             })
             .await?;
-        let _ = self
-            .maybe_record_user_summary(session_id, &input_text)
+        self.maybe_record_user_summary(session_id, &input_text)
             .await?;
 
         let instruction_sources = crate::instruction::system_sources(&self.settings, &self.cwd);
@@ -262,7 +263,7 @@ impl Agent {
         loop {
             // 检查中断令牌
             if self.abort_token.is_cancelled() {
-                let _ = self.emit(&events, AgentEvent::Stop);
+                self.emit(&events, AgentEvent::Stop);
                 return Ok("任务被中断".to_string());
             }
 
@@ -274,7 +275,7 @@ impl Agent {
             // 迭代预算检查
             if let Some(budget) = self.iteration_budget {
                 if steps > budget as usize {
-                    let _ = self.emit(&events, AgentEvent::Stop);
+                    self.emit(&events, AgentEvent::Stop);
                     return Ok(format!("迭代预算耗尽 ({} 步)", budget));
                 }
             }
@@ -1103,7 +1104,7 @@ impl Agent {
     }
 
     fn summarize_first_user(&self, content: &str) -> String {
-        let mut text = content.trim().replace('\n', " ").replace('\r', " ");
+        let mut text = content.trim().replace(['\n', '\r'], " ");
         if text.chars().count() > 20 {
             text = text.chars().take(20).collect();
         }

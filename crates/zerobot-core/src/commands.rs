@@ -52,9 +52,9 @@ If there's already an AGENTS.md, improve it if it's located in {}\n",
     );
     let extra = extra.trim();
     if !extra.is_empty() {
-        prompt.push_str("\n");
+        prompt.push('\n');
         prompt.push_str(extra);
-        prompt.push_str("\n");
+        prompt.push('\n');
     }
     prompt
 }

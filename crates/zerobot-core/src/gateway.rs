@@ -102,6 +102,7 @@ pub struct GatewayRuntime {
 }
 
 impl GatewayRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         settings: Settings,
         cwd: PathBuf,

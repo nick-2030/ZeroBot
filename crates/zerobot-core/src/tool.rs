@@ -297,7 +297,7 @@ impl ToolRegistry {
     }
 
     pub fn is_read_only(&self, name: &str) -> bool {
-        self.tools.get(name).map_or(false, |t| t.is_read_only())
+        self.tools.get(name).is_some_and(|t| t.is_read_only())
     }
 
     /// Get the memory manager if memory system is enabled.
@@ -539,6 +539,7 @@ pub struct SubagentTool {
 }
 
 impl SubagentTool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         settings: Settings,
         store: Arc<dyn SessionStore>,
@@ -724,6 +725,7 @@ impl AgentDispatcherTool {
 
 #[derive(Debug, Deserialize)]
 struct AgentToolArgs {
+    #[allow(dead_code)]
     description: String,
     prompt: String,
     #[serde(default)]
@@ -735,6 +737,7 @@ struct AgentToolArgs {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     team_name: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
@@ -1128,7 +1131,7 @@ async fn truncate_tool_content(
     let direction = settings.direction;
 
     let lines: Vec<&str> = content.split('\n').collect();
-    let total_bytes = content.as_bytes().len();
+    let total_bytes = content.len();
 
     if lines.len() <= max_lines && total_bytes <= max_bytes {
         return Ok(TruncateResult {
@@ -1145,7 +1148,7 @@ async fn truncate_tool_content(
 
     if direction == ToolOutputDirection::Head {
         for line in lines.iter().take(max_lines) {
-            let size = line.as_bytes().len() + if out.is_empty() { 0 } else { 1 };
+            let size = line.len() + if out.is_empty() { 0 } else { 1 };
             if bytes + size > max_bytes {
                 hit_bytes = true;
                 break;
@@ -1155,7 +1158,7 @@ async fn truncate_tool_content(
         }
     } else {
         for line in lines.iter().rev().take(max_lines) {
-            let size = line.as_bytes().len() + if out.is_empty() { 0 } else { 1 };
+            let size = line.len() + if out.is_empty() { 0 } else { 1 };
             if bytes + size > max_bytes {
                 hit_bytes = true;
                 break;
@@ -1179,11 +1182,7 @@ async fn truncate_tool_content(
         "输出过长已截断（移除 {removed} {unit}）。完整输出已保存至: {output_path}。可使用 read 配合 offset/limit 或 grep 进行检索。"
     );
 
-    let truncated_preview = if direction == ToolOutputDirection::Head {
-        preview
-    } else {
-        preview
-    };
+    let truncated_preview = preview;
 
     Ok(TruncateResult {
         content: truncated_preview,
@@ -2249,14 +2248,13 @@ impl Tool for GlobTool {
             root.join(&args.pattern)
         };
         let mut results = Vec::new();
-        for entry in glob::glob(pattern.to_string_lossy().as_ref())
+        for path in glob::glob(pattern.to_string_lossy().as_ref())
             .map_err(|err| ZeroBotError::Tool(format!("glob 模式无效: {err}")))?
+            .flatten()
         {
-            if let Ok(path) = entry {
-                if let Ok(meta) = tokio::fs::metadata(&path).await {
-                    let mtime = meta.modified().map(system_time_to_ts).unwrap_or_default();
-                    results.push((path, mtime));
-                }
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                let mtime = meta.modified().map(system_time_to_ts).unwrap_or_default();
+                results.push((path, mtime));
             }
         }
         results.sort_by(|a, b| b.1.cmp(&a.1));

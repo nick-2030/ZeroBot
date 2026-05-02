@@ -42,6 +42,7 @@ pub struct Curator {
     provider_factory: ProviderFactory,
     model: String,
     settings: Settings,
+    #[allow(dead_code)]
     cwd: PathBuf,
     last_run: Arc<std::sync::Mutex<Option<i64>>>,
 }

@@ -240,7 +240,8 @@ impl SDKMessage {
             | AgentEvent::FileChanged { .. }
             | AgentEvent::HookSessionAdded { .. }
             | AgentEvent::HookSessionRemoved { .. }
-            | AgentEvent::SelfReviewCompleted { .. } => None,
+            | AgentEvent::SelfReviewCompleted { .. }
+            | AgentEvent::Stop => None,
         }
     }
 }

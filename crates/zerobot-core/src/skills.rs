@@ -397,8 +397,10 @@ struct SkillFrontmatter {
     #[serde(default)]
     created_at: Option<i64>,
     #[serde(default)]
+    #[allow(dead_code)]
     updated_at: Option<i64>,
     #[serde(default)]
+    #[allow(dead_code)]
     last_used_at: Option<i64>,
     #[serde(default)]
     use_count: Option<u64>,

@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -773,6 +774,7 @@ impl SessionStore for SqliteSessionStore {
 }
 
 impl MessageRole {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(raw: &str) -> Self {
         match raw {
             "system" => MessageRole::System,
@@ -784,6 +786,7 @@ impl MessageRole {
 }
 
 impl SessionKind {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(raw: &str) -> Self {
         match raw {
             "sub" => SessionKind::Sub,
@@ -810,22 +813,22 @@ impl StoredToolCall {
     }
 }
 
-impl ToString for MessageRole {
-    fn to_string(&self) -> String {
+impl fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MessageRole::System => "system".to_string(),
-            MessageRole::User => "user".to_string(),
-            MessageRole::Assistant => "assistant".to_string(),
-            MessageRole::Tool => "tool".to_string(),
+            MessageRole::System => write!(f, "system"),
+            MessageRole::User => write!(f, "user"),
+            MessageRole::Assistant => write!(f, "assistant"),
+            MessageRole::Tool => write!(f, "tool"),
         }
     }
 }
 
-impl ToString for SessionKind {
-    fn to_string(&self) -> String {
+impl fmt::Display for SessionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SessionKind::Main => "main".to_string(),
-            SessionKind::Sub => "sub".to_string(),
+            SessionKind::Main => write!(f, "main"),
+            SessionKind::Sub => write!(f, "sub"),
         }
     }
 }

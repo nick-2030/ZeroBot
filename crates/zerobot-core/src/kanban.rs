@@ -241,6 +241,7 @@ impl KanbanManager {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn row_to_task(&self, row: (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, String, String)) -> KanbanTask {
         let (id, title, description, status, assignee, parent_id, metadata, summary, created_at, updated_at) = row;
 

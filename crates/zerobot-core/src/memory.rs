@@ -475,6 +475,7 @@ impl MemoryStore {
         let lock_path = path.with_extension("md.lock");
         let lock_file = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&lock_path)
             .map_err(|e| ZeroBotError::Io(format!("创建锁文件失败: {}", e)))?;
@@ -552,22 +553,21 @@ fn dedup_entries(entries: &mut Vec<String>) {
 }
 
 fn resolve_memory_dir(dir: &str) -> PathBuf {
-    let expanded = if dir.starts_with("~/") || dir == "~" {
+    if dir.starts_with("~/") || dir == "~" {
         if let Some(home) = dirs_home() {
             home.join(&dir[2..])
         } else {
             PathBuf::from(dir)
         }
-    } else if dir.starts_with("~\\") {
+    } else if let Some(stripped) = dir.strip_prefix("~\\") {
         if let Some(home) = dirs_home() {
-            home.join(&dir[2..])
+            home.join(stripped)
         } else {
             PathBuf::from(dir)
         }
     } else {
         PathBuf::from(dir)
-    };
-    expanded
+    }
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -638,6 +638,7 @@ pub struct MemoryManager {
     store: MemoryStore,
     providers: Vec<Box<dyn MemoryProvider>>,
     has_external: bool,
+    #[allow(dead_code)]
     settings: MemorySettings,
 }
 

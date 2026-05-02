@@ -227,7 +227,7 @@ fn find_rules_files(root: &Path) -> Vec<PathBuf> {
             && entry
                 .path()
                 .extension()
-                .map_or(false, |e| e == "md")
+                .is_some_and(|e| e == "md")
         {
             files.push(entry.path().to_path_buf());
         }
@@ -276,7 +276,7 @@ fn mark_loaded(session_id: &str, path: &Path) -> bool {
     let mut guard = loaded_cache().lock().expect("loaded cache lock");
     let entry = guard
         .entry(session_id.to_string())
-        .or_insert_with(HashSet::new);
+        .or_default();
     entry.insert(canonical)
 }
 

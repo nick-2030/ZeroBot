@@ -46,9 +46,10 @@ pub struct AgentManager {
 
 impl AgentManager {
     pub fn new(cwd: &Path) -> Self {
-        let mut roots = Vec::new();
-        roots.push(cwd.join(".zerobot").join("agents"));
-        roots.push(expand_home("~/.zerobot/agents"));
+        let roots = vec![
+            cwd.join(".zerobot").join("agents"),
+            expand_home("~/.zerobot/agents"),
+        ];
         Self { roots }
     }
 

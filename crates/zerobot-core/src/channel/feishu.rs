@@ -264,14 +264,14 @@ impl FeishuChannel {
                         match msg {
                             Ok(Message::Text(text)) => {
                                 if let Some(reply) = self.handle_ws_text(&text).await {
-                                    if let Err(err) = ws.send(Message::Text(reply.into())).await {
+                                    if let Err(err) = ws.send(Message::Text(reply)).await {
                                         warn!("feishu ws pong send failed: {}", err);
                                     }
                                 }
                             }
                             Ok(Message::Binary(payload)) => {
                                 if let Some(reply) = self.handle_ws_binary(&payload).await {
-                                    if let Err(err) = ws.send(Message::Binary(reply.into())).await {
+                                    if let Err(err) = ws.send(Message::Binary(reply)).await {
                                         warn!("feishu ws binary reply send failed: {}", err);
                                     }
                                 }
@@ -369,12 +369,9 @@ impl FeishuChannel {
             .unwrap_or(0);
         let trace_id = header_value(&frame.headers, "trace_id").unwrap_or_default();
 
-        let Some(merged_payload) = self
+        let merged_payload = self
             .merge_ws_payload(&message_id, sum, seq, &trace_id, frame.payload.clone())
-            .await
-        else {
-            return None;
-        };
+            .await?;
 
         let raw: JsonValue = match serde_json::from_slice(&merged_payload) {
             Ok(v) => v,
@@ -460,10 +457,8 @@ impl FeishuChannel {
         }
 
         let mut merged = Vec::new();
-        for chunk in &entry.chunks {
-            if let Some(bytes) = chunk {
-                merged.extend_from_slice(bytes);
-            }
+        for bytes in entry.chunks.iter().flatten() {
+            merged.extend_from_slice(bytes);
         }
         cache.parts.remove(message_id);
         Some(merged)

@@ -64,6 +64,7 @@ pub struct SelfReviewer {
     store: Arc<dyn SessionStore>,
     memory_manager: Arc<Mutex<MemoryManager>>,
     skill_manager: Arc<SkillManager>,
+    #[allow(dead_code)]
     cwd: PathBuf,
     turn_counter: Arc<AtomicU32>,
 }
@@ -96,7 +97,7 @@ impl SelfReviewer {
     pub async fn maybe_review(&self, session_id: &str) -> ZeroBotResult<Option<String>> {
         let count = self.turn_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let interval = self.settings.self_review.interval;
-        if interval == 0 || count % interval != 0 {
+        if interval == 0 || !count.is_multiple_of(interval) {
             return Ok(None);
         }
 

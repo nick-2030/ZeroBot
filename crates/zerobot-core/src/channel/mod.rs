@@ -22,6 +22,12 @@ pub struct ChannelManager {
     dispatch_task: Option<JoinHandle<()>>,
 }
 
+impl Default for ChannelManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChannelManager {
     pub fn new() -> Self {
         Self {
