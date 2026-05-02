@@ -90,6 +90,9 @@ pub struct TodoItem {
     pub content: String,
     pub status: TodoStatus,
     pub priority: TodoPriority,
+    /// Present continuous form shown during execution, e.g. "Running tests" (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
 }
 
 #[async_trait]
@@ -291,6 +294,7 @@ impl SessionStore for SqliteSessionStore {
                 session_id TEXT NOT NULL,
                 position INTEGER NOT NULL,
                 content TEXT NOT NULL,
+                active_form TEXT,
                 status TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
@@ -302,6 +306,10 @@ impl SessionStore for SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
+        // Migration: add active_form column to existing tables
+        let _ = sqlx::query("ALTER TABLE todos ADD COLUMN active_form TEXT")
+            .execute(&self.pool)
+            .await;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);")
             .execute(&self.pool)
@@ -535,15 +543,15 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn get_todos(&self, session_id: &str) -> ZeroBotResult<Vec<TodoItem>> {
-        let rows = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT content, status, priority FROM todos WHERE session_id = ? ORDER BY position ASC",
+        let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT content, status, priority, active_form FROM todos WHERE session_id = ? ORDER BY position ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
 
         let mut items = Vec::new();
-        for (content, status_raw, priority_raw) in rows {
+        for (content, status_raw, priority_raw, active_form) in rows {
             let status = serde_json::from_str::<TodoStatus>(&format!("\"{status_raw}\""))
                 .map_err(|err| ZeroBotError::SessionStore(err.to_string()))?;
             let priority = serde_json::from_str::<TodoPriority>(&format!("\"{priority_raw}\""))
@@ -552,6 +560,7 @@ impl SessionStore for SqliteSessionStore {
                 content,
                 status,
                 priority,
+                active_form,
             });
         }
         Ok(items)
@@ -574,11 +583,12 @@ impl SessionStore for SqliteSessionStore {
                 .trim_matches('"')
                 .to_string();
             sqlx::query(
-                "INSERT INTO todos (session_id, position, content, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO todos (session_id, position, content, active_form, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(session_id)
             .bind(position as i64)
             .bind(&todo.content)
+            .bind(&todo.active_form)
             .bind(status)
             .bind(priority)
             .bind(now)
@@ -832,11 +842,13 @@ mod tests {
                 content: "第一步".to_string(),
                 status: TodoStatus::Pending,
                 priority: TodoPriority::High,
+                active_form: None,
             },
             TodoItem {
                 content: "第二步".to_string(),
                 status: TodoStatus::InProgress,
                 priority: TodoPriority::Medium,
+                active_form: Some("正在执行第二步".to_string()),
             },
         ];
 

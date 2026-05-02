@@ -2383,7 +2383,7 @@ impl Tool for TodoWriteTool {
     }
 
     fn description(&self) -> &str {
-        "创建或更新当前会话的待办列表（适合多步骤任务）。请提供完整列表并保持有且只有一项 in_progress，其余为 pending/completed/cancelled。"
+        "创建或更新当前会话的待办列表（适合多步骤任务）。请提供完整列表并保持有且只有一项 in_progress，其余为 pending/completed/cancelled。全部完成后自动清除。"
     }
 
     fn parameters(&self) -> JsonValue {
@@ -2396,7 +2396,8 @@ impl Tool for TodoWriteTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": { "type": "string", "description": "待办内容" },
+                            "content": { "type": "string", "description": "待办内容（祈使句，如 '运行测试'" },
+                            "active_form": { "type": "string", "description": "执行时显示的进行时形式（可选，如 '正在运行测试'" },
                             "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
                             "priority": { "type": "string", "enum": ["high", "medium", "low"] }
                         },

@@ -502,22 +502,99 @@ impl App {
         };
         lines.push(status_line);
         if !self.todos.is_empty() {
+            let total = self.todos.len();
+            let done = self
+                .todos
+                .iter()
+                .filter(|t| {
+                    matches!(t.status, TodoStatus::Completed | TodoStatus::Cancelled)
+                })
+                .count();
+            let in_progress = self
+                .todos
+                .iter()
+                .filter(|t| matches!(t.status, TodoStatus::InProgress))
+                .count();
+            let pending = total - done - in_progress;
+            let header = if done == total {
+                format!("Tasks: {done}/{total} done")
+            } else {
+                format!(
+                    "Tasks: {done}/{total} done, {in_progress} active, {pending} pending"
+                )
+            };
             lines.push(Line::from(Span::styled(
-                "Todo:",
+                header,
                 Style::default()
                     .add_modifier(Modifier::BOLD)
                     .fg(COLOR_ACCENT),
             )));
-            for item in self.todos.iter().take(2) {
-                let status = match item.status {
-                    TodoStatus::Pending => "pending",
-                    TodoStatus::InProgress => "in_progress",
-                    TodoStatus::Completed => "completed",
-                    TodoStatus::Cancelled => "cancelled",
+            // Show up to 8 items: in_progress first, then pending, then recently completed
+            let max_display: usize = 8;
+            let mut display_items: Vec<&TodoItem> = Vec::new();
+            // In-progress items first
+            display_items.extend(
+                self.todos
+                    .iter()
+                    .filter(|t| matches!(t.status, TodoStatus::InProgress)),
+            );
+            // Then pending
+            display_items.extend(
+                self.todos
+                    .iter()
+                    .filter(|t| matches!(t.status, TodoStatus::Pending)),
+            );
+            // Then completed/cancelled (up to remaining slots)
+            let remaining = max_display.saturating_sub(display_items.len());
+            display_items.extend(
+                self.todos
+                    .iter()
+                    .filter(|t| {
+                        matches!(t.status, TodoStatus::Completed | TodoStatus::Cancelled)
+                    })
+                    .take(remaining),
+            );
+            let hidden = total.saturating_sub(display_items.len());
+            for item in display_items {
+                let (icon, style) = match item.status {
+                    TodoStatus::InProgress => (
+                        "\u{25A0}", // ■
+                        Style::default()
+                            .fg(COLOR_ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    TodoStatus::Pending => {
+                        ("\u{25A1}", Style::default().fg(COLOR_TEXT)) // □
+                    }
+                    TodoStatus::Completed => (
+                        "\u{2713}", // ✓
+                        Style::default()
+                            .fg(COLOR_SUCCESS)
+                            .add_modifier(Modifier::CROSSED_OUT)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    TodoStatus::Cancelled => (
+                        "\u{2717}", // ✗
+                        Style::default()
+                            .fg(COLOR_MUTED)
+                            .add_modifier(Modifier::CROSSED_OUT)
+                            .add_modifier(Modifier::DIM),
+                    ),
                 };
+                let display_text = if matches!(item.status, TodoStatus::InProgress) {
+                    item.active_form.as_deref().unwrap_or(&item.content)
+                } else {
+                    &item.content
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {icon} "), style),
+                    Span::styled(display_text.to_string(), style),
+                ]));
+            }
+            if hidden > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("  [{status}] {}", item.content),
-                    Style::default().fg(COLOR_TEXT),
+                    format!("  ... +{hidden} more"),
+                    Style::default().fg(COLOR_MUTED),
                 )));
             }
         }
@@ -2238,6 +2315,17 @@ async fn handle_agent_event(
 async fn refresh_session_state(app: &mut App, store: &std::sync::Arc<dyn SessionStore>) {
     if let Ok(todos) = store.get_todos(&app.session_id).await {
         app.todos = todos;
+    }
+    // Auto-clear completed todos when agent is idle (like Claude Code's auto-hide)
+    if !app.todos.is_empty()
+        && matches!(app.status, Status::Idle)
+        && app
+            .todos
+            .iter()
+            .all(|t| matches!(t.status, TodoStatus::Completed | TodoStatus::Cancelled))
+    {
+        let _ = store.set_todos(&app.session_id, &[]).await;
+        app.todos.clear();
     }
 }
 
