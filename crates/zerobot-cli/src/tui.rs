@@ -1,4 +1,4 @@
-use crate::slash::{SlashMatch, SlashRegistry};
+use crate::slash::{SlashCommandKind, SlashCommandOrigin, SlashMatch, SlashRegistry};
 use anyhow::Result;
 use base64::Engine as _;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -64,6 +64,11 @@ const COLOR_WARN: Color = Color::Rgb(234, 196, 118);
 const LOGO_COLOR: Color = COLOR_ACCENT;
 const BORDER_COLOR: Color = COLOR_PANEL_BORDER;
 const DOUBLE_PRESS_WINDOW_MS: u64 = 900;
+// 新增语义颜色
+const COLOR_THINKING: Color = Color::Rgb(100, 100, 120);
+const COLOR_TOOL_BORDER: Color = Color::Rgb(80, 90, 110);
+const COLOR_PERMISSION: Color = Color::Rgb(100, 149, 237);
+const COLOR_PLAN_MODE: Color = Color::Rgb(0, 191, 165);
 
 #[derive(Clone)]
 enum Status {
@@ -559,6 +564,28 @@ impl App {
             )),
         };
         lines.push(status_line);
+        // 权限模式指示器
+        match self.permission_mode {
+            PermissionMode::Plan => {
+                lines.push(Line::from(Span::styled(
+                    "计划模式 - 只读操作，写入需要确认",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )));
+            }
+            PermissionMode::AcceptEdits => {
+                lines.push(Line::from(Span::styled(
+                    "自动编辑模式 - 文件编辑自动批准",
+                    Style::default().fg(Color::Green),
+                )));
+            }
+            PermissionMode::BypassPermissions => {
+                lines.push(Line::from(Span::styled(
+                    "绕过权限模式 - 所有操作自动批准",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )));
+            }
+            PermissionMode::Default => {}
+        }
         if !self.active_hooks.is_empty() {
             let hook_count = self.active_hooks.len();
             let label = if hook_count == 1 {
@@ -1582,6 +1609,111 @@ async fn handle_event(
                 }
                 return Ok(true);
             }
+            // Ctrl+L: 清屏重绘
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
+                app.output.clear();
+                app.scroll = 0;
+                app.stick_to_bottom = true;
+                app.status_notice = Some("屏幕已清除".to_string());
+                return Ok(true);
+            }
+            // Ctrl+U: 清除当前输入行
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+                app.input.clear();
+                app.cursor = 0;
+                app.slash_query = None;
+                app.slash_matches.clear();
+                return Ok(true);
+            }
+            // Ctrl+W: 删除前一个单词
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('w') {
+                if app.cursor > 0 {
+                    let before = &app.input[..app.cursor];
+                    let trimmed = before.trim_end();
+                    let last_space = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                    app.input.drain(last_space..app.cursor);
+                    app.cursor = last_space;
+                }
+                return Ok(true);
+            }
+            // Ctrl+A: 光标移到行首
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+                app.cursor = 0;
+                return Ok(true);
+            }
+            // Ctrl+E: 光标移到行尾
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+                app.cursor = app.input.len();
+                return Ok(true);
+            }
+            // Ctrl+K: 删除光标到行尾
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+                app.input.truncate(app.cursor);
+                return Ok(true);
+            }
+            // Ctrl+D: 退出程序（空闲时）
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+                let busy = is_busy(app, runner);
+                let idle = !busy && app.info_overlay.is_none() && matches!(app.status, Status::Idle);
+                if idle {
+                    *should_quit = true;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            // Shift+Tab: 切换权限模式
+            if key.code == KeyCode::BackTab {
+                app.permission_mode = match app.permission_mode {
+                    PermissionMode::Default => PermissionMode::Plan,
+                    PermissionMode::Plan => PermissionMode::AcceptEdits,
+                    PermissionMode::AcceptEdits => PermissionMode::Default,
+                    PermissionMode::BypassPermissions => PermissionMode::Default,
+                };
+                let mode_name = match app.permission_mode {
+                    PermissionMode::Default => "默认",
+                    PermissionMode::Plan => "计划",
+                    PermissionMode::AcceptEdits => "自动编辑",
+                    PermissionMode::BypassPermissions => "绕过",
+                };
+                app.status_notice = Some(format!("权限模式: {mode_name}"));
+                return Ok(true);
+            }
+            // Ctrl+H: 显示帮助信息
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+                let help_text = r#"快捷键帮助:
+  Ctrl+L    清屏重绘
+  Ctrl+U    清除当前输入
+  Ctrl+W    删除前一个单词
+  Ctrl+A    光标移到行首
+  Ctrl+E    光标移到行尾
+  Ctrl+K    删除到行尾
+  Ctrl+D    退出程序
+  Ctrl+P    切换权限模式
+  Ctrl+T    显示成本统计
+  Ctrl+O    切换工具输出显示
+  Ctrl+H    显示此帮助
+  Shift+Tab 切换权限模式
+  Esc       中断/回退
+  Ctrl+C    中断/退出
+
+斜杠命令:
+  /help     显示命令列表
+  /clear    清空输出
+  /cost     成本统计
+  /status   状态信息
+  /diff     变更摘要
+  /permissions 权限规则
+  /hooks    Hook 列表
+  /skills   技能列表
+  /mcp      MCP 状态
+  /model    模型管理
+  /provider 提供商管理
+  /config   配置摘要
+  /session  会话管理
+  /compact  压缩上下文"#;
+                app.push_block(DotColor::White, help_text);
+                return Ok(true);
+            }
             let now = Instant::now();
             let double_window = Duration::from_millis(DOUBLE_PRESS_WINDOW_MS);
             let ctrl_c =
@@ -2227,6 +2359,153 @@ async fn handle_event(
                                     }
                                 });
                             }
+                            "diff" => {
+                                let mut lines = Vec::new();
+                                lines.push("会话变更摘要:".to_string());
+                                let mut tool_count = 0;
+                                let mut file_changes = Vec::new();
+                                for item in &app.output {
+                                    if let OutputItem::ToolOutput { tool_name, label, .. } = item {
+                                        tool_count += 1;
+                                        if let Some(lbl) = label {
+                                            if tool_name == "write" || tool_name == "edit" {
+                                                file_changes.push(lbl.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                lines.push(format!("  工具调用次数: {}", tool_count));
+                                if !file_changes.is_empty() {
+                                    lines.push(format!("  修改文件: {}", file_changes.join(", ")));
+                                }
+                                lines.push(format!("  总回合数: {}", app.session_turn_count));
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
+                            "cost" => {
+                                let mut lines = Vec::new();
+                                lines.push("会话成本统计:".to_string());
+                                lines.push(format!("  输入 token: {}", format_token_count(app.session_input_tokens)));
+                                lines.push(format!("  输出 token: {}", format_token_count(app.session_output_tokens)));
+                                lines.push(format!("  缓存创建: {}", format_token_count(app.session_cache_creation_tokens)));
+                                lines.push(format!("  缓存读取: {}", format_token_count(app.session_cache_read_tokens)));
+                                let total = app.session_input_tokens + app.session_output_tokens;
+                                lines.push(format!("  总 token: {}", format_token_count(total)));
+                                lines.push(format!("  总回合数: {}", app.session_turn_count));
+                                if let Some(last) = app.turn_costs.last() {
+                                    lines.push(format!("  最近回合: {}in / {}out",
+                                        format_token_count(last.input_tokens),
+                                        format_token_count(last.output_tokens)));
+                                }
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
+                            "status" => {
+                                let mut lines = Vec::new();
+                                lines.push("详细状态信息:".to_string());
+                                lines.push(format!("  会话 ID: {}", app.session_id));
+                                lines.push(format!("  提供商: {}", app.provider_id));
+                                lines.push(format!("  模型: {}", app.model));
+                                let mode_name = match app.permission_mode {
+                                    PermissionMode::Default => "默认",
+                                    PermissionMode::Plan => "计划",
+                                    PermissionMode::AcceptEdits => "自动编辑",
+                                    PermissionMode::BypassPermissions => "绕过",
+                                };
+                                lines.push(format!("  权限模式: {}", mode_name));
+                                let status_name = match &app.status {
+                                    Status::Idle => "空闲",
+                                    Status::Thinking => "思考中",
+                                    Status::Tool(name) => return Ok(true),  // 使用下面的格式
+                                    Status::Hook(name) => return Ok(true),
+                                    Status::Error(msg) => return Ok(true),
+                                    Status::WaitingUserInput => "等待用户输入",
+                                    Status::WaitingApproval => "等待授权",
+                                };
+                                lines.push(format!("  状态: {}", status_name));
+                                lines.push(format!("  活跃 hooks: {}", app.active_hooks.len()));
+                                lines.push(format!("  待办事项: {}", app.todos.len()));
+                                lines.push(format!("  输出项: {}", app.output.len()));
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
+                            "permissions" => {
+                                let mut lines = Vec::new();
+                                lines.push("权限规则:".to_string());
+                                let mode_name = match app.permission_mode {
+                                    PermissionMode::Default => "默认",
+                                    PermissionMode::Plan => "计划",
+                                    PermissionMode::AcceptEdits => "自动编辑",
+                                    PermissionMode::BypassPermissions => "绕过",
+                                };
+                                lines.push(format!("  当前模式: {}", mode_name));
+                                lines.push(format!("  默认模式: {:?}", settings.tools.approval.default));
+                                if !settings.tools.approval.per_tool.is_empty() {
+                                    lines.push("  工具规则:".to_string());
+                                    for (tool, mode) in &settings.tools.approval.per_tool {
+                                        lines.push(format!("    {} -> {:?}", tool, mode));
+                                    }
+                                }
+                                if !settings.tools.approval.content_rules.is_empty() {
+                                    lines.push("  内容规则:".to_string());
+                                    for rule in &settings.tools.approval.content_rules {
+                                        lines.push(format!("    {} -> {:?}", rule.pattern, rule.action));
+                                    }
+                                }
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
+                            "hooks" => {
+                                let mut lines = Vec::new();
+                                lines.push("已加载的 Hooks:".to_string());
+                                let hooks_list = hooks.hooks();
+                                if hooks_list.is_empty() {
+                                    lines.push("  （无）".to_string());
+                                } else {
+                                    for hook in hooks_list {
+                                        lines.push(format!("  {} - 事件: {:?}", hook.name, hook.events));
+                                    }
+                                }
+                                if app.active_hooks.is_empty() {
+                                    lines.push("当前无活跃 hook".to_string());
+                                } else {
+                                    lines.push(format!("活跃 hooks: {}", app.active_hooks.join(", ")));
+                                }
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
+                            "skills" => {
+                                let mut lines = Vec::new();
+                                lines.push("可用技能:".to_string());
+                                let slash_commands = slash.commands();
+                                let skill_commands: Vec<_> = slash_commands.iter()
+                                    .filter(|c| c.origin == SlashCommandOrigin::Skill)
+                                    .collect();
+                                if skill_commands.is_empty() {
+                                    lines.push("  （无）".to_string());
+                                } else {
+                                    for cmd in skill_commands {
+                                        lines.push(format!("  /{} - {}", cmd.name, cmd.description));
+                                    }
+                                }
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
+                            "mcp" => {
+                                let mut lines = Vec::new();
+                                lines.push("MCP 服务器状态:".to_string());
+                                // 检查是否有 MCP 工具注册
+                                let mcp_tools: Vec<_> = tools.names().iter()
+                                    .filter(|n| n.starts_with("mcp__"))
+                                    .cloned()
+                                    .collect();
+                                if mcp_tools.is_empty() {
+                                    lines.push("  （无 MCP 服务器连接）".to_string());
+                                } else {
+                                    lines.push(format!("  已注册 MCP 工具: {}", mcp_tools.len()));
+                                    for tool_name in mcp_tools.iter().take(10) {
+                                        lines.push(format!("    {}", tool_name));
+                                    }
+                                    if mcp_tools.len() > 10 {
+                                        lines.push(format!("    ... 还有 {} 个", mcp_tools.len() - 10));
+                                    }
+                                }
+                                app.push_block(DotColor::White, &lines.join("\n"));
+                            }
                             _ => {}
                         }
 
@@ -2766,18 +3045,20 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(1),  // 标题栏
+            Constraint::Min(1),    // 输出区域
+            Constraint::Length(1), // 分隔线
             Constraint::Length(info_height),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(size);
 
-    let output_area = chunks[0];
-    let info_area = chunks[2];
-    let input_area = chunks[3];
-    let status_area = chunks[4];
+    let header_area = chunks[0];
+    let output_area = chunks[1];
+    let info_area = chunks[3];
+    let input_area = chunks[4];
+    let status_area = chunks[5];
 
     app.viewport_width = output_area.width;
 
@@ -2798,6 +3079,32 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .scroll((app.scroll, 0))
         .style(output_style);
     frame.render_widget(output_widget, output_area);
+
+    // 标题栏
+    let mode_label = match app.permission_mode {
+        PermissionMode::Default => "默认",
+        PermissionMode::Plan => "计划",
+        PermissionMode::AcceptEdits => "自动编辑",
+        PermissionMode::BypassPermissions => "绕过",
+    };
+    let mode_style = match app.permission_mode {
+        PermissionMode::Default => Style::default().fg(COLOR_TEXT),
+        PermissionMode::Plan => Style::default().fg(Color::Yellow),
+        PermissionMode::AcceptEdits => Style::default().fg(Color::Green),
+        PermissionMode::BypassPermissions => Style::default().fg(Color::Red),
+    };
+    let header_spans = vec![
+        Span::styled(" ZeroBot ", Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(format!("{} ", app.model), Style::default().fg(COLOR_TEXT)),
+        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(format!("{} ", mode_label), mode_style),
+        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
+        Span::styled("Ctrl+H 帮助", Style::default().fg(COLOR_MUTED)),
+    ];
+    let header_widget = Paragraph::new(Line::from(header_spans))
+        .style(Style::default().bg(COLOR_PANEL_BG));
+    frame.render_widget(header_widget, header_area);
 
     let info_widget = Paragraph::new(Text::from(info_lines))
         .block(
