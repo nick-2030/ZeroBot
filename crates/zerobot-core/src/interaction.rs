@@ -3,7 +3,82 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
+use crate::config::{PermissionMode, PermissionSource, ToolApprovalMode};
 use crate::error::ZeroBotResult;
+
+/// Tracks WHY a permission decision was made.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PermissionReason {
+    /// Decision based on session-level permission mode.
+    Mode(PermissionMode),
+    /// Decision based on per-tool approval rule.
+    ToolRule {
+        source: PermissionSource,
+        tool_name: String,
+    },
+    /// Decision based on content-level rule (tool name + input pattern).
+    ContentRule {
+        pattern: String,
+        source: PermissionSource,
+    },
+    /// Decision based on bash/skill command rule.
+    CommandRule {
+        pattern: String,
+        source: PermissionSource,
+    },
+    /// Tool was approved in current session.
+    SessionApproval {
+        key: String,
+    },
+    /// Tool was approved at workspace level (persisted to disk).
+    WorkspaceApproval {
+        key: String,
+    },
+    /// Decision came from a hook.
+    HookDecision {
+        hook_name: String,
+    },
+    /// Denial threshold exceeded, falling back to interactive.
+    DenialThreshold {
+        consecutive: u32,
+        total: u32,
+    },
+}
+
+impl std::fmt::Display for PermissionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PermissionReason::Mode(mode) => write!(f, "Mode: {mode}"),
+            PermissionReason::ToolRule { tool_name, .. } => {
+                write!(f, "Tool rule: {tool_name}")
+            }
+            PermissionReason::ContentRule { pattern, .. } => {
+                write!(f, "Content rule: {pattern}")
+            }
+            PermissionReason::CommandRule { pattern, .. } => {
+                write!(f, "Command rule: {pattern}")
+            }
+            PermissionReason::SessionApproval { key } => {
+                write!(f, "Session approval: {key}")
+            }
+            PermissionReason::WorkspaceApproval { key } => {
+                write!(f, "Workspace approval: {key}")
+            }
+            PermissionReason::HookDecision { hook_name } => {
+                write!(f, "Hook: {hook_name}")
+            }
+            PermissionReason::DenialThreshold {
+                consecutive,
+                total,
+            } => {
+                write!(
+                    f,
+                    "Denial threshold: {consecutive} consecutive, {total} total"
+                )
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserInputRequest {
@@ -52,6 +127,12 @@ pub struct ToolApprovalRequest {
     pub arguments: JsonValue,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Pre-computed auto-decision (if the permission engine already determined a result).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_decision: Option<ToolApprovalMode>,
+    /// Why the auto-decision was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<PermissionReason>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,6 +147,9 @@ pub enum ToolApprovalDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolApprovalResponse {
     pub decision: ToolApprovalDecision,
+    /// Reason for the user's decision (for audit trail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PermissionReason>,
 }
 
 #[async_trait]

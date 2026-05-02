@@ -65,4 +65,22 @@ pub enum AgentEvent {
         cache_read_tokens: u64,
         turn_count: u32,
     },
+    PermissionDenied {
+        tool_name: String,
+        reason: String,
+        permission_reason: Option<String>,
+    },
+    CwdChanged {
+        old_cwd: String,
+        new_cwd: String,
+    },
+    FileChanged {
+        paths: Vec<String>,
+    },
+    HookSessionAdded {
+        hook_name: String,
+    },
+    HookSessionRemoved {
+        hook_name: String,
+    },
 }

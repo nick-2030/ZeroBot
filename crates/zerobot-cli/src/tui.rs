@@ -26,7 +26,7 @@ use tokio::time::{self, Duration};
 use tokio_stream::StreamExt;
 use unicode_width::UnicodeWidthStr;
 use zerobot_core::agent::Agent;
-use zerobot_core::config::Settings;
+use zerobot_core::config::{PermissionMode, Settings, ToolApprovalMode};
 use zerobot_core::events::AgentEvent;
 use zerobot_core::hooks::HookManager;
 use zerobot_core::interaction::{
@@ -74,6 +74,14 @@ enum Status {
     Error(String),
     WaitingUserInput,
     WaitingApproval,
+}
+
+#[derive(Clone)]
+struct TurnCost {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation: u64,
+    cache_read: u64,
 }
 
 struct PermissionPrompt {
@@ -174,6 +182,7 @@ struct App {
     session_id: String,
     provider_id: String,
     model: String,
+    permission_mode: PermissionMode,
     status: Status,
     output: Vec<OutputItem>,
     stream_buffer: String,
@@ -192,6 +201,7 @@ struct App {
     session_cache_creation_tokens: u64,
     session_cache_read_tokens: u64,
     session_turn_count: u32,
+    turn_costs: Vec<TurnCost>,
     permission_prompt: Option<PermissionPrompt>,
     info_overlay: Option<InfoOverlay>,
     overlay_queue: VecDeque<InfoOverlay>,
@@ -246,6 +256,7 @@ impl App {
             session_id,
             provider_id,
             model,
+            permission_mode: PermissionMode::Default,
             status: Status::Idle,
             output: Vec::new(),
             stream_buffer: String::new(),
@@ -264,6 +275,7 @@ impl App {
             session_cache_creation_tokens: 0,
             session_cache_read_tokens: 0,
             session_turn_count: 0,
+            turn_costs: Vec::new(),
             permission_prompt: None,
             info_overlay: None,
             overlay_queue: VecDeque::new(),
@@ -997,6 +1009,99 @@ impl UserInputOverlay {
     }
 }
 
+fn tool_approval_detail_lines(request: &ToolApprovalRequest) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let tool_name = request.tool_name.as_str();
+
+    match tool_name {
+        "bash" | "shell" => {
+            // Bash tools: show full command, highlight destructive patterns
+            lines.push(Line::from(Span::styled(
+                "类型: Shell 命令",
+                Style::default().fg(COLOR_ACCENT),
+            )));
+            if let Some(cmd) = request.arguments.get("command").and_then(|v| v.as_str()) {
+                let is_destructive = cmd.contains("rm ")
+                    || cmd.contains("rm -")
+                    || cmd.contains("rmdir")
+                    || cmd.contains("mkfs")
+                    || cmd.contains("dd ")
+                    || cmd.contains("> /dev/")
+                    || cmd.contains("chmod -R")
+                    || cmd.contains("chown -R");
+                let cmd_style = if is_destructive {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(COLOR_TEXT)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("命令: {cmd}"),
+                    cmd_style,
+                )));
+                if is_destructive {
+                    lines.push(Line::from(Span::styled(
+                        "⚠ 检测到潜在破坏性操作",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                }
+            }
+        }
+        "write" | "edit" | "apply_patch" | "patch" => {
+            // Write/Edit tools: show target file path
+            lines.push(Line::from(Span::styled(
+                "类型: 文件写入",
+                Style::default().fg(COLOR_ACCENT),
+            )));
+            if let Some(path) = request.arguments.get("file_path")
+                .or_else(|| request.arguments.get("path"))
+                .and_then(|v| v.as_str())
+            {
+                let is_absolute = path.starts_with('/');
+                let path_style = if is_absolute && !path.starts_with("/Users/") && !path.starts_with("/home/") {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(COLOR_TEXT)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("文件: {path}"),
+                    path_style,
+                )));
+                if is_absolute && !path.starts_with("/Users/") && !path.starts_with("/home/") {
+                    lines.push(Line::from(Span::styled(
+                        "⚠ 写入系统路径",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+            }
+        }
+        "skill" => {
+            // Skill tools: show skill name and description
+            lines.push(Line::from(Span::styled(
+                "类型: 技能调用",
+                Style::default().fg(COLOR_ACCENT),
+            )));
+            if let Some(name) = request.arguments.get("name").and_then(|v| v.as_str()) {
+                lines.push(Line::from(Span::styled(
+                    format!("技能: {name}"),
+                    Style::default().fg(COLOR_TEXT),
+                )));
+            }
+            if let Some(args) = request.arguments.get("args").and_then(|v| v.as_str()) {
+                if !args.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("参数: {args}"),
+                        Style::default().fg(COLOR_MUTED),
+                    )));
+                }
+            }
+        }
+        _ => {
+            // Other tools: show tool name and arguments (handled in main lines() method)
+        }
+    }
+    lines
+}
+
 impl ToolApprovalOverlay {
     fn new(
         request: ToolApprovalRequest,
@@ -1011,7 +1116,10 @@ impl ToolApprovalOverlay {
 
     fn finish(&mut self, decision: ToolApprovalDecision) -> Option<ToolApprovalResponse> {
         let respond_to = self.respond_to.take()?;
-        let response = ToolApprovalResponse { decision };
+        let response = ToolApprovalResponse {
+            decision,
+            reason: None,
+        };
         let _ = respond_to.send(response);
         None
     }
@@ -1069,15 +1177,41 @@ impl ToolApprovalOverlay {
                 )));
             }
         }
-        if let Ok(args) = serde_json::to_string(&self.request.arguments) {
-            let args = one_line(&args);
-            if !args.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("参数: {args}"),
-                    Style::default().fg(COLOR_MUTED),
-                )));
-            }
+        if let Some(auto_decision) = &self.request.auto_decision {
+            let decision_str = match auto_decision {
+                ToolApprovalMode::Auto => "自动允许",
+                ToolApprovalMode::Prompt => "需要确认",
+                ToolApprovalMode::Deny => "自动拒绝",
+            };
+            lines.push(Line::from(Span::styled(
+                format!("自动决策: {decision_str}"),
+                Style::default().fg(COLOR_WARN),
+            )));
         }
+        if let Some(decision_reason) = &self.request.decision_reason {
+            lines.push(Line::from(Span::styled(
+                format!("决策原因: {decision_reason}"),
+                Style::default().fg(COLOR_MUTED),
+            )));
+        }
+
+        // Per-tool specialized display
+        let detail_lines = tool_approval_detail_lines(&self.request);
+        if detail_lines.is_empty() {
+            // Generic fallback: show raw arguments
+            if let Ok(args) = serde_json::to_string(&self.request.arguments) {
+                let args = one_line(&args);
+                if !args.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("参数: {args}"),
+                        Style::default().fg(COLOR_MUTED),
+                    )));
+                }
+            }
+        } else {
+            lines.extend(detail_lines);
+        }
+
         let options = ["仅本次允许", "本会话允许", "本工作区允许", "拒绝"];
         for (idx, opt) in options.iter().enumerate() {
             let selected = idx == self.selected;
@@ -1410,6 +1544,42 @@ async fn handle_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
                 app.show_full_tool_output = !app.show_full_tool_output;
+                return Ok(true);
+            }
+            // Ctrl+P: Toggle permission mode
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+                app.permission_mode = match app.permission_mode {
+                    PermissionMode::Default => PermissionMode::Plan,
+                    PermissionMode::Plan => PermissionMode::AcceptEdits,
+                    PermissionMode::AcceptEdits => PermissionMode::Default,
+                    PermissionMode::BypassPermissions => PermissionMode::Default,
+                };
+                let mode_name = match app.permission_mode {
+                    PermissionMode::Default => "Default",
+                    PermissionMode::Plan => "Plan",
+                    PermissionMode::AcceptEdits => "AcceptEdits",
+                    PermissionMode::BypassPermissions => "Bypass",
+                };
+                app.status_notice = Some(format!("权限模式: {mode_name}"));
+                return Ok(true);
+            }
+            // Ctrl+T: Show turn cost breakdown
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+                if app.turn_costs.is_empty() {
+                    app.status_notice = Some("暂无回合成本数据".to_string());
+                } else {
+                    let mut cost_lines = vec![format!("共 {} 个回合:", app.turn_costs.len())];
+                    for (i, cost) in app.turn_costs.iter().enumerate().rev().take(10) {
+                        cost_lines.push(format!(
+                            "  T{}: {}in / {}out (cache: {})",
+                            i + 1,
+                            format_token_count(cost.input_tokens),
+                            format_token_count(cost.output_tokens),
+                            format_token_count(cost.cache_creation + cost.cache_read),
+                        ));
+                    }
+                    app.push_block(DotColor::White, &cost_lines.join("\n"));
+                }
                 return Ok(true);
             }
             let now = Instant::now();
@@ -2387,6 +2557,19 @@ async fn handle_agent_event(
             cache_read_tokens,
             turn_count,
         } => {
+            // Track per-turn cost delta
+            if turn_count > app.session_turn_count && app.session_turn_count > 0 {
+                let turn_input = input_tokens.saturating_sub(app.session_input_tokens);
+                let turn_output = output_tokens.saturating_sub(app.session_output_tokens);
+                let turn_cache_creation = cache_creation_tokens.saturating_sub(app.session_cache_creation_tokens);
+                let turn_cache_read = cache_read_tokens.saturating_sub(app.session_cache_read_tokens);
+                app.turn_costs.push(TurnCost {
+                    input_tokens: turn_input,
+                    output_tokens: turn_output,
+                    cache_creation: turn_cache_creation,
+                    cache_read: turn_cache_read,
+                });
+            }
             app.session_input_tokens = input_tokens;
             app.session_output_tokens = output_tokens;
             app.session_cache_creation_tokens = cache_creation_tokens;
@@ -2397,6 +2580,42 @@ async fn handle_agent_event(
             app.finalize_stream();
             app.status = Status::Idle;
             refresh_session_state(app, store).await;
+        }
+        AgentEvent::PermissionDenied {
+            tool_name,
+            reason,
+            permission_reason,
+        } => {
+            let mut msg = format!("权限拒绝: {tool_name} - {reason}");
+            if let Some(pr) = permission_reason {
+                msg.push_str(&format!(" ({pr})"));
+            }
+            app.push_block(DotColor::Yellow, &msg);
+        }
+        AgentEvent::CwdChanged { old_cwd, new_cwd } => {
+            app.push_block(
+                DotColor::White,
+                &format!("工作目录变更: {old_cwd} -> {new_cwd}"),
+            );
+        }
+        AgentEvent::FileChanged { paths } => {
+            let paths_str = paths.join(", ");
+            app.push_block(
+                DotColor::White,
+                &format!("文件变更: {paths_str}"),
+            );
+        }
+        AgentEvent::HookSessionAdded { hook_name } => {
+            app.push_block(
+                DotColor::Green,
+                &format!("会话 Hook 已添加: {hook_name}"),
+            );
+        }
+        AgentEvent::HookSessionRemoved { hook_name } => {
+            app.push_block(
+                DotColor::Yellow,
+                &format!("会话 Hook 已移除: {hook_name}"),
+            );
         }
         _ => {}
     }
@@ -2604,8 +2823,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(input_widget, input_area);
 
-    let status_text = build_status_bar(app);
-    let status_widget = Paragraph::new(Text::from(Line::from(Span::raw(status_text))))
+    let status_spans = build_status_bar(app);
+    let status_widget = Paragraph::new(Text::from(Line::from(status_spans)))
         .style(Style::default().fg(COLOR_TEXT));
     frame.render_widget(status_widget, status_area);
 
@@ -2670,7 +2889,7 @@ fn format_token_count(count: u64) -> String {
     }
 }
 
-fn build_status_bar(app: &App) -> String {
+fn build_status_bar(app: &App) -> Vec<Span<'static>> {
     let used = app
         .context_used
         .map(|v| v.to_string())
@@ -2686,11 +2905,30 @@ fn build_status_bar(app: &App) -> String {
         _ => "-".to_string(),
     };
     let commands = app.command_hint();
-    let mut parts = vec![
-        format!("Session: {}", app.session_id),
-        format!("{} / {}", app.provider_id, app.model),
-        format!("Tokens: {used}/{limit}/{percent}"),
+
+    let mode_label = match app.permission_mode {
+        PermissionMode::Default => "Mode: Default",
+        PermissionMode::Plan => "Mode: Plan",
+        PermissionMode::AcceptEdits => "Mode: AcceptEdits",
+        PermissionMode::BypassPermissions => "Mode: Bypass",
+    };
+    let mode_style = match app.permission_mode {
+        PermissionMode::Default => Style::default().fg(COLOR_TEXT),
+        PermissionMode::Plan => Style::default().fg(Color::Yellow),
+        PermissionMode::AcceptEdits => Style::default().fg(Color::Green),
+        PermissionMode::BypassPermissions => Style::default().fg(Color::Red),
+    };
+
+    let mut spans = vec![
+        Span::styled(format!("Session: {} ", app.session_id), Style::default().fg(COLOR_TEXT)),
+        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(format!("{} / {} ", app.provider_id, app.model), Style::default().fg(COLOR_TEXT)),
+        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(format!("{mode_label} "), mode_style),
+        Span::styled("| ", Style::default().fg(COLOR_MUTED)),
+        Span::styled(format!("Tokens: {used}/{limit}/{percent} "), Style::default().fg(COLOR_TEXT)),
     ];
+
     if app.session_turn_count > 0 {
         let total = app.session_input_tokens + app.session_output_tokens;
         let cache_total = app.session_cache_creation_tokens + app.session_cache_read_tokens;
@@ -2699,20 +2937,40 @@ fn build_status_bar(app: &App) -> String {
         } else {
             "-".to_string()
         };
-        parts.push(format!(
-            "Cost: {}tok (cache: {}, hit: {})",
-            format_token_count(total),
-            format_token_count(cache_total),
-            cache_rate,
+        spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
+        spans.push(Span::styled(
+            format!(
+                "Cost: {}tok (cache: {}, hit: {}) ",
+                format_token_count(total),
+                format_token_count(cache_total),
+                cache_rate,
+            ),
+            Style::default().fg(COLOR_TEXT),
         ));
+        // Show last turn cost if available
+        if let Some(last_turn) = app.turn_costs.last() {
+            let turn_num = app.turn_costs.len();
+            let turn_total = last_turn.input_tokens + last_turn.output_tokens;
+            spans.push(Span::styled(
+                format!(
+                    "T{}: {}in/{}out ",
+                    turn_num,
+                    format_token_count(last_turn.input_tokens),
+                    format_token_count(last_turn.output_tokens),
+                ),
+                Style::default().fg(COLOR_ACCENT_DIM),
+            ));
+        }
     }
     if !commands.is_empty() {
-        parts.push(format!("Commands: {commands}"));
+        spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
+        spans.push(Span::styled(format!("Commands: {commands} "), Style::default().fg(COLOR_TEXT)));
     }
     if let Some(notice) = &app.status_notice {
-        parts.push(notice.clone());
+        spans.push(Span::styled("| ", Style::default().fg(COLOR_MUTED)));
+        spans.push(Span::styled(format!("{notice} "), Style::default().fg(COLOR_WARN)));
     }
-    parts.join(" | ")
+    spans
 }
 
 fn parse_slash_command(input: &str) -> (String, String) {

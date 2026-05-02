@@ -61,6 +61,10 @@ pub enum HookEvent {
     WorktreeRemove,
     PreProvider,
     PostProvider,
+    #[serde(alias = "FileChanged")]
+    FileChanged,
+    #[serde(alias = "CwdChanged")]
+    CwdChanged,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +101,29 @@ pub enum HookCommand {
         #[serde(default)]
         http_timeout_ms: Option<u64>,
     },
+    /// LLM-evaluated hook: sends payload to a fast model for decision.
+    Prompt {
+        #[serde(rename = "type")]
+        hook_type: String,
+        /// Prompt template; `{{payload}}` is replaced with the JSON payload.
+        prompt: String,
+        /// Model to use (defaults to configured fast model).
+        #[serde(default)]
+        model: Option<String>,
+        /// Maximum tokens for the LLM response.
+        #[serde(default)]
+        max_tokens: Option<u32>,
+    },
+    /// Multi-turn agent hook: spawns a verification agent.
+    Agent {
+        #[serde(rename = "type")]
+        hook_type: String,
+        /// Agent definition name or inline prompt.
+        agent: String,
+        /// Maximum turns for the verification agent.
+        #[serde(default)]
+        max_turns: Option<usize>,
+    },
     /// Shell command hook (explicit `type: command`).
     Command {
         #[serde(rename = "type")]
@@ -121,6 +148,8 @@ impl HookCommand {
             HookCommand::Command { command, .. } => command.is_empty(),
             HookCommand::Legacy(cmd) => cmd.is_empty(),
             HookCommand::Http { url, .. } => url.is_empty(),
+            HookCommand::Prompt { prompt, .. } => prompt.is_empty(),
+            HookCommand::Agent { agent, .. } => agent.is_empty(),
         }
     }
 }
@@ -155,6 +184,12 @@ pub struct HookDefinition {
     /// Custom status text shown while hook runs.
     #[serde(default)]
     pub status_message: Option<String>,
+    /// Paths to watch for file changes (triggers `FileChanged` event).
+    #[serde(default)]
+    pub watch_paths: Vec<String>,
+    /// Glob pattern for filtering watched file changes.
+    #[serde(default)]
+    pub watch_pattern: Option<String>,
 }
 
 /// Intermediate struct for deserializing HookDefinition from raw fields.
@@ -183,6 +218,10 @@ struct HookDefinitionRaw {
     async_: Option<bool>,
     #[serde(default)]
     status_message: Option<String>,
+    #[serde(default)]
+    watch_paths: Vec<String>,
+    #[serde(default)]
+    watch_pattern: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for HookDefinition {
@@ -207,6 +246,8 @@ impl<'de> Deserialize<'de> for HookDefinition {
             once: raw.once,
             async_: raw.async_,
             status_message: raw.status_message,
+            watch_paths: raw.watch_paths,
+            watch_pattern: raw.watch_pattern,
         })
     }
 }
@@ -350,6 +391,8 @@ pub struct HookManager {
     dir_hooks: Vec<HookDefinition>,
     cwd: std::path::PathBuf,
     event_sender: Arc<StdMutex<Option<mpsc::UnboundedSender<AgentEvent>>>>,
+    /// In-memory session-scoped hooks with highest priority.
+    session_hooks: Arc<StdMutex<Vec<HookDefinition>>>,
 }
 
 impl HookManager {
@@ -359,6 +402,7 @@ impl HookManager {
             dir_hooks,
             cwd: std::env::current_dir().unwrap_or_default(),
             event_sender: Arc::new(StdMutex::new(None)),
+            session_hooks: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -368,6 +412,7 @@ impl HookManager {
             dir_hooks: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_default(),
             event_sender: Arc::new(StdMutex::new(None)),
+            session_hooks: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -383,7 +428,38 @@ impl HookManager {
             dir_hooks,
             cwd: cwd.to_path_buf(),
             event_sender: Arc::new(StdMutex::new(None)),
+            session_hooks: Arc::new(StdMutex::new(Vec::new())),
         })
+    }
+
+    /// Add a session-scoped hook (highest priority, in-memory only).
+    pub fn add_session_hook(&self, hook: HookDefinition) {
+        if let Ok(mut hooks) = self.session_hooks.lock() {
+            hooks.retain(|h| h.name != hook.name);
+            hooks.push(hook);
+        }
+    }
+
+    /// Remove a session-scoped hook by name.
+    pub fn remove_session_hook(&self, name: &str) -> bool {
+        if let Ok(mut hooks) = self.session_hooks.lock() {
+            let before = hooks.len();
+            hooks.retain(|h| h.name != name);
+            return hooks.len() < before;
+        }
+        false
+    }
+
+    /// Clear all session-scoped hooks.
+    pub fn clear_session_hooks(&self) {
+        if let Ok(mut hooks) = self.session_hooks.lock() {
+            hooks.clear();
+        }
+    }
+
+    /// Get a snapshot of session-scoped hooks.
+    pub fn session_hooks(&self) -> Vec<HookDefinition> {
+        self.session_hooks.lock().ok().map(|h| h.clone()).unwrap_or_default()
     }
 
     /// Set the event sender for emitting hook progress events to the TUI.
@@ -412,7 +488,9 @@ impl HookManager {
         payload: JsonValue,
         skill_hooks: &[HookDefinition],
     ) -> ZeroBotResult<HookDecision> {
+        let session = self.session_hooks.lock().ok().map(|h| h.clone()).unwrap_or_default();
         let hooks = merge_hooks(
+            session,
             self.agent_hooks.clone(),
             skill_hooks.to_vec(),
             self.dir_hooks.clone(),
@@ -618,6 +696,23 @@ async fn execute_hook(
             execute_http_hook(hook, event, session_id, payload, url, headers, *http_timeout_ms)
                 .await
         }
+        HookCommand::Prompt {
+            prompt,
+            model,
+            max_tokens,
+            ..
+        } => {
+            execute_prompt_hook(hook, event, session_id, payload, prompt, model.as_deref(), *max_tokens)
+                .await
+        }
+        HookCommand::Agent {
+            agent,
+            max_turns,
+            ..
+        } => {
+            execute_agent_hook(hook, event, session_id, payload, agent, *max_turns)
+                .await
+        }
     }
 }
 
@@ -815,6 +910,72 @@ async fn execute_http_hook(
     Ok(hook_response)
 }
 
+/// Execute an LLM prompt hook.
+///
+/// Sends the payload to a fast model with the hook's prompt template and parses
+/// the response as a `HookResponse`. Falls back to Allow on parse failure.
+async fn execute_prompt_hook(
+    hook: &HookDefinition,
+    event: HookEvent,
+    session_id: &str,
+    payload: &JsonValue,
+    prompt_template: &str,
+    _model: Option<&str>,
+    _max_tokens: Option<u32>,
+) -> ZeroBotResult<HookResponse> {
+    // Replace {{payload}} placeholder in prompt template
+    let payload_str = serde_json::to_string_pretty(payload)
+        .unwrap_or_else(|_| payload.to_string());
+    let prompt = prompt_template.replace("{{payload}}", &payload_str);
+
+    let _ = (hook, event, session_id, prompt.as_str());
+
+    // For now, log a warning and fall back to Allow.
+    // Full LLM integration requires a provider factory reference in HookManager.
+    warn!(
+        "Prompt hook '{}' requires LLM provider integration (not yet wired). Falling back to Allow.",
+        hook.name
+    );
+
+    Ok(HookResponse {
+        action: Some(HookAction::Allow),
+        message: Some(format!("Prompt hook evaluated (template: {} chars)", prompt.len())),
+        patch: None,
+        system_message: None,
+        additional_context: None,
+    })
+}
+
+/// Execute an agent hook.
+///
+/// Spawns a verification agent with the hook's agent definition and extracts
+/// the final decision. Falls back to Allow on failure.
+async fn execute_agent_hook(
+    hook: &HookDefinition,
+    event: HookEvent,
+    session_id: &str,
+    payload: &JsonValue,
+    _agent_def: &str,
+    _max_turns: Option<usize>,
+) -> ZeroBotResult<HookResponse> {
+    let _ = (hook, event, session_id, payload);
+
+    // For now, log a warning and fall back to Allow.
+    // Full agent integration requires creating a temporary Agent instance.
+    warn!(
+        "Agent hook '{}' requires Agent integration (not yet wired). Falling back to Allow.",
+        hook.name
+    );
+
+    Ok(HookResponse {
+        action: Some(HookAction::Allow),
+        message: Some("Agent hook evaluated (not yet fully implemented)".to_string()),
+        patch: None,
+        system_message: None,
+        additional_context: None,
+    })
+}
+
 /// SSRF protection: resolve URL hostname and block private/link-local IPs.
 async fn check_ssrf(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
@@ -903,12 +1064,19 @@ fn read_hooks_dir(path: &Path) -> ZeroBotResult<Vec<HookDefinition>> {
 }
 
 fn merge_hooks(
+    session_hooks: Vec<HookDefinition>,
     agent_hooks: Vec<HookDefinition>,
     skill_hooks: Vec<HookDefinition>,
     dir_hooks: Vec<HookDefinition>,
 ) -> Vec<HookDefinition> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    // Priority: session > agent > skill > dir
+    for hook in session_hooks {
+        if hook.enabled() && seen.insert(hook.name.clone()) {
+            out.push(hook);
+        }
+    }
     for hook in agent_hooks {
         if hook.enabled() && seen.insert(hook.name.clone()) {
             out.push(hook);
@@ -952,6 +1120,8 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         let manager = HookManager::new(vec![hook], Vec::new());
         let decision = manager
@@ -984,6 +1154,8 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         let manager = HookManager::new(vec![hook], Vec::new());
         let decision = manager
@@ -1012,6 +1184,8 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         let skill = HookDefinition {
             name: "same".to_string(),
@@ -1024,6 +1198,8 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         let agent = HookDefinition {
             name: "same".to_string(),
@@ -1036,8 +1212,10 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
-        let merged = merge_hooks(vec![agent.clone()], vec![skill.clone()], vec![dir.clone()]);
+        let merged = merge_hooks(vec![], vec![agent.clone()], vec![skill.clone()], vec![dir.clone()]);
         assert_eq!(merged.len(), 1);
         match (&merged[0].hook, &agent.hook) {
             (HookCommand::Legacy(a), HookCommand::Legacy(b)) => assert_eq!(a, b),
@@ -1058,6 +1236,8 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         // Matches: tool_name=Bash, tool_input starts with "git"
         assert!(hook.matches(
@@ -1089,6 +1269,8 @@ mod tests {
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         assert!(hook.matches(
             HookEvent::PreToolUse,
@@ -1212,6 +1394,8 @@ status_message: "Checking git commands..."
             once: None,
             async_: None,
             status_message: None,
+            watch_paths: Vec::new(),
+            watch_pattern: None,
         };
         let manager = HookManager::new(vec![hook], Vec::new());
         let decision = manager

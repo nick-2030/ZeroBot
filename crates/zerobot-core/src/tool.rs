@@ -3226,6 +3226,7 @@ content
         ) -> ZeroBotResult<crate::interaction::ToolApprovalResponse> {
             Ok(crate::interaction::ToolApprovalResponse {
                 decision: crate::interaction::ToolApprovalDecision::AllowOnce,
+                reason: None,
             })
         }
     }

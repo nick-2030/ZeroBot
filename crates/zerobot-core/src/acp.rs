@@ -164,6 +164,7 @@ impl AcpRuntime {
         let Some(conn) = self.connection() else {
             return Ok(ToolApprovalResponse {
                 decision: ToolApprovalDecision::Deny,
+                reason: None,
             });
         };
 
@@ -225,7 +226,10 @@ impl AcpRuntime {
             }
             _ => ToolApprovalDecision::Deny,
         };
-        Ok(ToolApprovalResponse { decision })
+        Ok(ToolApprovalResponse {
+            decision,
+            reason: None,
+        })
     }
 
     async fn upsert_session(&self, state: SessionState) {
@@ -736,7 +740,12 @@ impl AcpRuntime {
                             | AgentEvent::ToolBatchStarted { .. }
                             | AgentEvent::SessionCost { .. }
                             | AgentEvent::HookStarted { .. }
-                            | AgentEvent::HookFinished { .. } => {}
+                            | AgentEvent::HookFinished { .. }
+                            | AgentEvent::PermissionDenied { .. }
+                            | AgentEvent::CwdChanged { .. }
+                            | AgentEvent::FileChanged { .. }
+                            | AgentEvent::HookSessionAdded { .. }
+                            | AgentEvent::HookSessionRemoved { .. } => {}
                         }
                     }
                 }

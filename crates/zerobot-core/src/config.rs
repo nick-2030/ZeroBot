@@ -103,6 +103,129 @@ pub enum ToolApprovalMode {
     Deny,
 }
 
+/// Session-level permission mode that acts as an envelope over per-tool decisions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Default behavior: per-tool Auto/Prompt/Deny decisions apply.
+    Default,
+    /// Read-only mode: all write/execute tools require explicit approval.
+    Plan,
+    /// Auto-approve file edits; prompt for bash/execute.
+    AcceptEdits,
+    /// Auto-approve everything (dangerous, CLI flag only).
+    BypassPermissions,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        PermissionMode::Default
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PermissionMode::Default => write!(f, "Default"),
+            PermissionMode::Plan => write!(f, "Plan"),
+            PermissionMode::AcceptEdits => write!(f, "AcceptEdits"),
+            PermissionMode::BypassPermissions => write!(f, "Bypass"),
+        }
+    }
+}
+
+/// Tracks which configuration source a permission decision originated from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionSource {
+    UserSettings,
+    ProjectSettings,
+    LocalSettings,
+    PolicySettings,
+    CliArg,
+    Session,
+    Hook,
+}
+
+/// Content-level rule that matches tool name + input patterns.
+///
+/// Pattern format: `"tool_name:input_glob"` e.g., `"bash:rm -rf *"`, `"write:/etc/*"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentRule {
+    /// Pattern like "bash:rm -rf *" or "write:/etc/*".
+    pub pattern: String,
+    /// Action to take when this rule matches.
+    pub action: ToolApprovalMode,
+    /// Which config source this rule came from.
+    #[serde(default)]
+    pub source: Option<PermissionSource>,
+}
+
+impl ContentRule {
+    /// Check if this rule matches the given tool name and serialized input.
+    pub fn matches(&self, tool_name: &str, input: &str) -> bool {
+        let Some((rule_tool, rule_pattern)) = self.pattern.split_once(':') else {
+            // No colon: match tool name only
+            return glob_match_ci(&self.pattern, tool_name);
+        };
+        if !glob_match_ci(rule_tool, tool_name) {
+            return false;
+        }
+        if rule_pattern == "*" {
+            return true;
+        }
+        glob_match_ci(rule_pattern, input)
+    }
+}
+
+fn glob_match_ci(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return pattern.eq_ignore_ascii_case(text);
+    }
+    let escaped = regex::escape(pattern);
+    let re_pattern = escaped.replace("\\*", ".*").replace("\\?", ".");
+    if let Ok(re) = regex::Regex::new(&format!("^(?i){re_pattern}$")) {
+        return re.is_match(text);
+    }
+    false
+}
+
+/// Denial tracking thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DenialSettings {
+    /// Maximum consecutive denials before falling back to interactive.
+    #[serde(default = "default_max_consecutive_denials")]
+    pub max_consecutive_denials: u32,
+    /// Maximum total denials before falling back to interactive.
+    #[serde(default = "default_max_total_denials")]
+    pub max_total_denials: u32,
+    /// When thresholds are exceeded, override Deny to Prompt instead of blocking.
+    #[serde(default = "default_fallback_to_interactive")]
+    pub fallback_to_interactive: bool,
+}
+
+fn default_max_consecutive_denials() -> u32 {
+    3
+}
+
+fn default_max_total_denials() -> u32 {
+    20
+}
+
+fn default_fallback_to_interactive() -> bool {
+    true
+}
+
+impl Default for DenialSettings {
+    fn default() -> Self {
+        Self {
+            max_consecutive_denials: default_max_consecutive_denials(),
+            max_total_denials: default_max_total_denials(),
+            fallback_to_interactive: default_fallback_to_interactive(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolApprovalSettings {
     #[serde(default = "default_tool_approval_mode")]
@@ -113,6 +236,15 @@ pub struct ToolApprovalSettings {
     pub bash: CommandApprovalSettings,
     #[serde(default)]
     pub skill: CommandApprovalSettings,
+    /// Content-level rules matching tool name + input patterns.
+    #[serde(default)]
+    pub content_rules: Vec<ContentRule>,
+    /// Session-level permission mode override.
+    #[serde(default)]
+    pub permission_mode: Option<PermissionMode>,
+    /// Denial tracking configuration.
+    #[serde(default)]
+    pub denial: DenialSettings,
 }
 
 fn default_tool_approval_mode() -> ToolApprovalMode {
@@ -141,6 +273,22 @@ impl ToolApprovalSettings {
 
     pub fn skill_mode_for(&self, skill_name: &str) -> Option<ToolApprovalMode> {
         self.skill.mode_for(skill_name)
+    }
+
+    /// Check content rules for a match against tool name + serialized input.
+    /// Returns the first matching rule's action.
+    pub fn content_rule_for(&self, tool_name: &str, input: &str) -> Option<ToolApprovalMode> {
+        for rule in &self.content_rules {
+            if rule.matches(tool_name, input) {
+                return Some(rule.action);
+            }
+        }
+        None
+    }
+
+    /// Get the effective session-level permission mode.
+    pub fn effective_permission_mode(&self) -> PermissionMode {
+        self.permission_mode.unwrap_or(PermissionMode::Default)
     }
 }
 
@@ -616,6 +764,9 @@ impl Default for ToolApprovalSettings {
             per_tool: default_tool_approval_overrides(),
             bash: CommandApprovalSettings::default(),
             skill: CommandApprovalSettings::default(),
+            content_rules: Vec::new(),
+            permission_mode: None,
+            denial: DenialSettings::default(),
         }
     }
 }
@@ -1210,5 +1361,118 @@ plugins:
             entries[1].command,
             vec!["echo".to_string(), "local".to_string()]
         );
+    }
+
+    #[test]
+    fn content_rule_matches_tool_and_input() {
+        let rule = ContentRule {
+            pattern: "bash:rm -rf *".to_string(),
+            action: ToolApprovalMode::Deny,
+            source: None,
+        };
+        assert!(rule.matches("bash", "rm -rf /"));
+        assert!(rule.matches("Bash", "rm -rf /tmp/foo"));
+        assert!(!rule.matches("bash", "ls -la"));
+        assert!(!rule.matches("write", "rm -rf /"));
+    }
+
+    #[test]
+    fn content_rule_tool_only_pattern() {
+        let rule = ContentRule {
+            pattern: "write".to_string(),
+            action: ToolApprovalMode::Prompt,
+            source: None,
+        };
+        assert!(rule.matches("write", "anything"));
+        assert!(!rule.matches("read", "anything"));
+    }
+
+    #[test]
+    fn content_rule_wildcard_input() {
+        let rule = ContentRule {
+            pattern: "bash:*".to_string(),
+            action: ToolApprovalMode::Auto,
+            source: None,
+        };
+        assert!(rule.matches("bash", "any command here"));
+        assert!(!rule.matches("read", "file.txt"));
+    }
+
+    #[test]
+    fn content_rule_for_finds_first_match() {
+        let mut approval = ToolApprovalSettings::default();
+        approval.content_rules = vec![
+            ContentRule {
+                pattern: "bash:rm *".to_string(),
+                action: ToolApprovalMode::Deny,
+                source: None,
+            },
+            ContentRule {
+                pattern: "bash:*".to_string(),
+                action: ToolApprovalMode::Auto,
+                source: None,
+            },
+        ];
+        assert_eq!(
+            approval.content_rule_for("bash", "rm -rf /"),
+            Some(ToolApprovalMode::Deny)
+        );
+        assert_eq!(
+            approval.content_rule_for("bash", "ls -la"),
+            Some(ToolApprovalMode::Auto)
+        );
+        assert_eq!(approval.content_rule_for("write", "file.txt"), None);
+    }
+
+    #[test]
+    fn permission_mode_default_and_override() {
+        let approval = ToolApprovalSettings::default();
+        assert_eq!(
+            approval.effective_permission_mode(),
+            PermissionMode::Default
+        );
+
+        let mut approval = ToolApprovalSettings::default();
+        approval.permission_mode = Some(PermissionMode::Plan);
+        assert_eq!(
+            approval.effective_permission_mode(),
+            PermissionMode::Plan
+        );
+    }
+
+    #[test]
+    fn content_rules_in_yaml_config() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path();
+        write_file(
+            &cwd.join(".zerobot/settings.yaml"),
+            r#"
+tools:
+  approval:
+    content_rules:
+      - pattern: "bash:rm -rf *"
+        action: deny
+      - pattern: "write:/etc/*"
+        action: prompt
+    permission_mode: plan
+    denial:
+      max_consecutive_denials: 5
+      max_total_denials: 30
+"#,
+        );
+        let loader = ConfigLoader::new(cwd.to_path_buf());
+        let loaded = loader.load().unwrap();
+        let approval = &loaded.settings.tools.approval;
+        assert_eq!(approval.content_rules.len(), 2);
+        assert_eq!(approval.content_rules[0].pattern, "bash:rm -rf *");
+        assert_eq!(approval.content_rules[0].action, ToolApprovalMode::Deny);
+        assert_eq!(approval.content_rules[1].pattern, "write:/etc/*");
+        assert_eq!(approval.content_rules[1].action, ToolApprovalMode::Prompt);
+        assert_eq!(
+            approval.permission_mode,
+            Some(PermissionMode::Plan)
+        );
+        assert_eq!(approval.denial.max_consecutive_denials, 5);
+        assert_eq!(approval.denial.max_total_denials, 30);
     }
 }

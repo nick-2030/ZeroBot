@@ -1,5 +1,5 @@
 use crate::bus::OutboundMessage;
-use crate::config::{Settings, ToolApprovalMode};
+use crate::config::{PermissionMode, Settings, ToolApprovalMode};
 use crate::context::ContextManager;
 use crate::error::{ZeroBotError, ZeroBotResult};
 use crate::events::AgentEvent;
@@ -13,12 +13,45 @@ use crate::tool::{ToolContext, ToolRegistry, ToolRouteContext};
 use chrono::Utc;
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use tracing::warn;
 use uuid::Uuid;
+
+/// Tracks consecutive and total permission denials for fallback logic.
+/// Uses AtomicU32 for thread-safe interior mutability.
+#[derive(Clone)]
+struct DenialCounts {
+    consecutive: Arc<AtomicU32>,
+    total: Arc<AtomicU32>,
+}
+
+impl DenialCounts {
+    fn new() -> Self {
+        Self {
+            consecutive: Arc::new(AtomicU32::new(0)),
+            total: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn record_approval(&self) {
+        self.consecutive.store(0, Ordering::Relaxed);
+    }
+
+    fn record_denial(&self) {
+        self.consecutive.fetch_add(1, Ordering::Relaxed);
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Check if denial thresholds are exceeded.
+    fn exceeded(&self, max_consecutive: u32, max_total: u32) -> bool {
+        self.consecutive.load(Ordering::Relaxed) >= max_consecutive
+            || self.total.load(Ordering::Relaxed) >= max_total
+    }
+}
 
 const COMPACTION_PROMPT: &str = r#"请根据以下对话内容生成一份结构化摘要，确保后续对话可以无缝继续执行任务。
 
@@ -66,6 +99,7 @@ pub struct Agent {
     tool_approvals: Arc<RwLock<HashSet<String>>>,
     tool_route: Option<ToolRouteContext>,
     outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    denial_counts: DenialCounts,
 }
 
 impl Agent {
@@ -96,6 +130,7 @@ impl Agent {
             tool_approvals,
             tool_route,
             outbound,
+            denial_counts: DenialCounts::new(),
         }
     }
 
@@ -1009,6 +1044,7 @@ struct ToolExecutor {
     cwd: std::path::PathBuf,
     tool_route: Option<ToolRouteContext>,
     outbound: Option<mpsc::UnboundedSender<OutboundMessage>>,
+    denial_counts: DenialCounts,
 }
 
 impl ToolExecutor {
@@ -1024,6 +1060,7 @@ impl ToolExecutor {
             cwd: agent.cwd.clone(),
             tool_route: agent.tool_route.clone(),
             outbound: agent.outbound.clone(),
+            denial_counts: DenialCounts::new(),
         }
     }
 
@@ -1221,24 +1258,79 @@ impl ToolExecutor {
         }
 
         let approval_key = approval_key(&tool_name, &args);
-        let mut approval_mode = self.settings.tools.approval.mode_for(&tool_name);
-        if is_bash_tool(&tool_name) {
-            if let Some(command) = bash_command_from_args(&args) {
-                if let Some(mode) = self.settings.tools.approval.bash_mode_for(command) {
-                    approval_mode = mode;
+        let args_str = args.to_string();
+
+        // Step 1: Check PermissionMode override
+        let permission_mode = self.settings.tools.approval.effective_permission_mode();
+        let mut approval_mode = match permission_mode {
+            PermissionMode::BypassPermissions => {
+                // Auto-approve everything
+                ToolApprovalMode::Auto
+            }
+            PermissionMode::Plan => {
+                // In Plan mode, deny all write/execute tools
+                if is_write_or_execute_tool(&tool_name) {
+                    ToolApprovalMode::Deny
+                } else {
+                    ToolApprovalMode::Auto
                 }
             }
-        } else if tool_name == "skill" {
-            if let Some(skill_name) = skill_name_from_args(&args) {
-                if let Some(mode) = self.settings.tools.approval.skill_mode_for(skill_name) {
-                    approval_mode = mode;
+            PermissionMode::AcceptEdits => {
+                // Auto-approve file edits, prompt for bash/execute
+                if is_bash_tool(&tool_name) {
+                    ToolApprovalMode::Prompt
+                } else {
+                    ToolApprovalMode::Auto
+                }
+            }
+            PermissionMode::Default => {
+                // Step 4: Check per-tool mode (existing logic)
+                self.settings.tools.approval.mode_for(&tool_name)
+            }
+        };
+
+        // Step 2: Check content rules (tool name + input pattern)
+        if approval_mode != ToolApprovalMode::Deny {
+            if let Some(content_mode) = self.settings.tools.approval.content_rule_for(&tool_name, &args_str) {
+                approval_mode = content_mode;
+            }
+        }
+
+        // Step 3: Check bash/skill command rules
+        if approval_mode != ToolApprovalMode::Deny {
+            if is_bash_tool(&tool_name) {
+                if let Some(command) = bash_command_from_args(&args) {
+                    if let Some(mode) = self.settings.tools.approval.bash_mode_for(command) {
+                        approval_mode = mode;
+                    }
+                }
+            } else if tool_name == "skill" {
+                if let Some(skill_name) = skill_name_from_args(&args) {
+                    if let Some(mode) = self.settings.tools.approval.skill_mode_for(skill_name) {
+                        approval_mode = mode;
+                    }
                 }
             }
         }
+
+        // Step 5: Check session/workspace approval cache
         if approval_mode != ToolApprovalMode::Deny
             && self.tool_approvals.read().await.contains(&approval_key)
         {
             approval_mode = ToolApprovalMode::Auto;
+        }
+
+        // Step 6: Apply denial tracking
+        let denial_settings = &self.settings.tools.approval.denial;
+        if denial_settings.fallback_to_interactive
+            && approval_mode == ToolApprovalMode::Deny
+            && self.denial_counts.exceeded(
+                denial_settings.max_consecutive_denials,
+                denial_settings.max_total_denials,
+            )
+        {
+            // Thresholds exceeded: fall back to interactive
+            approval_mode = ToolApprovalMode::Prompt;
         }
 
         let mut approved = true;
@@ -1257,15 +1349,20 @@ impl ToolExecutor {
                         tool_name: tool_name.clone(),
                         arguments: args.clone(),
                         reason,
+                        auto_decision: Some(approval_mode),
+                        decision_reason: None,
                     })
                     .await?;
                 match response.decision {
-                    ToolApprovalDecision::AllowOnce => {}
+                    ToolApprovalDecision::AllowOnce => {
+                        self.denial_counts.record_approval();
+                    }
                     ToolApprovalDecision::AllowSession => {
                         self.tool_approvals
                             .write()
                             .await
                             .insert(approval_key.clone());
+                        self.denial_counts.record_approval();
                     }
                     ToolApprovalDecision::AllowWorkspace => {
                         self.tool_approvals
@@ -1273,19 +1370,35 @@ impl ToolExecutor {
                             .await
                             .insert(approval_key.clone());
                         self.store.insert_tool_approval(&approval_key).await?;
+                        self.denial_counts.record_approval();
                     }
                     ToolApprovalDecision::Deny => {
                         approved = false;
                         deny_message = Some("工具调用被拒绝".to_string());
+                        self.denial_counts.record_denial();
                     }
                 }
             } else {
                 approved = false;
                 deny_message = Some("需要用户授权，但当前无交互处理器".to_string());
+                self.denial_counts.record_denial();
             }
         } else if approval_mode == ToolApprovalMode::Deny {
             approved = false;
             deny_message = Some("工具调用被策略拒绝".to_string());
+            self.denial_counts.record_denial();
+        }
+
+        // Emit PermissionDenied event if denied
+        if !approved {
+            self.emit(
+                events,
+                AgentEvent::PermissionDenied {
+                    tool_name: tool_name.clone(),
+                    reason: deny_message.clone().unwrap_or_default(),
+                    permission_reason: Some(format!("Mode: {permission_mode}")),
+                },
+            );
         }
 
         self.emit(
@@ -1559,6 +1672,14 @@ fn partition_tool_calls(calls: Vec<ToolCall>, registry: &ToolRegistry) -> Vec<To
 
 fn is_bash_tool(name: &str) -> bool {
     matches!(name, "bash" | "shell")
+}
+
+/// Check if a tool performs write or execute operations (not read-only).
+fn is_write_or_execute_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write" | "edit" | "apply_patch" | "patch" | "bash" | "shell" | "todowrite"
+    )
 }
 
 fn bash_command_from_args(args: &JsonValue) -> Option<&str> {
