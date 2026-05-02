@@ -30,6 +30,7 @@ pub mod session;
 pub mod skills;
 pub mod task;
 pub mod tool;
+pub mod toolset;
 pub mod workspace;
 
 pub use agent::{Agent, AgentResult};
@@ -73,6 +74,7 @@ pub use session::{
 pub use skills::{format_skill_summary, SkillContent, SkillInfo, SkillManager};
 pub use task::{TaskId, TaskManager, TaskState, TaskStatus, TaskType, TaskUsage};
 pub use tool::{ToolContext, ToolRegistry, ToolRouteContext};
+pub use toolset::{builtin_toolsets, ToolsetDefinition, ToolsetRegistry};
 pub use workspace::{resolve_session_db_path, resolve_workspace_root, workspace_key};
 pub use memory::{MemoryManager, MemoryStore, MemoryProvider};
 pub use memory_tool::MemoryTool;
