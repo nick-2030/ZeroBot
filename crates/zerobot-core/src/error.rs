@@ -22,6 +22,16 @@ pub enum ZeroBotError {
     Io(String),
     #[error("网络请求错误: {0}")]
     Http(String),
+    #[error("任务错误: {0}")]
+    Task(String),
+    #[error("编排深度超限: {0}")]
+    OrchestrationDepthExceeded(String),
+    #[error("通知错误: {0}")]
+    Notification(String),
+    #[error("Kanban 错误: {0}")]
+    Kanban(String),
+    #[error("Swarm 错误: {0}")]
+    Swarm(String),
 }
 
 impl From<std::io::Error> for ZeroBotError {
