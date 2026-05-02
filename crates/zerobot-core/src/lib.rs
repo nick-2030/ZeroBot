@@ -26,6 +26,7 @@ pub mod prompt;
 pub mod provider;
 pub mod session;
 pub mod skills;
+pub mod task;
 pub mod tool;
 pub mod workspace;
 
@@ -65,6 +66,7 @@ pub use session::{
     SessionStore, SqliteSessionStore,
 };
 pub use skills::{format_skill_summary, SkillContent, SkillInfo, SkillManager};
+pub use task::{TaskId, TaskManager, TaskState, TaskStatus, TaskType, TaskUsage};
 pub use tool::{ToolContext, ToolRegistry, ToolRouteContext};
 pub use workspace::{resolve_session_db_path, resolve_workspace_root, workspace_key};
 pub use memory::{MemoryManager, MemoryStore, MemoryProvider};
