@@ -9,12 +9,8 @@ pub mod message;
 pub mod overlay;
 pub mod theme;
 
-// Legacy monolithic TUI — will be removed once all tasks are complete.
-mod legacy;
-pub use legacy::run_tui;
-
 // ---------------------------------------------------------------------------
-// New event loop: run_tui_new
+// Event loop: run_tui
 // ---------------------------------------------------------------------------
 
 use anyhow::Result;
@@ -116,15 +112,14 @@ impl InteractionHandler for UiInteractionHandler {
 }
 
 // ---------------------------------------------------------------------------
-// run_tui_new — the new event loop entry point
+// run_tui — the event loop entry point
 // ---------------------------------------------------------------------------
 
-/// Run the TUI with the new Message/Command architecture.
+/// Run the TUI with the Message/Command architecture.
 ///
 /// This function initializes the terminal, creates the application state, and
-/// runs the main event loop until the user quits.  It mirrors the signature of
-/// the legacy [`run_tui`] so callers can swap between them.
-pub async fn run_tui_new(
+/// runs the main event loop until the user quits.
+pub async fn run_tui(
     settings: Settings,
     cwd: std::path::PathBuf,
     session_id: String,
