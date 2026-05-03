@@ -63,11 +63,11 @@ impl StatusBar {
         ];
 
         if !mode_label.is_empty() {
-            spans.push(Span::styled("| ", Style::default().fg(theme.text_dim)));
+            spans.push(Span::styled(" │ ", Style::default().fg(theme.text_dim)));
             spans.push(Span::styled(format!("{} ", mode_label), mode_style));
         }
 
-        spans.push(Span::styled("| ", Style::default().fg(theme.text_dim)));
+        spans.push(Span::styled(" │ ", Style::default().fg(theme.text_dim)));
         spans.push(Span::styled(
             format!("{used}/{limit} ({percent}) "),
             Style::default().fg(theme.text),

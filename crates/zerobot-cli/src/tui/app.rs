@@ -7,12 +7,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use zerobot_core::config::PermissionMode;
 use zerobot_core::provider::TokenUsage;
 use zerobot_core::session::TodoItem;
 
-use crate::slash::{SlashMatch, SlashRegistry};
+use crate::slash::{SlashCommandKind, SlashMatch, SlashRegistry};
 use crate::tui::command::Command;
 use crate::tui::keybindings::types::KeyContext;
 use crate::tui::message::Message;
@@ -24,6 +25,16 @@ use crate::tui::overlay::OverlayType;
 
 /// Blink interval for the cursor.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Spinner verb pool — randomly selected on each submission.
+const SPINNER_VERBS: &[&str] = &[
+    "Thinking",
+    "Processing",
+    "Analyzing",
+    "Reasoning",
+    "Computing",
+    "Working",
+];
 
 /// Status of the agent / LLM interaction.
 #[derive(Clone, Debug)]
@@ -177,6 +188,7 @@ pub struct AppState {
 
     // -- Spinner --
     pub thinking_start: Option<Instant>,
+    pub spinner_verb: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +246,7 @@ impl AppState {
             blink_on: true,
             last_blink: Instant::now(),
             thinking_start: None,
+            spinner_verb: String::new(),
         }
     }
 
@@ -354,6 +367,69 @@ impl AppState {
     pub fn push_markdown_block(&mut self, text: &str) {
         self.output.push(OutputItem::Markdown(text.to_string()));
         self.stick_to_bottom = true;
+        self.mark_dirty();
+    }
+
+    /// Handle a builtin slash command locally (without sending to agent).
+    pub fn handle_builtin_command(&mut self, name: &str) {
+        let theme = &crate::tui::theme::THEME;
+        match name {
+            "help" => {
+                let hint = self.slash_registry.hint(20);
+                self.push_lines(vec![
+                    Line::from(Span::styled(
+                        "Available commands:",
+                        Style::default().fg(theme.text),
+                    )),
+                    Line::from(Span::styled(hint, Style::default().fg(theme.text_dim))),
+                ]);
+            }
+            "copy" => {
+                if self.last_copyable_output.is_some() {
+                    self.push_lines(vec![Line::from(Span::styled(
+                        "Copied to clipboard.",
+                        Style::default().fg(theme.success),
+                    ))]);
+                } else {
+                    self.push_lines(vec![Line::from(Span::styled(
+                        "No output to copy.",
+                        Style::default().fg(theme.warn),
+                    ))]);
+                }
+            }
+            "cost" => {
+                let input = self.session_input_tokens;
+                let output = self.session_output_tokens;
+                let turns = self.session_turn_count;
+                self.push_lines(vec![Line::from(Span::styled(
+                    format!(
+                        "Session: {turns} turns, {input} input tokens, {output} output tokens"
+                    ),
+                    Style::default().fg(theme.text),
+                ))]);
+            }
+            "status" => {
+                let mode = match self.permission_mode {
+                    zerobot_core::config::PermissionMode::Default => "default",
+                    zerobot_core::config::PermissionMode::Plan => "plan",
+                    zerobot_core::config::PermissionMode::AcceptEdits => "auto-edit",
+                    zerobot_core::config::PermissionMode::BypassPermissions => "bypass",
+                };
+                self.push_lines(vec![Line::from(Span::styled(
+                    format!(
+                        "Model: {} | Provider: {} | Mode: {}",
+                        self.model, self.provider_id, mode
+                    ),
+                    Style::default().fg(theme.text),
+                ))]);
+            }
+            _ => {
+                self.push_lines(vec![Line::from(Span::styled(
+                    format!("/{name}: not implemented yet"),
+                    Style::default().fg(theme.text_muted),
+                ))]);
+            }
+        }
         self.mark_dirty();
     }
 
@@ -524,8 +600,8 @@ impl AppState {
 
                 // Handle slash commands
                 if let Some(cmd) = raw.strip_prefix('/') {
-                    let cmd = cmd.trim().to_lowercase();
-                    match cmd.as_str() {
+                    let cmd_name = cmd.trim().to_lowercase();
+                    match cmd_name.as_str() {
                         "exit" | "quit" | "q" => {
                             self.should_quit = true;
                             return Command::Quit;
@@ -542,12 +618,56 @@ impl AppState {
                         }
                         _ => {}
                     }
+                    // Look up in slash registry (clone to release borrow on self)
+                    if let Some(spec) = self.slash_registry.find(&cmd_name) {
+                        let name = spec.name.clone();
+                        let kind = spec.kind.clone();
+                        match kind {
+                            SlashCommandKind::Builtin => {
+                                self.handle_builtin_command(&name);
+                                return Command::None;
+                            }
+                            SlashCommandKind::Template(tpl) => {
+                                // Echo the command
+                                self.push_lines(vec![Line::from(Span::styled(
+                                    format!("> /{name}"),
+                                    Style::default().fg(
+                                        crate::tui::theme::THEME.input_prompt,
+                                    ),
+                                ))]);
+                                self.status = Status::Thinking;
+                                self.thinking_start = Some(Instant::now());
+                                self.spinner_verb =
+                                    SPINNER_VERBS[self.output.len() % SPINNER_VERBS.len()]
+                                        .to_string();
+                                return Command::SpawnAgent {
+                                    prompt: tpl.template,
+                                };
+                            }
+                        }
+                    }
+                    // Unknown command
+                    self.push_lines(vec![Line::from(Span::styled(
+                        format!("Unknown command: /{cmd_name}"),
+                        Style::default()
+                            .fg(crate::tui::theme::THEME.error),
+                    ))]);
+                    return Command::None;
                 }
 
-                // Show user input in output area
-                self.push_block(DotColor::White, &raw);
+                // Show user input in output area with ">" prefix
+                self.push_lines(vec![Line::from(vec![
+                    Span::styled(
+                        "> ",
+                        Style::default()
+                            .fg(crate::tui::theme::THEME.input_prompt),
+                    ),
+                    Span::raw(raw.clone()),
+                ])]);
                 self.status = Status::Thinking;
                 self.thinking_start = Some(Instant::now());
+                self.spinner_verb =
+                    SPINNER_VERBS[self.output.len() % SPINNER_VERBS.len()].to_string();
                 Command::SpawnAgent { prompt: raw }
             }
             Message::InputMoveCursor(delta) => {

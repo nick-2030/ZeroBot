@@ -69,7 +69,7 @@ impl BottomArea {
     ///
     /// - Base: 3 (InputLine with top+bottom borders + content)
     /// - +1 for spinner line when status is not Idle
-    /// - +N for slash suggestions (up to 8 rows)
+    /// - +N for slash suggestions (up to 8 rows + 2 for top/bottom border)
     pub fn height_needed(state: &AppState) -> u16 {
         let base = 3;
         let spinner = if !matches!(state.status, Status::Idle) {
@@ -78,7 +78,7 @@ impl BottomArea {
             0
         };
         let slash = if state.slash_query.is_some() && !state.slash_matches.is_empty() {
-            state.slash_matches.len().min(8) as u16
+            state.slash_matches.len().min(8) as u16 + 2 // +2 for top/bottom border
         } else {
             0
         };

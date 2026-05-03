@@ -1,7 +1,7 @@
 //! Spinner component — animated status indicator above the input area.
 //!
-//! Displays a ping-pong animated character sequence with status text and
-//! elapsed time, matching Claude Code's spinner style.
+//! Displays a braille-dots rotating animation with a random verb and elapsed
+//! time, matching Claude Code's spinner style.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -12,9 +12,9 @@ use ratatui::widgets::Widget;
 use crate::tui::app::{AppState, Status};
 use crate::tui::theme::THEME;
 
-/// Animated spinner frames (ping-pong cycle, matching Claude Code).
-const SPINNER_FRAMES: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
-const SPINNER_INTERVAL_MS: u128 = 100;
+/// Braille dots rotating animation frames.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS: u128 = 80;
 
 pub struct Spinner;
 
@@ -62,10 +62,15 @@ impl Spinner {
             .unwrap_or_default();
         let frame = Self::current_frame(elapsed.as_millis());
         let elapsed_str = Self::format_elapsed(elapsed);
+        let verb = if state.spinner_verb.is_empty() {
+            status_text
+        } else {
+            state.spinner_verb.as_str()
+        };
 
         let line = Line::from(vec![
             Span::styled(format!(" {frame} "), Style::default().fg(theme.accent)),
-            Span::styled(status_text.to_string(), Style::default().fg(theme.thinking)),
+            Span::styled(verb.to_string(), Style::default().fg(theme.thinking)),
             Span::styled(
                 format!(" ({elapsed_str})"),
                 Style::default().fg(theme.text_muted),
