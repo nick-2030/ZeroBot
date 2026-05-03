@@ -178,7 +178,7 @@ pub struct AppState {
 
     // -- Misc --
     pub status_notice: Option<String>,
-    pub dirty: bool,
+    dirty: bool,
     pub last_copyable_output: Option<String>,
 
     // -- Blink timer --
