@@ -38,8 +38,8 @@ impl InputLine {
             }
         }
 
-        // Render the prompt prefix "> "
-        let prompt = "> ";
+        // Render the prompt prefix "❯ "
+        let prompt = "\u{276F} ";
         let prompt_style = Style::default()
             .fg(theme.input_prompt)
             .add_modifier(Modifier::BOLD);

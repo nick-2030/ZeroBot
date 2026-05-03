@@ -32,6 +32,8 @@ impl SlashSuggestions {
         }
 
         // Draw content rows with side borders
+        // Format: │ /name     description    │  (description right-aligned)
+        let inner_w = area.width.saturating_sub(2) as usize;
         for i in 0..max_visible {
             let m = &state.slash_matches[i as usize];
             let y = area.y + 1 + i;
@@ -43,7 +45,7 @@ impl SlashSuggestions {
             } else {
                 Style::default().fg(theme.text).bg(theme.panel_bg)
             };
-            let text = format!(" {} - {}", m.name, m.description);
+
             // Left border
             buf.set_string(
                 area.x,
@@ -51,14 +53,53 @@ impl SlashSuggestions {
                 "\u{2502}",
                 Style::default().fg(theme.panel_border).bg(theme.panel_bg),
             );
-            // Content (padded to fill width)
-            let inner_w = area.width.saturating_sub(2) as usize;
-            let padded = if text.len() < inner_w {
-                format!("{text}{:<width$}", "", width = inner_w - text.len())
+
+            // Build the content: " /name  description" padded to fill width
+            let cmd_part = format!(" /{}", m.name);
+            let desc_part = format!("{} ", m.description);
+            // Fill between cmd and desc with spaces
+            let used = cmd_part.chars().count() + desc_part.chars().count();
+            let padding = if used < inner_w {
+                " ".repeat(inner_w - used)
             } else {
-                text.chars().take(inner_w).collect()
+                String::new()
             };
-            buf.set_string(area.x + 1, y, &padded, content_style);
+            let full_text = format!("{cmd_part}{padding}{desc_part}");
+
+            // Truncate if too long
+            let display: String = full_text.chars().take(inner_w).collect();
+            let padded = if display.chars().count() < inner_w {
+                format!(
+                    "{display}{:<width$}",
+                    "",
+                    width = inner_w - display.chars().count()
+                )
+            } else {
+                display
+            };
+
+            // Render with two styles: name part dimmed, description part normal
+            let name_len = cmd_part.chars().count();
+            let name_str: String = padded.chars().take(name_len).collect();
+            let rest_str: String = padded.chars().skip(name_len).collect();
+
+            let name_style = if i as usize == state.slash_selected {
+                Style::default()
+                    .fg(theme.text_dim)
+                    .bg(theme.selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim).bg(theme.panel_bg)
+            };
+
+            buf.set_string(area.x + 1, y, &name_str, name_style);
+            buf.set_string(
+                area.x + 1 + name_len as u16,
+                y,
+                &rest_str,
+                content_style,
+            );
+
             // Right border
             buf.set_string(
                 area.x + area.width - 1,

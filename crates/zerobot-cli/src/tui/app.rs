@@ -630,7 +630,7 @@ impl AppState {
                             SlashCommandKind::Template(tpl) => {
                                 // Echo the command
                                 self.push_lines(vec![Line::from(Span::styled(
-                                    format!("> /{name}"),
+                                    format!("\u{276F} /{name}"),
                                     Style::default().fg(
                                         crate::tui::theme::THEME.input_prompt,
                                     ),
@@ -655,10 +655,10 @@ impl AppState {
                     return Command::None;
                 }
 
-                // Show user input in output area with ">" prefix
+                // Show user input in output area with "❯" prefix
                 self.push_lines(vec![Line::from(vec![
                     Span::styled(
-                        "> ",
+                        "\u{276F} ",
                         Style::default()
                             .fg(crate::tui::theme::THEME.input_prompt),
                     ),

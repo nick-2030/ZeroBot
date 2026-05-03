@@ -808,114 +808,44 @@ fn build_welcome_lines(
     provider: &str,
     model: &str,
     cwd: &str,
-    term_width: usize,
+    _term_width: usize,
 ) -> Vec<ratatui::text::Line<'static>> {
-    use ratatui::style::Style;
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
 
-    let logo = [
-        "███████╗███████╗██████╗  ██████╗ ██████╗  ██████╗ ████████╗",
-        "╚══███╔╝██╔════╝██╔══██╗██╔═══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
-        "  ███╔╝ █████╗  ██████╔╝██║   ██║██████╔╝██║   ██║   ██║   ",
-        " ███╔╝  ██╔════╝██╔══██╗██║   ██║██╔══██╗██║   ██║   ██║   ",
-        "███████╗███████╗██║  ██║╚██████╔╝██████╔╝╚██████╔╝   ██║   ",
-        "╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝  ╚═════╝    ╚═╝   ",
-    ];
-
-    let title = format!(">_ zerobot (v{version})");
-    let meta_line = format!("{provider} | {model}");
-    let help = "输入 /help 查看命令";
-    let box_lines = [title, meta_line, cwd.to_string(), help.to_string()];
-
-    let logo_width = logo.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let box_width = box_lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0)
-        + 4;
-    let min_width = logo_width + 2 + box_width;
-
-    let mut out = Vec::new();
     let theme = &*THEME;
 
-    if term_width >= min_width {
-        let inner = box_width.saturating_sub(2);
-        let top = format!("\u{256D}{}\u{256E}", "\u{2500}".repeat(inner));
-        let bottom = format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner));
-        let mut box_rendered: Vec<(String, bool)> = Vec::new();
-        box_rendered.push((top, true));
-        for line in &box_lines {
-            use unicode_width::UnicodeWidthStr;
-            let pad = inner.saturating_sub(UnicodeWidthStr::width(line.as_str()));
-            box_rendered.push((format!("\u{2502}{}{}\u{2502}", line, " ".repeat(pad)), false));
-        }
-        box_rendered.push((bottom, true));
+    // Compact logo — unique ZeroBot design
+    let logo_lines = [
+        " \u{2571}\u{2572}  ZeroBot",
+        "   v{version}",
+        " \u{2572}\u{2571}",
+    ];
+    let logo_lines: Vec<String> = logo_lines
+        .iter()
+        .map(|s| s.replace("{version}", version))
+        .collect();
+    let info_lines = [
+        format!("{provider} \u{00B7} {model}"),
+        cwd.to_string(),
+    ];
 
-        let rows = logo.len().max(box_rendered.len());
-        for i in 0..rows {
-            let left = *logo.get(i).unwrap_or(&"");
-            let left_pad = logo_width.saturating_sub(left.chars().count());
-            let right = box_rendered.get(i).map(|(s, _)| s.as_str()).unwrap_or("");
-            let right_is_border = box_rendered.get(i).map(|(_, b)| *b).unwrap_or(false);
-            let mut spans = Vec::new();
+    let mut out = Vec::new();
+    for (i, logo) in logo_lines.iter().enumerate() {
+        let mut spans = vec![Span::styled(
+            logo.to_string(),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )];
+        if let Some(info) = info_lines.get(i) {
+            spans.push(Span::raw("   "));
             spans.push(Span::styled(
-                left.to_string(),
-                Style::default().fg(theme.accent),
+                info.to_string(),
+                Style::default().fg(theme.text),
             ));
-            spans.push(Span::raw(" ".repeat(left_pad)));
-            spans.push(Span::raw("  "));
-            if right_is_border {
-                spans.push(Span::styled(
-                    right.to_string(),
-                    Style::default().fg(theme.panel_border),
-                ));
-            } else {
-                let mut chars = right.chars();
-                let left_border = chars.next().unwrap_or('\u{2502}').to_string();
-                let right_border = right.chars().last().unwrap_or('\u{2502}').to_string();
-                let middle: String = right
-                    .chars()
-                    .skip(1)
-                    .take(right.chars().count().saturating_sub(2))
-                    .collect();
-                spans.push(Span::styled(
-                    left_border,
-                    Style::default().fg(theme.panel_border),
-                ));
-                spans.push(Span::raw(middle));
-                spans.push(Span::styled(
-                    right_border,
-                    Style::default().fg(theme.panel_border),
-                ));
-            }
-            out.push(Line::from(spans));
         }
-    } else {
-        let inner = box_width.saturating_sub(2).max(10);
-        out.push(Line::from(Span::styled(
-            format!("\u{256D}{}\u{256E}", "\u{2500}".repeat(inner)),
-            Style::default().fg(theme.panel_border),
-        )));
-        for line in &box_lines {
-            use unicode_width::UnicodeWidthStr;
-            let pad = inner.saturating_sub(UnicodeWidthStr::width(line.as_str()));
-            let mut spans = Vec::new();
-            spans.push(Span::styled(
-                "\u{2502}".to_string(),
-                Style::default().fg(theme.panel_border),
-            ));
-            spans.push(Span::raw(format!("{}{}", line, " ".repeat(pad))));
-            spans.push(Span::styled(
-                "\u{2502}".to_string(),
-                Style::default().fg(theme.panel_border),
-            ));
-            out.push(Line::from(spans));
-        }
-        out.push(Line::from(Span::styled(
-            format!("\u{2570}{}\u{256F}", "\u{2500}".repeat(inner)),
-            Style::default().fg(theme.panel_border),
-        )));
+        out.push(Line::from(spans));
     }
+    // Empty line after logo
+    out.push(Line::from(Span::raw("")));
     out
 }
