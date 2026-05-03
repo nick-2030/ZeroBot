@@ -13,6 +13,7 @@ use zerobot_core::provider::TokenUsage;
 use zerobot_core::session::TodoItem;
 
 use crate::slash::SlashMatch;
+use crate::tui::keybindings::types::KeyContext;
 use crate::tui::overlay::OverlayType;
 
 // ---------------------------------------------------------------------------
@@ -89,22 +90,6 @@ pub struct RunningTool {
     pub label: String,
     pub arguments: String,
     pub start_time: Instant,
-}
-
-// ---------------------------------------------------------------------------
-// Keybinding context (temporary — will be moved to keybindings/types.rs in Task 4)
-// ---------------------------------------------------------------------------
-
-/// Describes the current keybinding context so the dispatcher can select the
-/// right key-map layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KeyContext {
-    Global,
-    Chat,
-    Autocomplete,
-    HistorySearch,
-    Help,
-    Confirmation,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,10 +291,8 @@ impl AppState {
                 // UserInput overlays don't have a dedicated context yet; they
                 // inherit Confirmation semantics for now.
                 OverlayType::UserInput(_) => ctxs.push(KeyContext::Confirmation),
-                // MessageSelector and TurnCost use Confirmation context for now.
-                OverlayType::MessageSelector(_) | OverlayType::TurnCost(_) => {
-                    ctxs.push(KeyContext::Confirmation)
-                }
+                OverlayType::MessageSelector(_) => ctxs.push(KeyContext::MessageSelector),
+                OverlayType::TurnCost(_) => ctxs.push(KeyContext::Confirmation),
             }
         } else if self.slash_query.is_some() {
             ctxs.push(KeyContext::Autocomplete);
