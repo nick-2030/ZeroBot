@@ -12,7 +12,7 @@ use zerobot_core::config::PermissionMode;
 use zerobot_core::provider::TokenUsage;
 use zerobot_core::session::TodoItem;
 
-use crate::slash::SlashMatch;
+use crate::slash::{SlashMatch, SlashRegistry};
 use crate::tui::command::Command;
 use crate::tui::keybindings::types::KeyContext;
 use crate::tui::message::Message;
@@ -66,6 +66,7 @@ pub enum OutputItem {
     Markdown(String),
     ToolRunning {
         label: String,
+        arguments: String,
     },
     ToolOutput {
         color: DotColor,
@@ -138,6 +139,7 @@ pub struct AppState {
     pub overlay_prev_status: Option<Status>,
 
     // -- Slash / autocomplete --
+    pub slash_registry: SlashRegistry,
     pub slash_query: Option<String>,
     pub slash_matches: Vec<SlashMatch>,
     pub slash_selected: usize,
@@ -172,6 +174,9 @@ pub struct AppState {
     // -- Blink timer --
     blink_on: bool,
     last_blink: Instant,
+
+    // -- Spinner --
+    pub thinking_start: Option<Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +212,7 @@ impl AppState {
             overlay: None,
             overlay_queue: VecDeque::new(),
             overlay_prev_status: None,
+            slash_registry: SlashRegistry::extended(vec![]),
             slash_query: None,
             slash_matches: Vec::new(),
             slash_selected: 0,
@@ -227,6 +233,7 @@ impl AppState {
             last_copyable_output: None,
             blink_on: true,
             last_blink: Instant::now(),
+            thinking_start: None,
         }
     }
 
@@ -262,13 +269,17 @@ impl AppState {
     /// (meaning a re-render is needed for the cursor).
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
+        let mut dirty = false;
         if now.duration_since(self.last_blink) >= BLINK_INTERVAL {
             self.blink_on = !self.blink_on;
             self.last_blink = now;
-            true
-        } else {
-            false
+            dirty = true;
         }
+        // Re-render while spinner is active (for animation)
+        if self.thinking_start.is_some() {
+            dirty = true;
+        }
+        dirty
     }
 
     /// Whether the cursor blink is currently in the "on" phase.
@@ -305,6 +316,21 @@ impl AppState {
         ctxs
     }
 
+    // -- Slash autocomplete ----------------------------------------------------
+
+    /// Update slash query state based on current input.
+    fn update_slash_state(&mut self) {
+        if self.input.starts_with('/') {
+            let query = &self.input[1..];
+            self.slash_query = Some(self.input.clone());
+            self.slash_matches = self.slash_registry.matches(query);
+            self.slash_selected = 0;
+        } else {
+            self.slash_query = None;
+            self.slash_matches.clear();
+        }
+    }
+
     // -- Output helpers ---------------------------------------------------------
 
     pub fn push_lines(&mut self, lines: Vec<Line<'static>>) {
@@ -334,6 +360,7 @@ impl AppState {
     pub fn push_running_tool(&mut self, tool_call_id: &str, label: &str, arguments: &str) {
         self.output.push(OutputItem::ToolRunning {
             label: label.to_string(),
+            arguments: arguments.to_string(),
         });
         let idx = self.output.len().saturating_sub(1);
         self.running_tools.insert(
@@ -455,12 +482,12 @@ impl AppState {
             Message::InputChar(ch) => {
                 self.input.insert(self.cursor, ch);
                 self.cursor += ch.len_utf8();
+                self.update_slash_state();
                 self.mark_dirty();
                 Command::None
             }
             Message::InputBackspace => {
                 if self.cursor > 0 {
-                    // Find the previous char boundary
                     let prev = self.input[..self.cursor]
                         .char_indices()
                         .last()
@@ -468,6 +495,7 @@ impl AppState {
                         .unwrap_or(0);
                     self.input.drain(prev..self.cursor);
                     self.cursor = prev;
+                    self.update_slash_state();
                     self.mark_dirty();
                 }
                 Command::None
@@ -491,6 +519,8 @@ impl AppState {
                 let raw = self.input.trim().to_string();
                 self.input.clear();
                 self.cursor = 0;
+                self.slash_query = None;
+                self.slash_matches.clear();
 
                 // Handle slash commands
                 if let Some(cmd) = raw.strip_prefix('/') {
@@ -517,6 +547,7 @@ impl AppState {
                 // Show user input in output area
                 self.push_block(DotColor::White, &raw);
                 self.status = Status::Thinking;
+                self.thinking_start = Some(Instant::now());
                 Command::SpawnAgent { prompt: raw }
             }
             Message::InputMoveCursor(delta) => {
@@ -715,11 +746,13 @@ impl AppState {
             Message::AgentDone => {
                 self.finalize_stream();
                 self.status = Status::Idle;
+                self.thinking_start = None;
                 Command::None
             }
             Message::AgentError(err) => {
                 self.finalize_stream();
                 self.status = Status::Error(err.clone());
+                self.thinking_start = None;
                 self.push_block(DotColor::Red, &err);
                 Command::None
             }
@@ -848,15 +881,41 @@ impl AppState {
 
             // -- Slash --
             Message::SlashQuery(_) => {
-                // Handled by the input handler
+                // Slash state is managed by update_slash_state()
                 Command::None
             }
             Message::SlashSelect => {
-                // Handled by the input handler
+                if let Some(selected) = self.slash_matches.get(self.slash_selected) {
+                    let cmd = format!("/{}", selected.name);
+                    self.input = cmd;
+                    self.cursor = self.input.len();
+                    self.slash_query = None;
+                    self.slash_matches.clear();
+                    self.mark_dirty();
+                }
                 Command::None
             }
-            Message::SlashExecute(cmd) => Command::SpawnAgent { prompt: cmd },
-            Message::SlashPage(_) => Command::None,
+            Message::SlashExecute(cmd) => {
+                self.slash_query = None;
+                self.slash_matches.clear();
+                Command::SpawnAgent { prompt: cmd }
+            }
+            Message::SlashPage(delta) => {
+                if !self.slash_matches.is_empty() {
+                    let len = self.slash_matches.len();
+                    if delta > 0 {
+                        self.slash_selected = (self.slash_selected + 1) % len;
+                    } else if delta < 0 {
+                        self.slash_selected = if self.slash_selected == 0 {
+                            len - 1
+                        } else {
+                            self.slash_selected - 1
+                        };
+                    }
+                    self.mark_dirty();
+                }
+                Command::None
+            }
 
             // -- History --
             Message::HistorySearch(_) => Command::None,

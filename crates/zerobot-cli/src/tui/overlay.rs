@@ -13,7 +13,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui::buffer::Buffer;
 
-use zerobot_core::config::ToolApprovalMode;
 use zerobot_core::interaction::{
     ToolApprovalDecision, ToolApprovalRequest, ToolApprovalResponse,
     UserInputAnswer, UserInputRequest, UserInputResponse,
@@ -92,59 +91,33 @@ impl ToolApprovalOverlay {
 
     fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+
+        // Title: tool name in bold
         lines.push(Line::from(Span::styled(
-            "需要工具授权".to_string(),
+            self.request.tool_name.clone(),
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(theme.accent),
         )));
-        lines.push(Line::from(Span::styled(
-            format!("工具: {}", self.request.tool_name),
-            Style::default().fg(theme.text),
-        )));
-        if let Some(reason) = &self.request.reason {
-            if !reason.trim().is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("原因: {reason}"),
-                    Style::default().fg(theme.text_muted),
-                )));
-            }
-        }
-        if let Some(auto_decision) = &self.request.auto_decision {
-            let decision_str = match auto_decision {
-                ToolApprovalMode::Auto => "自动允许",
-                ToolApprovalMode::Prompt => "需要确认",
-                ToolApprovalMode::Deny => "自动拒绝",
-            };
-            lines.push(Line::from(Span::styled(
-                format!("自动决策: {decision_str}"),
-                Style::default().fg(theme.warn),
-            )));
-        }
-        if let Some(decision_reason) = &self.request.decision_reason {
-            lines.push(Line::from(Span::styled(
-                format!("决策原因: {decision_reason}"),
-                Style::default().fg(theme.text_muted),
-            )));
-        }
 
-        // Per-tool specialized display
+        // Key parameter (command for bash, path for file tools, etc.)
         let detail_lines = tool_approval_detail_lines(&self.request, theme);
-        if detail_lines.is_empty() {
-            // Generic fallback: show raw arguments
-            if let Ok(args) = serde_json::to_string(&self.request.arguments) {
-                let args = one_line(&args);
-                if !args.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("参数: {args}"),
-                        Style::default().fg(theme.text_muted),
-                    )));
-                }
-            }
-        } else {
+        if !detail_lines.is_empty() {
             lines.extend(detail_lines);
+        } else if let Ok(args) = serde_json::to_string(&self.request.arguments) {
+            let args = one_line(&args);
+            if !args.is_empty() {
+                lines.push(Line::from(Span::styled(args, Style::default().fg(theme.text))));
+            }
         }
 
+        // Question
+        lines.push(Line::from(Span::styled(
+            "是否允许执行？",
+            Style::default().fg(theme.text_muted),
+        )));
+
+        // Options
         let options = ["仅本次允许", "本会话允许", "本工作区允许", "拒绝"];
         for (idx, opt) in options.iter().enumerate() {
             let selected = idx == self.selected;
@@ -156,27 +129,15 @@ impl ToolApprovalOverlay {
             };
             lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
         }
-        lines.push(Line::from(Span::styled(
-            "↑/↓ 选择  Enter 确认  Esc 取消",
-            Style::default().fg(theme.text_muted),
-        )));
         lines
     }
 }
 
 impl OverlayComponent for ToolApprovalOverlay {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
-        let lines = self.lines(theme);
-        let style = Style::default().bg(theme.panel_bg);
-        for (idx, line) in lines.iter().enumerate() {
-            let y = area.y + idx as u16;
-            if y >= area.y + area.height {
-                break;
-            }
-            buf.set_style(Rect::new(area.x, y, area.width, 1), style);
-            let inner = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
-            Widget::render(ratatui::widgets::Paragraph::new(line.clone()), inner, buf);
-        }
+        render_top_border(buf, area, theme);
+        let content = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+        render_overlay_content(buf, content, &self.lines(theme), theme);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -212,19 +173,24 @@ impl OverlayComponent for ToolApprovalOverlay {
     }
 
     fn height_needed(&self, _width: u16) -> u16 {
-        // Title + tool name + reason line (optional) + 4 options + help text = ~8
-        let mut h = 2; // title + tool name
-        if self.request.reason.is_some() {
-            h += 1;
+        // Top border + title + detail + question + 4 options
+        let mut h = 1; // top border
+        h += 1; // title (tool name)
+        // detail lines (bash command, file path, etc.)
+        h += 1; // at least one detail/fallback line
+        // destructive warning for bash
+        if self.request.tool_name == "bash" || self.request.tool_name == "shell" {
+            if let Some(cmd) = self.request.arguments.get("command").and_then(|v| v.as_str()) {
+                if cmd.contains("rm ") || cmd.contains("rm -") || cmd.contains("rmdir")
+                    || cmd.contains("mkfs") || cmd.contains("dd ") || cmd.contains("> /dev/")
+                    || cmd.contains("chmod -R") || cmd.contains("chown -R")
+                {
+                    h += 1;
+                }
+            }
         }
-        if self.request.auto_decision.is_some() {
-            h += 1;
-        }
-        if self.request.decision_reason.is_some() {
-            h += 1;
-        }
+        h += 1; // "是否允许执行？"
         h += 4; // options
-        h += 1; // help
         h
     }
 }
@@ -425,17 +391,9 @@ impl UserInputOverlay {
 
 impl OverlayComponent for UserInputOverlay {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
-        let lines = self.lines(theme);
-        let style = Style::default().bg(theme.panel_bg);
-        for (idx, line) in lines.iter().enumerate() {
-            let y = area.y + idx as u16;
-            if y >= area.y + area.height {
-                break;
-            }
-            buf.set_style(Rect::new(area.x, y, area.width, 1), style);
-            let inner = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
-            Widget::render(ratatui::widgets::Paragraph::new(line.clone()), inner, buf);
-        }
+        render_top_border(buf, area, theme);
+        let content = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+        render_overlay_content(buf, content, &self.lines(theme), theme);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -523,7 +481,8 @@ impl OverlayComponent for UserInputOverlay {
     }
 
     fn height_needed(&self, _width: u16) -> u16 {
-        let mut h = 1; // title
+        let mut h = 1; // top border
+        h += 1; // title
         if self.request.questions.len() > 1 {
             h += 1; // question tabs
         }
@@ -658,17 +617,9 @@ impl Default for HistorySearchOverlay {
 
 impl OverlayComponent for HistorySearchOverlay {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
-        let lines = self.lines(theme);
-        let style = Style::default().bg(theme.panel_bg);
-        for (idx, line) in lines.iter().enumerate() {
-            let y = area.y + idx as u16;
-            if y >= area.y + area.height {
-                break;
-            }
-            buf.set_style(Rect::new(area.x, y, area.width, 1), style);
-            let inner = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
-            Widget::render(ratatui::widgets::Paragraph::new(line.clone()), inner, buf);
-        }
+        render_top_border(buf, area, theme);
+        let content = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1));
+        render_overlay_content(buf, content, &self.lines(theme), theme);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Message> {
@@ -753,7 +704,8 @@ impl OverlayComponent for HistorySearchOverlay {
     }
 
     fn height_needed(&self, _width: u16) -> u16 {
-        let mut h = 2; // title + query line
+        let mut h = 1; // top border
+        h += 2; // title + query line
         if self.query.is_empty() {
             h += 1;
         } else if self.results.is_empty() {
@@ -848,10 +800,6 @@ fn tool_approval_detail_lines(
 
     match tool_name {
         "bash" | "shell" => {
-            lines.push(Line::from(Span::styled(
-                "类型: Shell 命令",
-                Style::default().fg(theme.accent),
-            )));
             if let Some(cmd) = request.arguments.get("command").and_then(|v| v.as_str()) {
                 let is_destructive = cmd.contains("rm ")
                     || cmd.contains("rm -")
@@ -866,10 +814,7 @@ fn tool_approval_detail_lines(
                 } else {
                     Style::default().fg(theme.text)
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("命令: {cmd}"),
-                    cmd_style,
-                )));
+                lines.push(Line::from(Span::styled(cmd.to_string(), cmd_style)));
                 if is_destructive {
                     lines.push(Line::from(Span::styled(
                         "⚠ 检测到潜在破坏性操作",
@@ -879,58 +824,61 @@ fn tool_approval_detail_lines(
             }
         }
         "write" | "edit" | "apply_patch" | "patch" => {
-            lines.push(Line::from(Span::styled(
-                "类型: 文件写入",
-                Style::default().fg(theme.accent),
-            )));
             if let Some(path) = request.arguments.get("file_path")
                 .or_else(|| request.arguments.get("path"))
                 .and_then(|v| v.as_str())
             {
-                let is_absolute = path.starts_with('/');
-                let path_style = if is_absolute
-                    && !path.starts_with("/Users/")
-                    && !path.starts_with("/home/")
-                {
-                    Style::default().fg(theme.warn)
-                } else {
-                    Style::default().fg(theme.text)
-                };
                 lines.push(Line::from(Span::styled(
-                    format!("文件: {path}"),
-                    path_style,
-                )));
-                if is_absolute && !path.starts_with("/Users/") && !path.starts_with("/home/") {
-                    lines.push(Line::from(Span::styled(
-                        "⚠ 写入系统路径",
-                        Style::default().fg(theme.warn),
-                    )));
-                }
-            }
-        }
-        "skill" => {
-            lines.push(Line::from(Span::styled(
-                "类型: 技能调用",
-                Style::default().fg(theme.accent),
-            )));
-            if let Some(name) = request.arguments.get("name").and_then(|v| v.as_str()) {
-                lines.push(Line::from(Span::styled(
-                    format!("技能: {name}"),
+                    path.to_string(),
                     Style::default().fg(theme.text),
                 )));
             }
-            if let Some(args) = request.arguments.get("args").and_then(|v| v.as_str()) {
-                if !args.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("参数: {args}"),
-                        Style::default().fg(theme.text_muted),
-                    )));
-                }
+        }
+        "skill" => {
+            if let Some(name) = request.arguments.get("name").and_then(|v| v.as_str()) {
+                lines.push(Line::from(Span::styled(
+                    name.to_string(),
+                    Style::default().fg(theme.text),
+                )));
             }
         }
         _ => {}
     }
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Shared overlay rendering helpers
+// ---------------------------------------------------------------------------
+
+/// Render a rounded top border line (`╭────╮`) above overlay content.
+fn render_top_border(buf: &mut Buffer, area: Rect, theme: &Theme) {
+    if area.height == 0 || area.width < 3 {
+        return;
+    }
+    let style = Style::default().fg(theme.panel_border).bg(theme.panel_bg);
+    buf.set_string(area.x, area.y, "\u{256D}", style); // ╭
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let hline: String = "\u{2500}".repeat(inner_w); // ─
+    buf.set_string(area.x + 1, area.y, &hline, style);
+    buf.set_string(area.x + area.width - 1, area.y, "\u{256E}", style); // ╮
+    for x in area.x..area.x + area.width {
+        buf.get_mut(x, area.y).set_style(Style::default().bg(theme.panel_bg));
+    }
+}
+
+/// Render overlay content lines below the top border.
+fn render_overlay_content(buf: &mut Buffer, area: Rect, lines: &[Line<'_>], theme: &Theme) {
+    let style = Style::default().bg(theme.panel_bg);
+    for (idx, line) in lines.iter().enumerate() {
+        let y = area.y + idx as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        buf.set_style(Rect::new(area.x, y, area.width, 1), style);
+        let inner = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
+        Widget::render(ratatui::widgets::Paragraph::new(line.clone()), inner, buf);
+    }
 }
 
 // ---------------------------------------------------------------------------

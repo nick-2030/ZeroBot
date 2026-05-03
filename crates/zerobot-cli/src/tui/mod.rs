@@ -26,6 +26,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use zerobot_core::agent::Agent;
@@ -248,9 +249,50 @@ async fn run_tui_inner(
                     areas.scroll_box,
                     &app,
                 );
+
+                // Bottom area: spinner (when active) + slash suggestions + input line
+                let bottom = areas.bottom_area;
+                let show_spinner = !matches!(app.status, Status::Idle);
+                let mut y_offset = 0u16;
+
+                // Spinner row
+                if show_spinner && bottom.height > 1 {
+                    let sa = Rect::new(bottom.x, bottom.y, bottom.width, 1);
+                    components::spinner::Spinner::render(frame.buffer_mut(), sa, &app);
+                    y_offset += 1;
+                }
+
+                // Slash suggestions
+                let show_slash = app.slash_query.is_some() && !app.slash_matches.is_empty();
+                if show_slash {
+                    let slash_h = (app.slash_matches.len().min(8) as u16)
+                        .min(bottom.height.saturating_sub(y_offset).saturating_sub(1));
+                    if slash_h > 0 {
+                        let slash_area = Rect::new(
+                            bottom.x,
+                            bottom.y + y_offset,
+                            bottom.width,
+                            slash_h,
+                        );
+                        components::slash_suggestions::SlashSuggestions::render(
+                            frame.buffer_mut(),
+                            slash_area,
+                            &app,
+                        );
+                        y_offset += slash_h;
+                    }
+                }
+
+                // Input line
+                let input_area = Rect::new(
+                    bottom.x,
+                    bottom.y + y_offset,
+                    bottom.width,
+                    bottom.height.saturating_sub(y_offset),
+                );
                 components::input_line::InputLine::render(
                     frame.buffer_mut(),
-                    areas.bottom_area,
+                    input_area,
                     &app,
                 );
                 components::status_bar::StatusBar::render(
@@ -269,7 +311,7 @@ async fn run_tui_inner(
                 if app.overlay.is_none() {
                     if let Some((cx, cy)) =
                         components::input_line::InputLine::cursor_position(
-                            areas.bottom_area,
+                            input_area,
                             &app,
                         )
                     {
@@ -552,6 +594,10 @@ fn map_action_to_message(action: KeyAction, _app: &AppState) -> Message {
         KeyAction::ToggleTranscript => Message::ToggleFullToolOutput,
         KeyAction::LineUp => Message::ScrollUp,
         KeyAction::LineDown => Message::ScrollDown,
+        KeyAction::AutocompleteAccept => Message::SlashSelect,
+        KeyAction::AutocompleteDismiss => Message::SlashQuery(String::new()),
+        KeyAction::AutocompletePrevious => Message::SlashPage(-1),
+        KeyAction::AutocompleteNext => Message::SlashPage(1),
         _ => Message::Noop,
     }
 }
@@ -687,6 +733,7 @@ fn abort_runner(runner: &mut Option<JoinHandle<ZeroBotResult<String>>>, app: &mu
         handle.abort();
     }
     app.finalize_stream();
+    app.thinking_start = None;
     // Mark any still-running tools as interrupted
     let running: Vec<_> = app.running_tools.drain().collect();
     for (_, rt) in running {

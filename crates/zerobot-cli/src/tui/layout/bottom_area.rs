@@ -67,11 +67,22 @@ impl BottomArea {
     /// Compute the height (in rows) that the bottom area needs for the given
     /// application state.
     ///
-    /// Always returns 3: the InputLine component uses top border + content +
-    /// bottom border = 3 rows.  Status/spinner information is conveyed through
-    /// the streaming buffer in the messages area instead.
-    pub fn height_needed(_state: &AppState) -> u16 {
-        3
+    /// - Base: 3 (InputLine with top+bottom borders + content)
+    /// - +1 for spinner line when status is not Idle
+    /// - +N for slash suggestions (up to 8 rows)
+    pub fn height_needed(state: &AppState) -> u16 {
+        let base = 3;
+        let spinner = if !matches!(state.status, Status::Idle) {
+            1
+        } else {
+            0
+        };
+        let slash = if state.slash_query.is_some() && !state.slash_matches.is_empty() {
+            state.slash_matches.len().min(8) as u16
+        } else {
+            0
+        };
+        base + spinner + slash
     }
 }
 
@@ -94,12 +105,12 @@ mod tests {
     #[test]
     fn height_needed_thinking() {
         let state = test_state(Status::Thinking);
-        assert_eq!(BottomArea::height_needed(&state), 3);
+        assert_eq!(BottomArea::height_needed(&state), 4);
     }
 
     #[test]
     fn height_needed_error() {
         let state = test_state(Status::Error("test".into()));
-        assert_eq!(BottomArea::height_needed(&state), 3);
+        assert_eq!(BottomArea::height_needed(&state), 4);
     }
 }

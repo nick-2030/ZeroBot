@@ -65,21 +65,28 @@ impl Messages {
                 OutputItem::Lines(lines) => lines.clone(),
                 OutputItem::Block { color, text } => format_block_lines(*color, text),
                 OutputItem::Markdown(text) => format_markdown_lines(text, width),
-                OutputItem::ToolRunning { label } => {
-                    vec![format_running_tool_line(label, state.blink_on())]
+                OutputItem::ToolRunning { label, arguments } => {
+                    format_running_tool_line(label, arguments, state.blink_on())
                 }
                 OutputItem::ToolOutput {
                     color,
                     tool_name,
                     label,
-                    ..
+                    arguments,
+                    output,
+                    expanded,
+                    duration_ms,
                 } => {
-                    // Simplified rendering — full collapse/expand in a later task.
-                    vec![format_tool_output_simple_line(
+                    format_tool_output_lines(
                         *color,
                         tool_name,
                         label.as_deref(),
-                    )]
+                        arguments,
+                        output,
+                        *expanded,
+                        state.show_full_tool_output,
+                        *duration_ms,
+                    )
                 }
                 OutputItem::HookRunning { label } => {
                     vec![format_running_hook_line(label, state.blink_on())]
@@ -175,39 +182,143 @@ fn format_block_lines(color: DotColor, text: &str) -> Vec<Line<'static>> {
 // Tool / hook line formatters
 // ---------------------------------------------------------------------------
 
-/// Format a running tool indicator line with a blinking dot.
-fn format_running_tool_line(label: &str, blink_on: bool) -> Line<'static> {
+/// Format running tool lines: `[dot] **tool_name** (key_param)`
+fn format_running_tool_line(label: &str, arguments: &str, blink_on: bool) -> Vec<Line<'static>> {
     let theme = &THEME;
-    Line::from(vec![
+    let display = format_tool_display_name(label, arguments);
+    vec![Line::from(vec![
         running_tool_dot_span(blink_on),
         Span::raw(" "),
-        Span::styled(label.to_string(), Style::default().fg(theme.text)),
-    ])
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" ({display})"), Style::default().fg(theme.text_dim)),
+    ])]
 }
 
-/// Simplified tool output line: dot + tool_name + optional label.
-fn format_tool_output_simple_line(
+/// Format completed tool output lines.
+fn format_tool_output_lines(
     color: DotColor,
     tool_name: &str,
     label: Option<&str>,
-) -> Line<'static> {
+    arguments: &str,
+    output: &str,
+    expanded: bool,
+    show_full: bool,
+    duration_ms: Option<u64>,
+) -> Vec<Line<'static>> {
     let theme = &THEME;
-    let mut spans = vec![
+    let mut lines = Vec::new();
+
+    // Header: [dot] **tool_name** (key_param) (duration)
+    let display = format_tool_display_name(tool_name, arguments);
+    let mut header = vec![
         tool_dot_span(color),
         Span::raw(" "),
         Span::styled(
             tool_name.to_string(),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(format!(" ({display})"), Style::default().fg(theme.text_dim)),
     ];
-    if let Some(label) = label {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(theme.text_dim),
+    if let Some(ms) = duration_ms {
+        header.push(Span::styled(
+            format!(" ({ms}ms)"),
+            Style::default().fg(theme.text_muted),
         ));
     }
-    Line::from(spans)
+    lines.push(Line::from(header));
+
+    // Output preview (truncated or expanded)
+    if !output.is_empty() && (expanded || show_full) {
+        for line in output.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+    } else if !output.is_empty() {
+        let preview: Vec<&str> = output.lines().take(3).collect();
+        let total = output.lines().count();
+        for line in &preview {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+        if total > 3 {
+            lines.push(Line::from(Span::styled(
+                format!("  ... (+{} lines)", total - 3),
+                Style::default().fg(theme.text_muted),
+            )));
+        }
+    }
+
+    lines
+}
+
+/// Extract the key display parameter for a tool based on its name.
+fn format_tool_display_name(tool_name: &str, arguments: &str) -> String {
+    let args: Option<serde_json::Value> = serde_json::from_str(arguments).ok();
+    match tool_name.to_lowercase().as_str() {
+        "bash" | "shell" => {
+            if let Some(ref a) = args {
+                if let Some(cmd) = a.get("command").and_then(|v| v.as_str()) {
+                    return truncate_display(cmd, 80);
+                }
+            }
+            truncate_display(arguments, 80)
+        }
+        "read" | "write" | "edit" | "apply_patch" | "patch" => {
+            if let Some(ref a) = args {
+                if let Some(path) = a
+                    .get("file_path")
+                    .or_else(|| a.get("path"))
+                    .and_then(|v| v.as_str())
+                {
+                    return path.to_string();
+                }
+            }
+            truncate_display(arguments, 60)
+        }
+        "glob" | "grep" | "ls" => {
+            if let Some(ref a) = args {
+                if let Some(p) = a
+                    .get("pattern")
+                    .or_else(|| a.get("query"))
+                    .or_else(|| a.get("path"))
+                    .and_then(|v| v.as_str())
+                {
+                    return truncate_display(p, 60);
+                }
+            }
+            truncate_display(arguments, 60)
+        }
+        _ => {
+            if let Some(ref a) = args {
+                if let Some(obj) = a.as_object() {
+                    for val in obj.values() {
+                        if let Some(s) = val.as_str() {
+                            if !s.is_empty() {
+                                return truncate_display(s, 60);
+                            }
+                        }
+                    }
+                }
+            }
+            truncate_display(arguments, 60)
+        }
+    }
+}
+
+fn truncate_display(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(max_chars - 3).collect();
+        format!("{truncated}...")
+    }
 }
 
 /// Format a running hook indicator line with a flashing icon.
