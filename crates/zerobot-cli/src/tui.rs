@@ -1632,6 +1632,17 @@ async fn run_tui_inner(
                     dirty = true;
                 }
                 result = handle => {
+                    match &result {
+                        Ok(Ok(msg)) => {
+                            tracing::info!("[tui] runner 完成: Ok, response_len={}", msg.len());
+                        }
+                        Ok(Err(err)) => {
+                            tracing::error!("[tui] runner 完成: Err={}", err);
+                        }
+                        Err(join_err) => {
+                            tracing::error!("[tui] runner panic: {}", join_err);
+                        }
+                    }
                     if let Ok(Err(err)) = result {
                         app.finalize_stream();
                         app.status = Status::Error(format!("{err}"));
@@ -3200,6 +3211,10 @@ async fn handle_agent_event(
                 DotColor::Yellow,
                 &format!("会话 Hook 已移除: {hook_name}"),
             );
+        }
+        AgentEvent::Stop => {
+            tracing::info!("[tui] 收到 AgentEvent::Stop");
+            app.push_block(DotColor::Yellow, "Agent 已停止");
         }
         _ => {}
     }

@@ -495,17 +495,21 @@ impl Provider for OpenAIProvider {
             let mut payload = JsonValue::Object(payload_map);
             merge_payload_options(&mut payload, provider_options);
 
+            tracing::info!("[provider] OpenAI 请求: model={}, messages={}, tools={}", model, messages.len(), tools.len());
+
             let request = client.post(url).bearer_auth(api_key);
             let request = apply_headers(request, &headers);
             let response = request.json(&payload).send().await;
             let response = match response {
                 Ok(resp) => resp,
                 Err(err) => {
+                    tracing::error!("[provider] OpenAI HTTP 请求失败: {}", err);
                     let _ = tx.send(Err(ZeroBotError::Provider(err.to_string())));
                     return;
                 }
             };
             let status = response.status();
+            tracing::info!("[provider] OpenAI HTTP 响应: status={}", status);
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
                 let _ = tx.send(Err(ZeroBotError::Provider(format!(
@@ -544,6 +548,7 @@ impl Provider for OpenAIProvider {
                                 }
                                 if let Ok(raw) = serde_json::from_str::<JsonValue>(&data) {
                                     if raw.get("error").is_some() {
+                                        tracing::error!("[provider] OpenAI API 错误: {}", raw);
                                         let _ =
                                             tx.send(Err(ZeroBotError::Provider(raw.to_string())));
                                         return;
@@ -587,7 +592,9 @@ impl Provider for OpenAIProvider {
                                                                 .get("name")
                                                                 .and_then(|v| v.as_str())
                                                             {
-                                                                entry.name = name.to_string();
+                                                                if !name.is_empty() {
+                                                                    entry.name = name.to_string();
+                                                                }
                                                             }
                                                             if let Some(args) = func
                                                                 .get("arguments")
@@ -607,6 +614,8 @@ impl Provider for OpenAIProvider {
                                         last_usage = Some(usage.clone());
                                         let _ = tx.send(Ok(ProviderEvent::Usage(usage)));
                                     }
+                                } else {
+                                    tracing::warn!("[provider] OpenAI SSE JSON 解析失败: data={}", data);
                                 }
                             }
                         } else if let Some(rest) = line.strip_prefix("data:") {
@@ -623,6 +632,7 @@ impl Provider for OpenAIProvider {
 
             for call in tool_calls.into_iter() {
                 if call.name.is_empty() {
+                    tracing::warn!("[provider] OpenAI 跳过空名称的 tool call: id={}", call.id);
                     continue;
                 }
                 let arguments = serde_json::from_str(&call.arguments)
@@ -901,6 +911,8 @@ impl Provider for AnthropicProvider {
             let mut payload = JsonValue::Object(payload_map);
             merge_payload_options(&mut payload, provider_options);
 
+            tracing::info!("[provider] Anthropic 请求: model={}, messages={}, tools={}", model, messages.len(), tools.len());
+
             let request = client
                 .post(url)
                 .header("x-api-key", &api_key)
@@ -910,11 +922,13 @@ impl Provider for AnthropicProvider {
             let response = match response {
                 Ok(resp) => resp,
                 Err(err) => {
+                    tracing::error!("[provider] Anthropic HTTP 请求失败: {}", err);
                     let _ = tx.send(Err(ZeroBotError::Provider(err.to_string())));
                     return;
                 }
             };
             let status = response.status();
+            tracing::info!("[provider] Anthropic HTTP 响应: status={}", status);
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
                 let _ = tx.send(Err(ZeroBotError::Provider(format!(
@@ -952,10 +966,12 @@ impl Provider for AnthropicProvider {
                                 let evt = event_name.take();
                                 if let Ok(raw) = serde_json::from_str::<JsonValue>(&data) {
                                     if raw.get("error").is_some() {
+                                        tracing::error!("[provider] Anthropic API 错误: {}", raw);
                                         let _ =
                                             tx.send(Err(ZeroBotError::Provider(raw.to_string())));
                                         return;
                                     }
+                                    tracing::debug!("[provider] Anthropic SSE chunk: {}", raw);
                                     let evt_type = evt
                                         .as_deref()
                                         .or_else(|| raw.get("type").and_then(|v| v.as_str()))
@@ -1041,7 +1057,9 @@ impl Provider for AnthropicProvider {
                                                     if let Some(name) =
                                                         block.get("name").and_then(|v| v.as_str())
                                                     {
-                                                        entry.name = name.to_string();
+                                                        if !name.is_empty() {
+                                                            entry.name = name.to_string();
+                                                        }
                                                     }
                                                     if let Some(input) = block.get("input") {
                                                         if let Ok(text) =
@@ -1096,6 +1114,8 @@ impl Provider for AnthropicProvider {
                                         }
                                         _ => {}
                                     }
+                                } else {
+                                    tracing::warn!("[provider] Anthropic SSE JSON 解析失败: data={}", data);
                                 }
                             }
                         } else if let Some(rest) = line.strip_prefix("event:") {
@@ -1114,6 +1134,7 @@ impl Provider for AnthropicProvider {
 
             for call in tool_calls.into_iter() {
                 if call.name.is_empty() {
+                    tracing::warn!("[provider] Anthropic 跳过空名称的 tool call: id={}", call.id);
                     continue;
                 }
                 let arguments = serde_json::from_str(&call.arguments)

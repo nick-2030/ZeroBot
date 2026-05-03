@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::notification::{Notification, NotificationBus, NotificationSender, NotificationStatus};
@@ -172,6 +172,7 @@ impl Agent {
         input: &str,
         events: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> ZeroBotResult<String> {
+        info!("[agent] run_turn 开始: session={}, input_len={}, agent_type={}", session_id, input.len(), self.agent_type);
         self.emit(
             &events,
             AgentEvent::UserMessage {
@@ -201,6 +202,7 @@ impl Agent {
             let message = decision
                 .message
                 .unwrap_or_else(|| "输入被 Hook 拒绝".to_string());
+            info!("[agent] UserPromptSubmit hook 拒绝: {}", message);
             self.emit(
                 &events,
                 AgentEvent::Error {
@@ -244,8 +246,9 @@ impl Agent {
                 created_at: Utc::now().timestamp(),
             })
             .await?;
-        self.maybe_record_user_summary(session_id, &input_text)
-            .await?;
+        if let Err(e) = self.maybe_record_user_summary(session_id, &input_text).await {
+            warn!("[agent] maybe_record_user_summary 失败 (非致命): {}", e);
+        }
 
         let instruction_sources = crate::instruction::system_sources(&self.settings, &self.cwd);
         let url_instructions =
@@ -263,12 +266,14 @@ impl Agent {
         loop {
             // 检查中断令牌
             if self.abort_token.is_cancelled() {
+                info!("[agent] abort_token 已取消，中断任务");
                 self.emit(&events, AgentEvent::Stop);
                 return Ok("任务被中断".to_string());
             }
 
             steps += 1;
             if steps > self.settings.agent.max_steps {
+                warn!("[agent] 超过最大步骤限制 {}", self.settings.agent.max_steps);
                 return Err(ZeroBotError::Agent("超过最大步骤限制".to_string()));
             }
 
@@ -536,6 +541,7 @@ impl Agent {
             let mut tool_calls = Vec::new();
             let mut had_delta = false;
             let mut content = String::new();
+            info!("[agent] 调用 provider.stream, messages={}, tools={}", request.messages.len(), request.tools.len());
             let mut stream = self.provider.stream(request);
             let mut stream_error: Option<ZeroBotError> = None;
             while let Some(event) = stream.next().await {
@@ -566,6 +572,7 @@ impl Agent {
                 }
             }
             if let Some(err) = stream_error {
+                info!("[agent] provider stream 错误: {}", err);
                 if Self::is_context_overflow(&err)
                     && self.settings.context.compaction.enabled
                     && !overflow_compaction_attempted
@@ -577,6 +584,7 @@ impl Agent {
                 return Err(err);
             }
             overflow_compaction_attempted = false;
+            info!("[agent] provider stream 完成: content_len={}, tool_calls={}", content.len(), tool_calls.len());
 
             let post_payload = serde_json::json!({
                 "content": content.clone(),
@@ -789,6 +797,7 @@ impl Agent {
             )
             .await;
 
+        info!("[agent] run_turn 正常结束: response_len={}", last_response.len());
         Ok(last_response)
     }
 
