@@ -488,12 +488,36 @@ impl AppState {
                 if self.input.trim().is_empty() {
                     return Command::None;
                 }
-                let prompt = self.input.trim().to_string();
+                let raw = self.input.trim().to_string();
                 self.input.clear();
                 self.cursor = 0;
+
+                // Handle slash commands
+                if let Some(cmd) = raw.strip_prefix('/') {
+                    let cmd = cmd.trim().to_lowercase();
+                    match cmd.as_str() {
+                        "exit" | "quit" | "q" => {
+                            self.should_quit = true;
+                            return Command::Quit;
+                        }
+                        "clear" => {
+                            self.output.clear();
+                            self.stream_buffer.clear();
+                            self.streaming = false;
+                            self.running_tools.clear();
+                            self.scroll = 0;
+                            self.stick_to_bottom = true;
+                            self.mark_dirty();
+                            return Command::ClearScreen;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Show user input in output area
+                self.push_block(DotColor::White, &raw);
                 self.status = Status::Thinking;
-                self.mark_dirty();
-                Command::SpawnAgent { prompt }
+                Command::SpawnAgent { prompt: raw }
             }
             Message::InputMoveCursor(delta) => {
                 if delta > 0 {

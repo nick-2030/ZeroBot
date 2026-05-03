@@ -17,16 +17,25 @@ impl InputLine {
     pub fn render(buf: &mut Buffer, area: Rect, state: &AppState) {
         let theme = &THEME;
 
-        // Draw a bordered block with top + bottom borders.
+        // Draw a bordered block with top + bottom borders and a distinct background.
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
-            .border_style(Style::default().fg(theme.panel_border));
+            .border_style(Style::default().fg(theme.panel_border))
+            .style(Style::default().bg(theme.panel_bg));
 
         let inner = block.inner(area);
         Widget::render(block, area, buf);
 
         if inner.height == 0 || inner.width < 3 {
             return;
+        }
+
+        // Fill the inner area with the background color.
+        for y in inner.y..inner.y + inner.height {
+            for x in inner.x..inner.x + inner.width {
+                let cell = buf.get_mut(x, y);
+                cell.set_style(Style::default().bg(theme.panel_bg));
+            }
         }
 
         // Render the prompt prefix "> "

@@ -67,18 +67,11 @@ impl BottomArea {
     /// Compute the height (in rows) that the bottom area needs for the given
     /// application state.
     ///
-    /// - `Idle`: 3 (input line + padding)
-    /// - All other statuses: 4 (extra status/spinner line)
-    pub fn height_needed(state: &AppState) -> u16 {
-        match &state.status {
-            Status::Idle => 3,
-            Status::Thinking
-            | Status::Tool(_)
-            | Status::Hook(_)
-            | Status::WaitingUserInput
-            | Status::WaitingApproval
-            | Status::Error(_) => 4,
-        }
+    /// Always returns 3: the InputLine component uses top border + content +
+    /// bottom border = 3 rows.  Status/spinner information is conveyed through
+    /// the streaming buffer in the messages area instead.
+    pub fn height_needed(_state: &AppState) -> u16 {
+        3
     }
 }
 
@@ -101,12 +94,12 @@ mod tests {
     #[test]
     fn height_needed_thinking() {
         let state = test_state(Status::Thinking);
-        assert_eq!(BottomArea::height_needed(&state), 4);
+        assert_eq!(BottomArea::height_needed(&state), 3);
     }
 
     #[test]
     fn height_needed_error() {
         let state = test_state(Status::Error("test".into()));
-        assert_eq!(BottomArea::height_needed(&state), 4);
+        assert_eq!(BottomArea::height_needed(&state), 3);
     }
 }

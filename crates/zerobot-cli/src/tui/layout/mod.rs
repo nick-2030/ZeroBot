@@ -141,7 +141,7 @@ mod tests {
         state.status = crate::tui::app::Status::Thinking;
         let areas = FullscreenLayout::compute(area, &state);
 
-        assert_eq!(areas.bottom_area.height, 4); // Thinking => 4
+        assert_eq!(areas.bottom_area.height, 3); // Always 3
     }
 
     #[test]

@@ -46,7 +46,7 @@ struct Cli {
     #[arg(long)]
     resume: Option<String>,
     #[arg(long, default_value_t = false)]
-    no_alt_screen: bool,
+    alt_screen: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
                 cli.provider,
                 cli.model,
                 cli.resume,
-                !cli.no_alt_screen,
+                cli.alt_screen,
             )
             .await?;
         }
