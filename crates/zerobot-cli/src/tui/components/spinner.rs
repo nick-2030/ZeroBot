@@ -1,7 +1,7 @@
 //! Spinner component — animated status indicator above the input area.
 //!
-//! Displays a braille-dots rotating animation with a random verb and elapsed
-//! time, matching Claude Code's spinner style.
+//! Matches Claude Code's spinner: ping-pong frame sequence of star/asterisk
+//! characters at 120ms per frame, with a random verb + ellipsis.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -12,9 +12,14 @@ use ratatui::widgets::Widget;
 use crate::tui::app::{AppState, Status};
 use crate::tui::theme::THEME;
 
-/// Braille dots rotating animation frames.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SPINNER_INTERVAL_MS: u128 = 80;
+/// Base spinner characters (macOS set from Claude Code `Spinner/utils.ts`).
+const BASE_FRAMES: &[&str] = &["\u{00B7}", "\u{2722}", "\u{2733}", "\u{2736}", "\u{273B}", "\u{273D}"];
+/// Ping-pong: forward then backward = 12 frames total.
+const SPINNER_FRAMES: &[&str] = &[
+    "\u{00B7}", "\u{2722}", "\u{2733}", "\u{2736}", "\u{273B}", "\u{273D}",
+    "\u{273D}", "\u{273B}", "\u{2736}", "\u{2733}", "\u{2722}", "\u{00B7}",
+];
+const SPINNER_INTERVAL_MS: u128 = 120;
 
 pub struct Spinner;
 
@@ -52,7 +57,7 @@ impl Spinner {
             return;
         }
         let theme = &THEME;
-        let status_text = match Self::status_text(&state.status) {
+        let _status_text = match Self::status_text(&state.status) {
             Some(text) => text,
             None => return,
         };
@@ -63,14 +68,15 @@ impl Spinner {
         let frame = Self::current_frame(elapsed.as_millis());
         let elapsed_str = Self::format_elapsed(elapsed);
         let verb = if state.spinner_verb.is_empty() {
-            status_text
+            "Thinking"
         } else {
             state.spinner_verb.as_str()
         };
 
+        // Format: " {frame} {verb}… ({elapsed})"
         let line = Line::from(vec![
             Span::styled(format!(" {frame} "), Style::default().fg(theme.accent)),
-            Span::styled(verb.to_string(), Style::default().fg(theme.thinking)),
+            Span::styled(format!("{verb}\u{2026}"), Style::default().fg(theme.thinking)),
             Span::styled(
                 format!(" ({elapsed_str})"),
                 Style::default().fg(theme.text_muted),

@@ -38,11 +38,9 @@ impl InputLine {
             }
         }
 
-        // Render the prompt prefix "❯ "
-        let prompt = "\u{276F} ";
-        let prompt_style = Style::default()
-            .fg(theme.input_prompt)
-            .add_modifier(Modifier::BOLD);
+        // Render the prompt prefix "> " — matches Claude Code figures.pointer
+        let prompt = "> ";
+        let prompt_style = Style::default().fg(theme.input_prompt);
         buf.set_span(inner.x, inner.y, &Span::styled(prompt, prompt_style), 2);
 
         // Render the user input text.

@@ -808,44 +808,135 @@ fn build_welcome_lines(
     provider: &str,
     model: &str,
     cwd: &str,
-    _term_width: usize,
+    term_width: usize,
 ) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
+    use unicode_width::UnicodeWidthStr;
 
     let theme = &*THEME;
 
-    // Compact logo — unique ZeroBot design
-    let logo_lines = [
-        " \u{2571}\u{2572}  ZeroBot",
-        "   v{version}",
-        " \u{2572}\u{2571}",
-    ];
-    let logo_lines: Vec<String> = logo_lines
+    // --- Content lines ---
+    let welcome_msg = format!("Welcome to ZeroBot v{version}");
+    let model_line = format!("{provider} \u{00B7} {model}");
+    let cwd_line = cwd.to_string();
+    let content_lines = [&welcome_msg, &model_line, &cwd_line];
+
+    // --- Border title: " ZeroBot vX.X " in accent color ---
+    let border_title = format!(" ZeroBot v{version} ");
+
+    // --- Compute box width ---
+    let content_max = content_lines
         .iter()
-        .map(|s| s.replace("{version}", version))
-        .collect();
-    let info_lines = [
-        format!("{provider} \u{00B7} {model}"),
-        cwd.to_string(),
-    ];
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(20);
+    let padding = 2; // paddingX = 1 on each side
+    let inner_width = (content_max + padding).min(term_width.saturating_sub(2) as usize).max(20);
+    let box_width = inner_width + 2; // +2 for side borders
 
     let mut out = Vec::new();
-    for (i, logo) in logo_lines.iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            logo.to_string(),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-        )];
-        if let Some(info) = info_lines.get(i) {
-            spans.push(Span::raw("   "));
-            spans.push(Span::styled(
-                info.to_string(),
-                Style::default().fg(theme.text),
+
+    // Top border: ╭──────╮  with title embedded
+    // Claude Code uses borderText at offset 1: " Claude Code vX.X "
+    let top_line_chars = inner_width;
+    let title_offset = 1usize; // offset from left border
+    let title_display_width = UnicodeWidthStr::width(border_title.as_str());
+
+    let mut top_spans = Vec::new();
+    // Left corner
+    top_spans.push(Span::styled(
+        "\u{256D}".to_string(),
+        Style::default().fg(theme.accent),
+    ));
+    // Before title
+    for i in 0..title_offset {
+        if i + 1 + title_display_width + 1 <= top_line_chars {
+            top_spans.push(Span::styled(
+                "\u{2500}".to_string(),
+                Style::default().fg(theme.accent),
             ));
         }
+    }
+    // Title text
+    top_spans.push(Span::styled(
+        border_title.clone(),
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+    ));
+    // After title
+    let used = title_offset + title_display_width;
+    for _ in used..top_line_chars {
+        top_spans.push(Span::styled(
+            "\u{2500}".to_string(),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    // Right corner
+    top_spans.push(Span::styled(
+        "\u{256E}".to_string(),
+        Style::default().fg(theme.accent),
+    ));
+    out.push(Line::from(top_spans));
+
+    // Empty padding line (paddingY = 1)
+    out.push(Line::from(vec![
+        Span::styled("\u{2502}", Style::default().fg(theme.accent)),
+        Span::raw(" ".repeat(inner_width)),
+        Span::styled("\u{2502}", Style::default().fg(theme.accent)),
+    ]));
+
+    // Content lines (centered, dim)
+    for line_text in &content_lines {
+        let w = UnicodeWidthStr::width(line_text.as_str());
+        let pad_total = inner_width.saturating_sub(w + 2); // +2 for paddingX
+        let pad_left = 1usize; // paddingX = 1
+        let pad_right = pad_total.saturating_sub(pad_left);
+
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            "\u{2502}".to_string(),
+            Style::default().fg(theme.accent),
+        ));
+        spans.push(Span::raw(" ".repeat(pad_left)));
+        // First line (welcome msg) is bold, rest are dim
+        if std::ptr::eq(*line_text, &welcome_msg) {
+            spans.push(Span::styled(
+                line_text.to_string(),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                line_text.to_string(),
+                Style::default().fg(theme.text_dim),
+            ));
+        }
+        spans.push(Span::raw(" ".repeat(pad_right + 1)));
+        spans.push(Span::styled(
+            "\u{2502}".to_string(),
+            Style::default().fg(theme.accent),
+        ));
         out.push(Line::from(spans));
     }
-    // Empty line after logo
+
+    // Empty padding line (paddingY = 1)
+    out.push(Line::from(vec![
+        Span::styled("\u{2502}", Style::default().fg(theme.accent)),
+        Span::raw(" ".repeat(inner_width)),
+        Span::styled("\u{2502}", Style::default().fg(theme.accent)),
+    ]));
+
+    // Bottom border: ╰──────╯
+    out.push(Line::from(vec![
+        Span::styled(
+            format!(
+                "\u{2570}{}\u{256F}",
+                "\u{2500}".repeat(inner_width)
+            ),
+            Style::default().fg(theme.accent),
+        ),
+    ]));
+
+    // Empty line after box
     out.push(Line::from(Span::raw("")));
     out
 }

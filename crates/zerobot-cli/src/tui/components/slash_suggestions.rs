@@ -1,4 +1,9 @@
 //! Slash command suggestions dropdown.
+//!
+//! Matches Claude Code's PromptInputFooterSuggestions:
+//! - Two-column layout: name (40% width) + description (remaining)
+//! - Selected item uses `suggestion` color, others are dimmed
+//! - Rounded border with `accent` color
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -27,77 +32,78 @@ impl SlashSuggestions {
                 area.x,
                 area.y,
                 &top,
-                Style::default().fg(theme.panel_border).bg(theme.panel_bg),
+                Style::default().fg(theme.accent).bg(theme.panel_bg),
             );
         }
 
-        // Draw content rows with side borders
-        // Format: │ /name     description    │  (description right-aligned)
+        // Content rows — two-column format matching Claude Code
+        // Name column: 40% of inner width, padded
+        // Description column: remaining width
         let inner_w = area.width.saturating_sub(2) as usize;
+        let name_col_w = (inner_w as f64 * 0.4) as usize;
+
         for i in 0..max_visible {
             let m = &state.slash_matches[i as usize];
             let y = area.y + 1 + i;
-            let content_style = if i as usize == state.slash_selected {
-                Style::default()
-                    .fg(theme.text)
-                    .bg(theme.selected_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text).bg(theme.panel_bg)
-            };
+            let is_selected = i as usize == state.slash_selected;
 
             // Left border
             buf.set_string(
                 area.x,
                 y,
                 "\u{2502}",
-                Style::default().fg(theme.panel_border).bg(theme.panel_bg),
+                Style::default().fg(theme.accent).bg(theme.panel_bg),
             );
 
-            // Build the content: " /name  description" padded to fill width
-            let cmd_part = format!(" /{}", m.name);
-            let desc_part = format!("{} ", m.description);
-            // Fill between cmd and desc with spaces
-            let used = cmd_part.chars().count() + desc_part.chars().count();
-            let padding = if used < inner_w {
-                " ".repeat(inner_w - used)
-            } else {
-                String::new()
-            };
-            let full_text = format!("{cmd_part}{padding}{desc_part}");
-
-            // Truncate if too long
-            let display: String = full_text.chars().take(inner_w).collect();
-            let padded = if display.chars().count() < inner_w {
+            // Build name column: " /name" padded to name_col_w
+            let name_str = format!(" /{}", m.name);
+            let name_padded = if name_str.chars().count() < name_col_w {
                 format!(
-                    "{display}{:<width$}",
+                    "{name_str}{:<width$}",
                     "",
-                    width = inner_w - display.chars().count()
+                    width = name_col_w - name_str.chars().count()
                 )
             } else {
-                display
+                name_str.chars().take(name_col_w).collect::<String>()
             };
 
-            // Render with two styles: name part dimmed, description part normal
-            let name_len = cmd_part.chars().count();
-            let name_str: String = padded.chars().take(name_len).collect();
-            let rest_str: String = padded.chars().skip(name_len).collect();
+            // Description column: fills remaining space
+            let desc_w = inner_w.saturating_sub(name_col_w);
+            let desc_str: String = m.description.chars().take(desc_w).collect();
+            let desc_padded = if desc_str.chars().count() < desc_w {
+                format!(
+                    "{desc_str}{:<width$}",
+                    "",
+                    width = desc_w - desc_str.chars().count()
+                )
+            } else {
+                desc_str
+            };
 
-            let name_style = if i as usize == state.slash_selected {
+            // Render name column
+            let name_style = if is_selected {
                 Style::default()
-                    .fg(theme.text_dim)
+                    .fg(theme.suggestion)
                     .bg(theme.selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
+                Style::default().fg(theme.text).bg(theme.panel_bg)
+            };
+            buf.set_string(area.x + 1, y, &name_padded, name_style);
+
+            // Render description column
+            let desc_style = if is_selected {
+                Style::default()
+                    .fg(theme.suggestion)
+                    .bg(theme.selected_bg)
+            } else {
                 Style::default().fg(theme.text_dim).bg(theme.panel_bg)
             };
-
-            buf.set_string(area.x + 1, y, &name_str, name_style);
             buf.set_string(
-                area.x + 1 + name_len as u16,
+                area.x + 1 + name_col_w as u16,
                 y,
-                &rest_str,
-                content_style,
+                &desc_padded,
+                desc_style,
             );
 
             // Right border
@@ -105,7 +111,7 @@ impl SlashSuggestions {
                 area.x + area.width - 1,
                 y,
                 "\u{2502}",
-                Style::default().fg(theme.panel_border).bg(theme.panel_bg),
+                Style::default().fg(theme.accent).bg(theme.panel_bg),
             );
         }
 
@@ -120,7 +126,7 @@ impl SlashSuggestions {
                 area.x,
                 bottom_y,
                 &bottom,
-                Style::default().fg(theme.panel_border).bg(theme.panel_bg),
+                Style::default().fg(theme.accent).bg(theme.panel_bg),
             );
         }
     }

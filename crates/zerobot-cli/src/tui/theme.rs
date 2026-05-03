@@ -4,10 +4,7 @@ use std::sync::LazyLock;
 /// Global theme instance used across the TUI.
 pub static THEME: LazyLock<Theme> = LazyLock::new(Theme::default);
 
-/// Color palette for the entire TUI.
-///
-/// All semantic colors are centralized here so that changing the theme
-/// propagates to every component automatically.
+/// Color palette — values sourced from Claude Code `src/utils/theme.ts` dark theme.
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub panel_bg: Color,
@@ -29,30 +26,57 @@ pub struct Theme {
     pub input_prompt: Color,
     pub status_bg: Color,
     pub modal_divider: Color,
+    /// Shimmer color for spinner verb highlight
+    pub accent_shimmer: Color,
+    /// Autocomplete suggestion highlight color
+    pub suggestion: Color,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            panel_bg: Color::Rgb(32, 36, 44),
-            panel_border: Color::Rgb(70, 76, 88),
-            text: Color::Rgb(220, 224, 232),
-            text_dim: Color::Rgb(136, 142, 156),
-            text_muted: Color::Rgb(100, 106, 120),
+            // Background: near-black
+            panel_bg: Color::Rgb(0, 0, 0),
+            // Borders: medium gray
+            panel_border: Color::Rgb(136, 136, 136),
+            // Text: pure white
+            text: Color::Rgb(255, 255, 255),
+            // Dimmed text: light gray (inactive)
+            text_dim: Color::Rgb(153, 153, 153),
+            // Muted text: dark gray (subtle)
+            text_muted: Color::Rgb(80, 80, 80),
+            // Claude orange
             accent: Color::Rgb(215, 119, 87),
+            // Claude shimmer (lighter orange)
             accent_dim: Color::Rgb(180, 95, 65),
-            selected_bg: Color::Rgb(55, 60, 75),
-            success: Color::Rgb(152, 195, 121),
-            error: Color::Rgb(224, 108, 117),
-            warn: Color::Rgb(229, 192, 123),
-            thinking: Color::Rgb(120, 120, 140),
-            tool_border: Color::Rgb(80, 90, 110),
-            permission: Color::Rgb(100, 149, 237),
-            plan_mode: Color::Rgb(0, 191, 165),
-            user_message_bg: Color::Rgb(38, 42, 52),
-            input_prompt: Color::Rgb(215, 119, 87),
-            status_bg: Color::Rgb(32, 36, 44),
-            modal_divider: Color::Rgb(100, 149, 237),
+            // Selection background: dark blue
+            selected_bg: Color::Rgb(38, 79, 120),
+            // Success: bright green
+            success: Color::Rgb(78, 186, 101),
+            // Error: bright red-pink
+            error: Color::Rgb(255, 107, 128),
+            // Warning: bright amber
+            warn: Color::Rgb(255, 193, 7),
+            // Thinking/spinner text
+            thinking: Color::Rgb(153, 153, 153),
+            // Tool output border
+            tool_border: Color::Rgb(136, 136, 136),
+            // Permission mode: light blue-purple
+            permission: Color::Rgb(177, 185, 249),
+            // Plan mode: muted sage green
+            plan_mode: Color::Rgb(72, 150, 140),
+            // User message background: lighter grey
+            user_message_bg: Color::Rgb(55, 55, 55),
+            // Input prompt color: default text (white)
+            input_prompt: Color::Rgb(255, 255, 255),
+            // Status bar background: black
+            status_bg: Color::Rgb(0, 0, 0),
+            // Modal divider
+            modal_divider: Color::Rgb(136, 136, 136),
+            // Shimmer: lighter claude orange
+            accent_shimmer: Color::Rgb(235, 159, 127),
+            // Suggestion: light blue-purple
+            suggestion: Color::Rgb(177, 185, 249),
         }
     }
 }
