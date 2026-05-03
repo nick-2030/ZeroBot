@@ -43,7 +43,7 @@ impl Messages {
         }
 
         // Fill remaining rows with the panel background.
-        let rendered = all_lines.len().saturating_sub(scroll).min(visible_height);
+        let rendered = total.saturating_sub(scroll).min(visible_height);
         for i in rendered..visible_height {
             let y = area.y + i as u16;
             for x in area.x..area.x + width {

@@ -9,14 +9,14 @@ use ratatui::widgets::Widget;
 use zerobot_core::config::PermissionMode;
 
 use crate::tui::app::AppState;
-use crate::tui::theme::Theme;
+use crate::tui::theme::{Theme, THEME};
 
 /// Renders the status bar at the bottom of the screen.
 pub struct StatusBar;
 
 impl StatusBar {
     pub fn render(buf: &mut Buffer, area: Rect, state: &AppState) {
-        let theme = &crate::tui::theme::THEME;
+        let theme = &THEME;
         let spans = Self::build_spans(state, theme);
         let line = Line::from(spans);
         ratatui::widgets::Paragraph::new(line)

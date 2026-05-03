@@ -74,8 +74,10 @@ impl InputLine {
             return None;
         }
         let input_x = inner.x + 2;
-        let cursor_display_width =
-            UnicodeWidthStr::width(&state.input[..state.cursor.min(state.input.len())]);
+        // Ensure cursor lands on a UTF-8 character boundary to avoid panicking
+        // on slice if cursor happens to be mid-codepoint.
+        let cursor_end = find_char_boundary(&state.input, state.cursor);
+        let cursor_display_width = UnicodeWidthStr::width(&state.input[..cursor_end]);
         let cursor_x = input_x + cursor_display_width as u16;
         if cursor_x < inner.x + inner.width {
             Some((cursor_x, inner.y))
@@ -89,6 +91,20 @@ impl InputLine {
 fn truncate_left(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
+    }
+    if max_width < 4 {
+        // Not enough room for "..." + content, just truncate raw.
+        let mut end = 0;
+        let mut w = 0;
+        for (i, ch) in text.char_indices() {
+            let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+            if w + cw > max_width {
+                break;
+            }
+            w += cw;
+            end = i + ch.len_utf8();
+        }
+        return text[..end].to_string();
     }
     let total_width = UnicodeWidthStr::width(text);
     if total_width <= max_width {
@@ -107,4 +123,19 @@ fn truncate_left(text: &str, max_width: usize) -> String {
         start = i + ch.len_utf8();
     }
     format!("...{}", &text[start..])
+}
+
+/// Find the nearest valid UTF-8 character boundary at or before `pos`.
+///
+/// If `pos` is already a char boundary, returns `pos`. Otherwise, walks back
+/// to the nearest preceding boundary. Returns 0 if `pos` is beyond the string.
+fn find_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut boundary = pos;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
