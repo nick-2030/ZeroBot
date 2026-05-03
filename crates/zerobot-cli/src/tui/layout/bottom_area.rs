@@ -67,9 +67,8 @@ impl BottomArea {
     /// Compute the height (in rows) that the bottom area needs for the given
     /// application state.
     ///
-    /// - `Idle`: 3 (top border + input line + bottom border)
-    /// - `Thinking` / `Tool` / `Hook` / `WaitingUserInput` / `WaitingApproval`: 4
-    /// - `Error`: 4
+    /// - `Idle`: 3 (input line + padding)
+    /// - All other statuses: 4 (extra status/spinner line)
     pub fn height_needed(state: &AppState) -> u16 {
         match &state.status {
             Status::Idle => 3,
@@ -80,5 +79,34 @@ impl BottomArea {
             | Status::WaitingApproval
             | Status::Error(_) => 4,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state(status: Status) -> AppState {
+        let mut state = AppState::new("test".into(), "provider".into(), "model".into());
+        state.status = status;
+        state
+    }
+
+    #[test]
+    fn height_needed_idle() {
+        let state = test_state(Status::Idle);
+        assert_eq!(BottomArea::height_needed(&state), 3);
+    }
+
+    #[test]
+    fn height_needed_thinking() {
+        let state = test_state(Status::Thinking);
+        assert_eq!(BottomArea::height_needed(&state), 4);
+    }
+
+    #[test]
+    fn height_needed_error() {
+        let state = test_state(Status::Error("test".into()));
+        assert_eq!(BottomArea::height_needed(&state), 4);
     }
 }

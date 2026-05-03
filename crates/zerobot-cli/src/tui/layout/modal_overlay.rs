@@ -22,8 +22,8 @@ impl ModalOverlay {
         let px = percent_x.min(100);
         let py = percent_y.min(100);
 
-        let popup_width = area.width * px / 100;
-        let popup_height = area.height * py / 100;
+        let popup_width = ((area.width as u32 * px as u32) / 100) as u16;
+        let popup_height = ((area.height as u32 * py as u32) / 100) as u16;
 
         let popup_x = area.x + (area.width - popup_width) / 2;
         let popup_y = area.y + (area.height - popup_height) / 2;

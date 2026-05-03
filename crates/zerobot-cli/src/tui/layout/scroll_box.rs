@@ -39,7 +39,7 @@ impl ScrollBoxState {
     /// `sticky` is automatically set to `true`.
     pub fn scroll_down(&mut self, lines: u16) {
         let max_offset = self.max_offset();
-        self.offset = (self.offset + lines).min(max_offset);
+        self.offset = self.offset.saturating_add(lines).min(max_offset);
         if self.offset >= max_offset {
             self.sticky = true;
         }
@@ -77,7 +77,7 @@ impl ScrollBoxState {
     /// `[0, total_lines]`.
     pub fn visible_range(&self) -> (u16, u16) {
         let start = self.offset.min(self.total_lines);
-        let end = (self.offset + self.viewport_height).min(self.total_lines);
+        let end = self.offset.saturating_add(self.viewport_height).min(self.total_lines);
         (start, end)
     }
 
