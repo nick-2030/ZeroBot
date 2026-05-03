@@ -13,6 +13,7 @@ use zerobot_core::provider::TokenUsage;
 use zerobot_core::session::TodoItem;
 
 use crate::slash::SlashMatch;
+use crate::tui::overlay::OverlayType;
 
 // ---------------------------------------------------------------------------
 // Supporting types (migrated from legacy.rs)
@@ -187,24 +188,6 @@ pub struct AppState {
 }
 
 // ---------------------------------------------------------------------------
-// OverlayType — lightweight enum used by AppState.
-//
-// The full overlay widget implementations live in `overlay.rs` (Task 3).
-// This enum captures the *kind* of overlay so that `active_contexts()` and
-// the queue can reason about them without depending on widget internals.
-// ---------------------------------------------------------------------------
-
-/// Identifies the kind of overlay currently displayed (or queued).
-#[derive(Clone, Debug)]
-pub enum OverlayType {
-    HistorySearch,
-    Help,
-    Confirmation,
-    UserInput,
-    ToolApproval,
-}
-
-// ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
@@ -317,14 +300,16 @@ impl AppState {
 
         if let Some(ref overlay) = self.overlay {
             match overlay {
-                OverlayType::HistorySearch => ctxs.push(KeyContext::HistorySearch),
-                OverlayType::Help => ctxs.push(KeyContext::Help),
-                OverlayType::Confirmation | OverlayType::ToolApproval => {
-                    ctxs.push(KeyContext::Confirmation)
-                }
+                OverlayType::HistorySearch(_) => ctxs.push(KeyContext::HistorySearch),
+                OverlayType::Help(_) => ctxs.push(KeyContext::Help),
+                OverlayType::ToolApproval(_) => ctxs.push(KeyContext::Confirmation),
                 // UserInput overlays don't have a dedicated context yet; they
                 // inherit Confirmation semantics for now.
-                OverlayType::UserInput => ctxs.push(KeyContext::Confirmation),
+                OverlayType::UserInput(_) => ctxs.push(KeyContext::Confirmation),
+                // MessageSelector and TurnCost use Confirmation context for now.
+                OverlayType::MessageSelector(_) | OverlayType::TurnCost(_) => {
+                    ctxs.push(KeyContext::Confirmation)
+                }
             }
         } else if self.slash_query.is_some() {
             ctxs.push(KeyContext::Autocomplete);
