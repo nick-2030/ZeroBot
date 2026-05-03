@@ -692,27 +692,45 @@ impl OverlayComponent for HistorySearchOverlay {
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 {
-                    self.query.remove(self.cursor - 1);
-                    self.cursor -= 1;
+                    let prev = self.query[..self.cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.query.drain(prev..self.cursor);
+                    self.cursor = prev;
                     self.selected = 0;
                 }
                 None
             }
             KeyCode::Delete => {
                 if self.cursor < self.query.len() {
-                    self.query.remove(self.cursor);
+                    let next = self.query[self.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.cursor + i)
+                        .unwrap_or(self.query.len());
+                    self.query.drain(self.cursor..next);
                 }
                 None
             }
             KeyCode::Left => {
                 if self.cursor > 0 {
-                    self.cursor -= 1;
+                    self.cursor = self.query[..self.cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                 }
                 None
             }
             KeyCode::Right => {
                 if self.cursor < self.query.len() {
-                    self.cursor += 1;
+                    self.cursor = self.query[self.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.cursor + i)
+                        .unwrap_or(self.query.len());
                 }
                 None
             }
@@ -726,7 +744,7 @@ impl OverlayComponent for HistorySearchOverlay {
             }
             KeyCode::Char(c) => {
                 self.query.insert(self.cursor, c);
-                self.cursor += 1;
+                self.cursor += c.len_utf8();
                 self.selected = 0;
                 None
             }

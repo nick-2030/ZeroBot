@@ -860,8 +860,9 @@ impl AppState {
 
 fn format_tool_label(name: &str, args: &str, width: u16) -> String {
     let max_args = (width as usize).saturating_sub(name.len() + 10).max(20);
-    let short_args = if args.len() > max_args {
-        format!("{}...", &args[..max_args])
+    let short_args = if args.chars().count() > max_args {
+        let truncated: String = args.chars().take(max_args).collect();
+        format!("{truncated}...")
     } else {
         args.to_string()
     };
